@@ -85,7 +85,7 @@ impl_glm/
 │   ├── jadxcli.jar              # 反编译引擎（内嵌到 artpi-cli 中，运行时自动释放）
 │   └── artpi_repl.py            # Python 宿主端 REPL 客户端
 ├── external/                    # xdl (linker 绕过) / xz-embedded / frida-gum / qbdi
-├── assets/                      # 演示截图与展示资源 (findclasses, hookall, listMethods, trace)
+├── assets/                      # 演示截图与展示资源 (findclasses, hookall, listMethods, trace, break, artobject)
 └── prebuild/                    # 构建产物 (libartpi.so / libartpi_static.a / libartpi_agent.so / artpi-cli)
 ```
 
@@ -167,6 +167,14 @@ ArtPI 注入目标进程后，通过终端进入内置 QuickJS REPL 即可获得
 ### 5.4 跨层树形调用链路追踪 (`trace`)
 可视化调用链路树，精准记录每一步执行顺序、嵌套层级与内部方法调用关系：
 ![Execution Trace](assets/trace.png)
+
+### 5.5 断点拦截与单步调试 (`break`)
+在关键方法处下断点拦截执行，支持单步步入/步过（`s`/`n`/`c`）与实时寄存器状态打印（`regs`）：
+![Method Breakpoint](assets/break.png)
+
+### 5.6 活体对象反射持久化 (`artobject`)
+获取堆内实例后直接提升为持久化全局引用，支持交互式反射调用成员方法与属性读写：
+![Object Reflection](assets/artobject.png)
 
 ---
 

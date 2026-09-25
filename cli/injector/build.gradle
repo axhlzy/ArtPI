@@ -1,7 +1,7 @@
 // =============================================================================
 // :cli - the ArtPI CLI (ptrace injector + REPL), sources in cli/injector/.
-// Compiles its own code, then embeds libartpi_agent.so into the binary using
-// pure JVM code (no pack_payload.py / shell scripts).
+// Compiles its own code, then embeds libartpi_agent.so and jadxcli.jar into the
+// binary using XZ/LZMA compression (with automatic fallback).
 // Produces: prebuild/bin/arm64-v8a/artpi-cli
 // =============================================================================
 
@@ -39,16 +39,53 @@ tasks.register('build') {
         if (!raw.exists()) throw new GradleException("raw CLI binary not found: ${raw}")
         if (!agent.exists()) throw new GradleException("agent not found: ${agent}")
 
+        // Optional XZ compression helper for payloads
+        def compressWithXz = { File srcFile, File dstFile ->
+            def pyScript = new File(rootProject.projectDir, 'cli/pack_compress.py')
+            def pyCandidates = rootProject.ext.artpiIsWin ? ['python', 'py', 'python3'] : ['python3', 'python']
+            for (cand in pyCandidates) {
+                try {
+                    project.exec {
+                        commandLine cand, pyScript.absolutePath, srcFile.absolutePath, dstFile.absolutePath
+                    }
+                    if (dstFile.exists() && dstFile.length() > 0) {
+                        return true
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            return false
+        }
+
+        // Compress agent.so
+        def agentToPack = agent
+        def agentXz = new File(bd, 'libartpi_agent.so.xz')
+        if (compressWithXz(agent, agentXz)) {
+            agentToPack = agentXz
+            logger.lifecycle("[cli] agent compressed with XZ: ${agent.length()}B -> ${agentXz.length()}B")
+        }
+
+        // Compress jadxcli.jar
+        def jadxToPack = jadxJar
+        if (jadxJar.exists()) {
+            def jadxXz = new File(bd, 'jadxcli.jar.xz')
+            if (compressWithXz(jadxJar, jadxXz)) {
+                jadxToPack = jadxXz
+                logger.lifecycle("[cli] jadxcli.jar compressed with XZ: ${jadxJar.length()}B -> ${jadxXz.length()}B")
+            }
+        }
+
         out.parentFile.mkdirs()
         out.withOutputStream { os ->
             raw.withInputStream { is -> is.transferTo(os) }
-            appendPayload(os, agent, 'PPAYLOAD')
-            if (jadxJar.exists()) {
-                appendPayload(os, jadxJar, 'PJADXJAR')
+            appendPayload(os, agentToPack, 'PPAYLOAD')
+            if (jadxToPack.exists()) {
+                appendPayload(os, jadxToPack, 'PJADXJAR')
             }
         }
         out.setExecutable(true, false)
-        def jadxDesc = jadxJar.exists() ? " + jadx ${jadxJar.length()}B" : ""
-        logger.lifecycle("[cli] packed -> ${out} (raw ${raw.length()}B + agent ${agent.length()}B${jadxDesc} + trailers)")
+        def jadxDesc = jadxToPack.exists() ? " + jadx ${jadxToPack.length()}B" : ""
+        logger.lifecycle("[cli] packed -> ${out} (raw ${raw.length()}B + agent ${agentToPack.length()}B${jadxDesc} + trailers)")
+        logger.lifecycle("[cli] Final artpi-cli size: ${out.length()} bytes (${String.format('%.2f', out.length() / (1024.0 * 1024.0))} MB)")
     }
 }
