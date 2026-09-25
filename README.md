@@ -141,6 +141,7 @@ impl_glm/
 ---
 
 ### 4.2 部署与运行
+(注意：代码补全功能需要在adb shell中再执行 ./artpi-cli xxx 才能生效 如果使用 adb shell su -c xxx 这种方式启动无法体验代码补全)
 
 ```bash
 # 1. 部署：仅需推送单个 artpi-cli 到设备 /data/local/tmp（自动授予 755）
