@@ -71,10 +71,6 @@ jobs:
       - name: Build ArtPI Product (Core, Agent & CLI)
         run: ./gradlew buildNative --info --stacktrace
 
-      - name: Build Test Suites
-        run: ./gradlew :test:buildTest :test-js:buildTest :test-harness:buildTest --info --stacktrace
-        continue-on-error: true
-
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -85,7 +81,6 @@ jobs:
             prebuild/lib/arm64-v8a/libartpi.so
             prebuild/lib/arm64-v8a/libartpi_static.a
             prebuild/include/ArtPI.h
-            prebuild/test/
           retention-days: 30
 
       - name: Release on Tag Push

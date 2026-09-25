@@ -1,7 +1,9 @@
-# ArtPI (Art Process Inspector)
+# ArtPI (ART Process Instrumentation)
 
-> 面向 Android ART 运行时的**高性能原生动态分析与注入工具包**。  
-> 支持 Java 方法 Hook、Smali 反汇编与**运行时 JADX 单类/单方法免 OOM Java 反编译**、堆内存实例枚举（`choose`）、Dalvik 字节码解释沙箱（单步 / StepIn / Mock）、Java↔Native 全栈混合追踪，并通过 **ptrace(不喜欢ptrace可以后续自行更换注入方式) 一键注入 + 多 Payload 链式内嵌 + 内置 QuickJS REPL** 实现终端交互与脚本自动化。
+[中文](README.md) | [English](README_EN.md)
+
+> 面向 Android ART 运行时的**高性能原生动态插桩与逆向分析工具包**。  
+> 支持 Java 方法 Hook、Smali 反汇编与**运行时 JADX 单类/单方法免 OOM Java 反编译**、堆内存实例枚举（`choose`）、Dalvik 字节码解释沙箱（单步 / StepIn / Mock）、Java↔Native 全栈混合追踪，并通过 **ptrace (亦可扩展其它注入方案) 一键注入 + 多 Payload 链式内嵌 + 内置 QuickJS REPL** 实现终端交互与脚本自动化。
 
 适用平台：**Android 7.0 ~ 15（arm64-v8a）**，进程注入需 root。
 
