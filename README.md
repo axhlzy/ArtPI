@@ -5,6 +5,18 @@
 
 适用平台：**Android 7.0 ~ 15（arm64-v8a）**，进程注入需 root。
 
+### 测试验证基准设备 (Test Platform)
+
+| 属性 | 参数 / 说明 |
+|---|---|
+| **设备型号 (Model)** | Google Pixel 6 (`oriole`) |
+| **处理器 (SoC)** | Google Tensor (GS101, 8 核 64 位 arm64-v8a) |
+| **操作系统 (OS)** | Android 13 (Tiramisu, API Level 33) |
+| **系统构建号 (Build ID)** | `TP1A.220624.021` |
+| **Linux 内核 (Kernel)** | `5.10.107-android13-4-00005-ge05ae1680b1c-ab8715050` |
+| **Root 环境** | APatch (Kernel Patch, SuperUser v11039) / Magisk |
+| **SELinux 状态** | Permissive / Enforcing（内置安全上下文自动适配） |
+
 ---
 
 ## 1. 核心能力
@@ -85,7 +97,8 @@ impl_glm/
 │   ├── jadxcli.jar              # 反编译引擎（内嵌到 artpi-cli 中，运行时自动释放）
 │   └── artpi_repl.py            # Python 宿主端 REPL 客户端
 ├── external/                    # xdl (linker 绕过) / xz-embedded / frida-gum / qbdi
-├── assets/                      # 演示截图与展示资源 (findclasses, hookall, listMethods, trace, break, artobject)
+├── assets/                      # 静态展示资源
+│   └── screenshots/             # 实机交互运行效果截图
 └── prebuild/                    # 构建产物 (libartpi.so / libartpi_static.a / libartpi_agent.so / artpi-cli)
 ```
 
@@ -154,27 +167,37 @@ ArtPI 注入目标进程后，通过终端进入内置 QuickJS REPL 即可获得
 
 ### 5.1 类检索与模糊匹配 (`findclass`)
 支持通配符与正则模式，秒级枚举当前运行时中所有已加载的类并输出唯一句柄：
-![Class Search](assets/findclasses.png)
+![Class Search](assets/screenshots/findclasses.png)
 
 ### 5.2 类声明方法与签名列举 (`listMethods`)
 快速列出目标类的所有声明方法、访问标志位（`public/private/static/final` 等）及底层 `ArtMethod*` 指针：
-![List Methods](assets/listMethods.png)
+![List Methods](assets/screenshots/listMethods.png)
+![List Methods Detail](assets/screenshots/listmethods_2.png)
 
 ### 5.3 一键批量 Hook 拦截 (`hookall`)
 无需繁琐编写单个钩子，一键完成整类非抽象/原生方法批量插桩，自动格式化打印被调对象、参数实参及返回结果：
-![Batch Hook](assets/hookall.png)
+![Batch Hook](assets/screenshots/hookall.png)
 
-### 5.4 跨层树形调用链路追踪 (`trace`)
-可视化调用链路树，精准记录每一步执行顺序、嵌套层级与内部方法调用关系：
-![Execution Trace](assets/trace.png)
+### 5.4 跨层树形调用链路追踪 (`Trace.unified` / `trace`)
+全栈贯通 Java 解释执行与 Native C/C++ 机器码，遇到 JNI 边界自动交接，输出连贯的跨层调用链路树：
+- **跨层追踪启动与跨边界交接**：
+![Cross Trace Start](assets/screenshots/cross_trace_start.png)
+- **跨层完整链路执行树**：
+![Cross Trace End](assets/screenshots/cross_trace_end.png)
+- **单方法细粒度追踪**：
+![Execution Trace](assets/screenshots/trace.png)
 
 ### 5.5 断点拦截与单步调试 (`break`)
 在关键方法处下断点拦截执行，支持单步步入/步过（`s`/`n`/`c`）与实时寄存器状态打印（`regs`）：
-![Method Breakpoint](assets/break.png)
+![Method Breakpoint](assets/screenshots/break.png)
 
-### 5.6 活体对象反射持久化 (`artobject`)
+### 5.6 Java $\to$ Native 跨层单步穿透
+单步调试支持无缝穿透 JNI 边界深入底层 Native 机器码，同步观察 ARM64 寄存器状态与反汇编指令：
+![Cross Breakpoint](assets/screenshots/break_cross_java2native.png)
+
+### 5.7 活体对象反射持久化 (`artobject`)
 获取堆内实例后直接提升为持久化全局引用，支持交互式反射调用成员方法与属性读写：
-![Object Reflection](assets/artobject.png)
+![Object Reflection](assets/screenshots/artobject.png)
 
 ---
 
