@@ -1,0 +1,24 @@
+// =============================================================================
+// :agent - injection agent shared library (sources + CMakeLists.txt live here).
+// Links the core library; publishes to prebuild/lib (no external scripts).
+// =============================================================================
+
+tasks.register('build') {
+    group = 'artpi'
+    description = 'Build libartpi_agent.so (links the core library) and publish it to prebuild/lib.'
+    dependsOn ':configureNative'
+    dependsOn ':libartpi'   // agent links the core library
+    doLast {
+        def ninja = rootProject.ext.artpiNinja
+        def bd = rootProject.ext.artpiBuildDir
+        logger.lifecycle('[agent] ninja artpi_agent')
+        project.exec {
+            workingDir rootProject.projectDir
+            commandLine([ninja, '-C', bd.absolutePath, 'artpi_agent'])
+        }
+        def libDir = new File(rootProject.projectDir, 'prebuild/lib/arm64-v8a')
+        libDir.mkdirs()
+        project.copy { from new File(bd, 'src/agent/libartpi_agent.so'); into libDir }
+        logger.lifecycle("[agent] published -> ${libDir}")
+    }
+}

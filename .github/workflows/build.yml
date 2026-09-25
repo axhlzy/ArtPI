@@ -1,0 +1,103 @@
+name: Build ArtPI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (arm64-v8a)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android NDK & Environment
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> $GITHUB_ENV
+
+          # 检测已预装的 NDK（优先使用 26.x）
+          NDK_DIR=""
+          if [ -d "$ANDROID_HOME/ndk" ]; then
+            NDK_DIR=$(find "$ANDROID_HOME/ndk" -maxdepth 1 -name "26.*" | sort -V | tail -n 1)
+            if [ -z "$NDK_DIR" ]; then
+              NDK_DIR=$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+            fi
+          fi
+
+          # 若 runner 无预装 NDK，使用 sdkmanager 安装 r26b (26.1.10909125)
+          if [ -z "$NDK_DIR" ] || [ ! -d "$NDK_DIR" ]; then
+            echo "Installing NDK 26.1.10909125 via sdkmanager..."
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;26.1.10909125"
+            NDK_DIR="$ANDROID_HOME/ndk/26.1.10909125"
+          fi
+
+          echo "Selected NDK: $NDK_DIR"
+          echo "NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+
+          # 写入 local.properties 供 Gradle 和 CMake 识别
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "ndk.dir=$NDK_DIR" >> local.properties
+
+      - name: Install Ninja Build Tool, p7zip & Permissions
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build p7zip-full
+          chmod +x gradlew
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build ArtPI Product (Core, Agent & CLI)
+        run: ./gradlew buildNative --info --stacktrace
+
+      - name: Build Test Suites
+        run: ./gradlew :test:buildTest :test-js:buildTest :test-harness:buildTest --info --stacktrace
+        continue-on-error: true
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artpi-arm64-v8a-${{ github.sha }}
+          path: |
+            prebuild/bin/arm64-v8a/artpi-cli
+            prebuild/lib/arm64-v8a/libartpi_agent.so
+            prebuild/lib/arm64-v8a/libartpi.so
+            prebuild/lib/arm64-v8a/libartpi_static.a
+            prebuild/include/ArtPI.h
+            prebuild/test/
+          retention-days: 30
+
+      - name: Release on Tag Push
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            prebuild/bin/arm64-v8a/artpi-cli
+            prebuild/lib/arm64-v8a/libartpi_agent.so
+            prebuild/lib/arm64-v8a/libartpi.so
+            prebuild/lib/arm64-v8a/libartpi_static.a
+            prebuild/include/ArtPI.h
+          draft: false
+          prerelease: false
+          generate_release_notes: true

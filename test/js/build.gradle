@@ -1,0 +1,19 @@
+// =============================================================================
+// :test-js - Suite 2: QuickJS binding tests (dlopen agent at runtime).
+//   ./gradlew :test-js:build | :test-js:push | :test-js:run -Psu
+// Products: prebuild/test/js/  (libartpi_js_test.so + libartpi_agent.so + classes.dex)
+// =============================================================================
+
+ext.artpiSuite = [
+    name   : 'js',
+    targets: ['artpi_agent', 'artpi_js_test'],
+    libs   : [
+        ['libartpi_js_test.so', new File(rootProject.ext.artpiBuildDir, 'test/libartpi_js_test.so')],
+        ['libartpi_agent.so',   new File(rootProject.ext.artpiBuildDir, 'src/agent/libartpi_agent.so')],
+    ],
+    main   : 'com.artpi.js.JsMain',
+    remote : '/data/local/tmp/artpi_js_test',
+    env    : ['ARTPI_AGENT_LIB=$remote/libartpi_agent.so'],
+]
+
+apply from: "$rootDir/gradle/test-suite.gradle"

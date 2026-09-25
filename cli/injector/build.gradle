@@ -1,0 +1,54 @@
+// =============================================================================
+// :cli - the ArtPI CLI (ptrace injector + REPL), sources in cli/injector/.
+// Compiles its own code, then embeds libartpi_agent.so into the binary using
+// pure JVM code (no pack_payload.py / shell scripts).
+// Produces: prebuild/bin/arm64-v8a/artpi-cli
+// =============================================================================
+
+import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
+
+def appendPayload = { OutputStream os, File payloadFile, String magicStr ->
+    byte[] magic = magicStr.getBytes('US-ASCII')
+    long payloadLen = payloadFile.length()
+    payloadFile.withInputStream { is -> is.transferTo(os) }
+    os.write(magic)
+    byte[] sz = new byte[8]
+    for (int i = 0; i < 8; i++) sz[i] = (byte) ((payloadLen >>> (8 * i)) & 0xFF)
+    os.write(sz)
+}
+
+tasks.register('build') {
+    group = 'artpi'
+    description = 'Build the ArtPI CLI (own code) + embed libartpi_agent.so and jadxcli.jar -> prebuild/bin/artpi-cli.'
+    dependsOn ':configureNative'
+    dependsOn ':agent:build'   // the loaded agent must be built before packing
+    doLast {
+        def ninja = rootProject.ext.artpiNinja
+        def bd = rootProject.ext.artpiBuildDir
+        logger.lifecycle('[cli] ninja artpi-cli')
+        project.exec {
+            workingDir rootProject.projectDir
+            commandLine([ninja, '-C', bd.absolutePath, 'artpi-cli'])
+        }
+        def raw = new File(bd, 'cli/injector/artpi-cli')
+        def agent = new File(bd, 'src/agent/libartpi_agent.so')
+        def jadxJar = new File(rootProject.projectDir, 'cli/jadxcli.jar')
+        def out = new File(rootProject.projectDir, 'prebuild/bin/arm64-v8a/artpi-cli')
+        if (!raw.exists()) throw new GradleException("raw CLI binary not found: ${raw}")
+        if (!agent.exists()) throw new GradleException("agent not found: ${agent}")
+
+        out.parentFile.mkdirs()
+        out.withOutputStream { os ->
+            raw.withInputStream { is -> is.transferTo(os) }
+            appendPayload(os, agent, 'PPAYLOAD')
+            if (jadxJar.exists()) {
+                appendPayload(os, jadxJar, 'PJADXJAR')
+            }
+        }
+        out.setExecutable(true, false)
+        def jadxDesc = jadxJar.exists() ? " + jadx ${jadxJar.length()}B" : ""
+        logger.lifecycle("[cli] packed -> ${out} (raw ${raw.length()}B + agent ${agent.length()}B${jadxDesc} + trailers)")
+    }
+}

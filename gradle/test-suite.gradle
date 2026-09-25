@@ -1,0 +1,111 @@
+// =============================================================================
+// Shared, cross-platform build/push/run logic for one ArtPI functional test
+// suite. Apply from a suite's build.gradle AFTER setting:
+//
+//   ext.artpiSuite = [
+//       name   : 'artpi',                       // prebuild/test/<name> + staging dir
+//       targets: ['artpi_test'],                // ninja targets
+//       libs   : [['libx.so', new File(...)]],  // [publishedName, builtFile]
+//       main   : 'com.artpi.test.Main',         // app_process entry class
+//       remote : '/data/local/tmp/artpi_test',  // device dir
+//       env    : ['ARTPI_TEST_LIB=$remote/libartpi_test.so']
+//   ]
+//   apply from: "$rootDir/gradle/test-suite.gradle"
+//
+// Tasks: build / push / run (no shell scripts required).
+// =============================================================================
+
+def cfg = project.ext.artpiSuite
+def ninjaExe = rootProject.ext.artpiNinja
+def adbExe = rootProject.ext.artpiAdb
+def cmakeBd = rootProject.ext.artpiBuildDir
+def javacExe = rootProject.ext.artpiJavac
+def d8Exe = rootProject.ext.artpiD8
+def androidJar = rootProject.ext.artpiAndroidJar
+def prebuildDir = new File(rootProject.ext.artpiPrebuildTest, cfg.name as String)
+
+tasks.register('buildTest') {
+    group = 'artpi'
+    description = "Build the '${cfg.name}' suite (ninja + javac + d8) -> prebuild/test/${cfg.name}."
+    dependsOn ':configureNative'
+    doLast {
+        if (!d8Exe) throw new GradleException('d8 not found (set sdk.dir / ANDROID_SDK_ROOT)')
+        if (!androidJar) throw new GradleException('android.jar not found (set sdk.dir / ANDROID_SDK_ROOT)')
+
+        def targets = cfg.targets as List
+        logger.lifecycle("[${cfg.name}] ninja ${targets.join(' ')}")
+        project.exec { commandLine([ninjaExe, '-C', cmakeBd.absolutePath] + targets) }
+
+        // javac
+        def clsDir = new File(project.layout.buildDirectory.get().asFile, 'classes')
+        def dexDir = new File(project.layout.buildDirectory.get().asFile, 'dex')
+        project.delete(clsDir); clsDir.mkdirs()
+        def sources = project.fileTree('src') { include '**/*.java' }.files.collect { it.absolutePath }
+        if (sources) {
+            project.exec {
+                commandLine([javacExe, '-source', '8', '-target', '8', '-encoding', 'UTF-8',
+                             '-classpath', androidJar, '-d', clsDir.absolutePath] + sources)
+            }
+        }
+
+        // d8 -> classes.dex
+        project.delete(dexDir); dexDir.mkdirs()
+        def classes = project.fileTree(clsDir) { include '**/*.class' }.files.collect { it.absolutePath }
+        logger.lifecycle("[${cfg.name}] d8 ${classes.size()} class(es)")
+        project.exec {
+            commandLine([d8Exe, '--output', dexDir.absolutePath, '--lib', androidJar, '--min-api', '33'] + classes)
+        }
+
+        // publish
+        prebuildDir.mkdirs()
+        (cfg.libs as List).each { entry ->
+            def fname = entry[0] as String
+            def src = (entry[1] instanceof File) ? (File) entry[1] : new File(entry[1].toString())
+            if (!src.exists()) throw new GradleException("missing ${src}")
+            project.copy { from src; into prebuildDir; rename { fname } }
+        }
+        project.copy { from new File(dexDir, 'classes.dex'); into prebuildDir }
+        logger.lifecycle("[${cfg.name}] published -> ${prebuildDir}")
+    }
+}
+
+tasks.register('pushTest') {
+    group = 'artpi'
+    description = "Build + publish, then push the '${cfg.name}' artifacts to the device."
+    dependsOn 'buildTest'
+    doLast {
+        def serial = project.findProperty('serial')
+        def adbArgs = serial ? ['-s', serial] : []
+        def files = prebuildDir.listFiles()?.findAll { it.isFile } ?: []
+        if (files.isEmpty()) throw new GradleException("no artifacts in ${prebuildDir}")
+
+        def stage = "/sdcard/${cfg.name}_stage"
+        project.exec { commandLine([adbExe] + adbArgs + ['shell', "rm -rf $stage; mkdir -p $stage"]) }
+        files.each { f ->
+            project.exec { commandLine([adbExe] + adbArgs + ['push', f.absolutePath, "$stage/${f.name}"]) }
+        }
+        def names = files.collect { it.name }
+        def copyInto = names.collect { "cp -f $stage/$it ${cfg.remote}/" }.join(' && ')
+        def chmodOn = names.collect { "$stage/$it" }.join(' ')
+        project.exec {
+            commandLine([adbExe] + adbArgs + ['shell',
+                "su -c 'mkdir -p ${cfg.remote} && $copyInto && chmod 644 ${chmodOn} && rm -rf $stage && ls -l ${cfg.remote}'"])
+        }
+    }
+}
+
+tasks.register('runTest') {
+    group = 'artpi'
+    description = "Run the '${cfg.name}' suite on device (app_process ${cfg.main}). -Psu for root."
+    dependsOn 'pushTest'
+    doLast {
+        def serial = project.findProperty('serial')
+        def adbArgs = serial ? ['-s', serial] : []
+        def remote = cfg.remote as String
+        def envs = ((cfg.env ?: []) as List).collect { it.toString().replace('$remote', remote) }.join(' ')
+        def inner = "cd $remote && CLASSPATH=$remote/classes.dex ${envs} app_process /system/bin ${cfg.main}"
+        def cmd = project.hasProperty('su') ? "su -c '$inner'" : inner
+        logger.lifecycle("[${cfg.name}] run: $cmd")
+        project.exec { commandLine([adbExe] + adbArgs + ['shell', '-t', cmd]) }
+    }
+}

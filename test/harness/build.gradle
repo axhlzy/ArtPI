@@ -1,0 +1,19 @@
+// =============================================================================
+// :test-harness - Playground: trace/hook harness (dlopen agent + ticker loop).
+//   ./gradlew :test-harness:build | :test-harness:push | :test-harness:run -Psu
+// Products: prebuild/test/harness/  (libartpi_harness.so + libartpi_agent.so + classes.dex)
+// =============================================================================
+
+ext.artpiSuite = [
+    name   : 'harness',
+    targets: ['artpi_agent', 'artpi_harness'],
+    libs   : [
+        ['libartpi_harness.so', new File(rootProject.ext.artpiBuildDir, 'test/libartpi_harness.so')],
+        ['libartpi_agent.so',   new File(rootProject.ext.artpiBuildDir, 'src/agent/libartpi_agent.so')],
+    ],
+    main   : 'com.artpi.harness.Harness',
+    remote : '/data/local/tmp/artpi_harness',
+    env    : [],
+]
+
+apply from: "$rootDir/gradle/test-suite.gradle"

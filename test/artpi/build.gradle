@@ -1,0 +1,16 @@
+// =============================================================================
+// :test - Suite 1: ArtPI.h native C++ API tests (app_process).
+//   ./gradlew :test:build | :test:push | :test:run -Psu
+// Products: prebuild/test/artpi/  (libartpi_test.so + classes.dex)
+// =============================================================================
+
+ext.artpiSuite = [
+    name   : 'artpi',
+    targets: ['artpi_test'],
+    libs   : [['libartpi_test.so', new File(rootProject.ext.artpiBuildDir, 'test/libartpi_test.so')]],
+    main   : 'com.artpi.test.Main',
+    remote : '/data/local/tmp/artpi_test',
+    env    : ['ARTPI_TEST_LIB=$remote/libartpi_test.so'],
+]
+
+apply from: "$rootDir/gradle/test-suite.gradle"

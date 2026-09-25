@@ -1,0 +1,15 @@
+build/
+doc/
+.cxx/
+.idea/
+.vscode/
+.cache/
+.gradle/
+__pycache__/
+*.pyc
+*.pyo
+prebuild/
+compile_commands.json
+*.a
+.DS_Store
+Thumbs.db

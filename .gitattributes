@@ -1,0 +1,7 @@
+# Line ending rules
+gradlew text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Git LFS not strictly needed since libQBDI.a is stored as libQBDI.7z (<50MB)

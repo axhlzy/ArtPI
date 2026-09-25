@@ -1,0 +1,20 @@
+// The root project itself is the CORE LIBRARY (root CMakeLists.txt spans
+// src/ + engine/ + include/), hence the name.
+rootProject.name = 'artpi-core'
+
+// Product subprojects, mapped onto the REAL source directories they build:
+include ':agent'
+project(':agent').projectDir = file('src/agent')       // links core -> libartpi_agent.so
+
+include ':cli'
+project(':cli').projectDir = file('cli/injector')      // own code + embeds agent -> artpi-cli
+
+// Test suites (NOT part of `build`; run via ./gradlew :test*:…):
+include ':test'
+project(':test').projectDir = file('test/artpi')       // Suite 1: ArtPI.h API
+
+include ':test-js'
+project(':test-js').projectDir = file('test/js')       // Suite 2: QuickJS bindings
+
+include ':test-harness'
+project(':test-harness').projectDir = file('test/harness') // Playground: trace/hook

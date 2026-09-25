@@ -1,0 +1,310 @@
+// =============================================================================
+// ArtPI - standalone Gradle build (self-contained in this directory).
+//
+// Layout (see `./gradlew projects`): Gradle projects map onto the REAL source dirs.
+//   (root)  artpi-core              core library <- root CMakeLists.txt (src/ + engine/ + include/)
+//                                       -> prebuild/lib/.../libartpi.so, libartpi_static.a, include/ArtPI.h
+//   :agent     src/agent            links artpi-core        -> prebuild/lib/.../libartpi_agent.so
+//   :cli       cli/injector         own code + embeds :agent -> prebuild/bin/.../artpi-cli
+//   :test      test/artpi           + :test-js, :test-harness (see settings.gradle)
+//
+// Dependency chain:  artpi-core  <-  :agent  <-  :cli
+//
+// Root aggregate tasks:
+//   ./gradlew buildNative    builds all subprojects (configure + ninja)
+//   ./gradlew deploy         push artpi-cli + agent + libs to the device
+//   ./gradlew cli -Ppkg=X    force-stop, relaunch, inject (server mode)
+//   ./gradlew cleanNative    delete build/ and prebuild/ entirely
+//
+// The native code is built by CMake + Ninja; Gradle is only the orchestrator.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Toolchain / tool discovery (shared with subprojects via rootProject.ext)
+// -----------------------------------------------------------------------------
+def isWin = System.getProperty('os.name').toLowerCase().contains('windows')
+def binExt = isWin ? '.exe' : ''
+
+def localProps = new Properties()
+def localFile = new File(rootDir, 'local.properties')
+if (localFile.exists()) {
+    localFile.withInputStream { localProps.load(it) }
+}
+
+def which = { String name ->
+    def exts = isWin ? ['.exe', '.bat', '.cmd', ''] : ['']
+    def paths = System.getenv('PATH')?.split(File.pathSeparator) ?: []
+    for (p in paths) {
+        for (e in exts) {
+            def f = new File(p, name + e)
+            if (f.exists()) return f.absolutePath
+        }
+    }
+    return name
+}
+
+def latestUnder = { File base, String rel ->
+    if (base == null || !base.isDirectory()) return null
+    def vers = base.listFiles()?.findAll { it.isDirectory() }?.sort { it.name }
+    for (int i = (vers?.size() ?: 0) - 1; i >= 0; i--) {
+        def f = new File(vers[i], rel)
+        if (f.exists()) return f.absolutePath
+    }
+    return null
+}
+
+def sdkDir = (localProps.getProperty('sdk.dir')
+        ?: System.getenv('ANDROID_SDK_ROOT')
+        ?: System.getenv('ANDROID_HOME'))?.toString()?.replace('\\', '/')
+
+def buildDir = new File(rootDir, 'build/arm64-v8a')
+
+def cmakeExe = (sdkDir ? latestUnder(new File(sdkDir, 'cmake'), "bin/cmake${binExt}") : null) ?: which('cmake')
+
+def ninjaExe = null
+def cacheFile = new File(buildDir, 'CMakeCache.txt')
+if (cacheFile.exists()) {
+    def m = (cacheFile.text =~ /CMAKE_MAKE_PROGRAM:[^=]*=(.+)/)
+    if (m.find()) ninjaExe = m.group(1).trim()
+}
+if (!ninjaExe) ninjaExe = (sdkDir ? latestUnder(new File(sdkDir, 'cmake'), "bin/ninja${binExt}") : null) ?: which('ninja')
+
+def adbPath = sdkDir ? new File(sdkDir, 'platform-tools/adb' + binExt) : null
+def adbExe = (adbPath?.exists() ? adbPath.absolutePath : which('adb'))
+
+def ndkHome = localProps.getProperty('ndk.dir') ?: System.getenv('NDK_HOME') ?: System.getenv('ANDROID_NDK_HOME')
+if (!ndkHome && sdkDir) {
+    def ndks = new File(sdkDir, 'ndk')
+    if (ndks.isDirectory()) {
+        def vers = ndks.listFiles().findAll { it.isDirectory() }.sort { it.name }
+        if (vers) ndkHome = vers[-1].absolutePath
+    }
+}
+
+// javac / d8 / android.jar for the test suites (shared with :test* subprojects)
+def javacExe = new File(System.getProperty('java.home'), "bin/javac${binExt}").absolutePath
+def d8Exe = null
+if (sdkDir) {
+    def bt = new File(sdkDir, 'build-tools')
+    for (name in (isWin ? ['d8.bat', 'd8.exe', 'd8'] : ['d8'])) {
+        d8Exe = latestUnder(bt, name)
+        if (d8Exe) break
+    }
+}
+def androidJar = null
+if (sdkDir) {
+    def pf = new File(sdkDir, 'platforms')
+    if (pf.isDirectory()) {
+        def vers = pf.listFiles().findAll { it.isDirectory() }.sort { it.name }
+        def pick = vers.find { it.name == 'android-33' } ?: (vers ? vers[-1] : null)
+        if (pick) {
+            def j = new File(pick, 'android.jar')
+            if (j.exists()) androidJar = j.absolutePath
+        }
+    }
+}
+
+ext {
+    artpiRoot       = rootDir
+    artpiBuildDir   = new File(rootDir, 'build/arm64-v8a')
+    artpiPrebuildBin = new File(rootDir, 'prebuild/bin/arm64-v8a')
+    artpiPrebuildLib = new File(rootDir, 'prebuild/lib/arm64-v8a')
+    artpiPrebuildTest = new File(rootDir, 'prebuild/test')
+    artpiCmake      = cmakeExe
+    artpiNinja      = ninjaExe
+    artpiAdb        = adbExe
+    artpiNdkHome    = ndkHome
+    artpiSdk        = sdkDir
+    artpiIsWin      = isWin
+    artpiJavac      = javacExe
+    artpiD8         = d8Exe
+    artpiAndroidJar = androidJar
+}
+
+// Script-local aliases (top-level defs are captured by the task closures below).
+def prebuildBin = ext.artpiPrebuildBin
+def prebuildLib = ext.artpiPrebuildLib
+
+// -----------------------------------------------------------------------------
+// Root tasks
+// -----------------------------------------------------------------------------
+tasks.register('ensurePrebuiltLibs') {
+    group = 'artpi'
+    description = 'Ensure prebuilt static libraries (.a) exist by extracting from .7z archives if needed.'
+
+    def archives = [
+        [
+            dir  : new File(rootDir, 'external/qbdi/lib/arm64-v8a'),
+            aName: 'libQBDI.a',
+            zName: 'libQBDI.7z'
+        ],
+        [
+            dir  : new File(rootDir, 'external/frida-gum/lib/arm64-v8a'),
+            aName: 'libfrida-gum.a',
+            zName: 'libfrida-gum.7z'
+        ]
+    ]
+
+    onlyIf {
+        archives.any { item -> !new File(item.dir, item.aName).exists() }
+    }
+
+    doLast {
+        def missing = archives.findAll { item -> !new File(item.dir, item.aName).exists() }
+        if (missing.isEmpty()) return
+
+        def zCandidates = ['7z', '7za', '7zr', 'NanaZipC']
+        if (isWin) {
+            zCandidates.addAll([
+                'C:/Program Files/7-Zip/7z.exe',
+                'C:/Program Files (x86)/7-Zip/7z.exe'
+            ])
+        }
+
+        for (item in missing) {
+            def aFile = new File(item.dir, item.aName)
+            def zFile = new File(item.dir, item.zName)
+            if (!zFile.exists()) {
+                throw new GradleException("Neither ${item.aName} nor ${item.zName} found in ${item.dir.absolutePath}")
+            }
+
+            logger.lifecycle("[artpi] ${item.aName} not found. Extracting from ${item.zName}...")
+            boolean success = false
+            Exception lastEx = null
+            for (cmd in zCandidates) {
+                try {
+                    project.exec {
+                        commandLine cmd, 'x', '-y', zFile.absolutePath, "-o${item.dir.absolutePath}"
+                    }
+                    if (aFile.exists()) {
+                        success = true
+                        logger.lifecycle("[artpi] Successfully unpacked ${item.aName} with '${cmd}' (${aFile.length()} bytes)")
+                        break
+                    }
+                } catch (Exception e) {
+                    lastEx = e
+                }
+            }
+
+            if (!success || !aFile.exists()) {
+                throw new GradleException("Failed to extract ${item.zName} (7z/7za not found or failed). Please install 7-Zip or p7zip.", lastEx)
+            }
+        }
+    }
+}
+
+// Backwards-compatible alias
+tasks.register('ensureQbdi') {
+    dependsOn 'ensurePrebuiltLibs'
+}
+
+tasks.register('configureNative') {
+    group = 'artpi'
+    description = 'Configure the ArtPI CMake project (arm64-v8a, Release, Ninja).'
+    dependsOn 'ensurePrebuiltLibs'
+    onlyIf { !new File(buildDir, 'build.ninja').exists() }
+    doLast {
+        if (!cmakeExe) throw new GradleException('cmake not found (set sdk.dir in local.properties or put cmake on PATH)')
+        if (!ndkHome) throw new GradleException('NDK not found (set NDK_HOME env, ndk.dir in local.properties, or install an NDK)')
+        logger.lifecycle("[artpi] cmake --preset android-arm64-release (NDK_HOME=${ndkHome})")
+        project.exec {
+            workingDir rootDir
+            environment 'NDK_HOME', ndkHome
+            commandLine cmakeExe, '--preset', 'android-arm64-release'
+        }
+    }
+}
+
+tasks.register('libartpi') {
+    group = 'artpi'
+    description = 'Build the core library and publish libartpi.so / libartpi_static.a / ArtPI.h.'
+    dependsOn 'ensurePrebuiltLibs'
+    dependsOn 'configureNative'
+    doLast {
+        logger.lifecycle('[libartpi] ninja artpi artpi_static')
+        project.exec {
+            workingDir rootDir
+            commandLine([ninjaExe, '-C', buildDir.absolutePath, 'artpi', 'artpi_static'])
+        }
+        def incDir = new File(rootDir, 'prebuild/include')
+        def libDir = new File(rootDir, 'prebuild/lib/arm64-v8a')
+        incDir.mkdirs(); libDir.mkdirs()
+        project.copy { from new File(rootDir, 'include/ArtPI.h'); into incDir }
+        project.copy { from new File(buildDir, 'libartpi.so'); into libDir }
+        project.copy { from new File(buildDir, 'libartpi_static.a'); into libDir }
+        logger.lifecycle("[libartpi] published -> ${libDir}")
+    }
+}
+
+tasks.register('buildNative') {
+    group = 'artpi'
+    description = 'Build everything: core library + agent + packed CLI (all subprojects).'
+    dependsOn 'libartpi', ':agent:build', ':cli:build'
+    doLast {
+        logger.lifecycle('[artpi] artifacts:')
+        logger.lifecycle("  packed cli      : ${new File(prebuildBin, 'artpi-cli')}")
+        logger.lifecycle("  agent           : ${new File(prebuildLib, 'libartpi_agent.so')}")
+        logger.lifecycle("  static lib      : ${new File(prebuildLib, 'libartpi_static.a')}")
+        logger.lifecycle("  shared lib      : ${new File(prebuildLib, 'libartpi.so')}")
+    }
+}
+
+tasks.register('build') {
+    group = 'build'
+    description = 'Build the product only: core library + agent + packed CLI (tests are separate).'
+    dependsOn 'buildNative'
+}
+
+def runAdb = { List extra ->
+    def serial = project.findProperty('serial')
+    project.exec {
+        commandLine([adbExe] + (serial ? ['-s', serial] : []) + extra)
+    }
+}
+
+def pushArtifacts = {
+    runAdb(['push', new File(prebuildBin, 'artpi-cli').absolutePath, '/data/local/tmp/artpi-cli'])
+    runAdb(['shell', 'chmod 755 /data/local/tmp/artpi-cli; ls -l /data/local/tmp/artpi-cli'])
+}
+
+tasks.register('deploy') {
+    group = 'artpi'
+    description = 'Push the packed CLI (with embedded agent) to the device (/data/local/tmp) and chmod.'
+    dependsOn 'buildNative'
+    doLast { pushArtifacts() }
+}
+
+tasks.register('cli') {
+    group = 'artpi'
+    description = 'Force-stop + relaunch the app, then inject the agent via artpi-cli (server mode).  -Ppkg=<name> | -Ppid=<pid>'
+    dependsOn 'buildNative'
+    doLast {
+        def pkg = project.findProperty('pkg')
+        def pid = project.findProperty('pid')
+        if (!pkg && !pid) throw new GradleException('pass -Ppkg=<package> or -Ppid=<pid>')
+
+        pushArtifacts()
+
+        if (pkg) {
+            // CRITICAL: without a force-stop artpi-cli reuses the live (old) agent.
+            logger.lifecycle("[artpi] force-stop ${pkg}")
+            runAdb(['shell', 'am', 'force-stop', pkg])
+            Thread.sleep(1000)
+            logger.lifecycle("[artpi] launching ${pkg}")
+            runAdb(['shell', 'monkey', '-p', pkg, '-c', 'android.intent.category.LAUNCHER', '1'])
+            Thread.sleep(4000)
+        }
+
+        def target = pkg ? "-k ${pkg}".toString() : "-P ${pid}".toString()
+        logger.lifecycle('[artpi] injecting (server mode)...')
+        runAdb(['shell', "su -c '/data/local/tmp/artpi-cli ${target} --server'"])
+        logger.lifecycle("[artpi] done. Attach with:  adb shell \"su -c '/data/local/tmp/artpi-cli ${target}'\"")
+    }
+}
+
+tasks.register('cleanNative', Delete) {
+    group = 'artpi'
+    description = 'Delete the whole build/ and prebuild/ directories.'
+    delete new File(rootDir, 'build')
+    delete new File(rootDir, 'prebuild')
+}
