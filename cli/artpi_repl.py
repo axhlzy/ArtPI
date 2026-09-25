@@ -43,6 +43,9 @@ COMPLETIONS = [
     "Java.dumpCode(",
     "Java.dumpSmali(",
     "Java.dumpNative(",
+    "Java.decompile(",
+    "Java.disassembly(",
+    "Java.choose(",
     "Java.hook(",
     "Java.unhook(",
     "Java.unhookAll()",
@@ -85,6 +88,9 @@ COMPLETIONS = [
     "dumpcode(",
     "dumpsmali(",
     "dumpnative(",
+    "decompile(",
+    "disassembly(",
+    "choose(",
     "jhook(",
     "nhook(",
     "unhook(",
@@ -112,8 +118,8 @@ COMPLETIONS = [
 ]
 
 
-JAVA_METHOD_ACTIONS = ["dumpCode()", "dumpSmali()", "dumpNative()", "hook(", "hookallclassmethods(", "trace(", "break()", "address", "ptr", "artMethod", "isNative"]
-JAVA_CLASS_ACTIONS = ["dumpCode()", "dumpSmali()", "listMethods()", "findMethods(", "hookall("]
+JAVA_METHOD_ACTIONS = ["dumpCode()", "dumpSmali()", "dumpNative()", "disassembly()", "decompile()", "hook(", "hookallclassmethods(", "trace(", "break()", "address", "ptr", "artMethod", "isNative"]
+JAVA_CLASS_ACTIONS = ["dumpCode()", "dumpSmali()", "disassembly()", "decompile()", "listMethods()", "findMethods(", "hookall(", "choose("]
 NATIVE_SYMBOL_ACTIONS = ["dumpCode()", "dumpNative()", "hook(", "break()", "hexdump()", "address", "ptr", "readCString()", "readByteArray("]
 
 

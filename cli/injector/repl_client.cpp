@@ -171,6 +171,9 @@ const std::vector<std::string> kCompletions = {
     "Java.dumpCode(",
     "Java.dumpSmali(",
     "Java.dumpNative(",
+    "Java.decompile(",
+    "Java.disassembly(",
+    "Java.choose(",
     "Java.hook(",
     "Java.unhook(",
     "Java.unhookAll()",
@@ -223,6 +226,9 @@ const std::vector<std::string> kCompletions = {
     "dumpcode(",
     "dumpsmali(",
     "dumpnative(",
+    "decompile(",
+    "disassembly(",
+    "choose(",
     "jhook(",
     "nhook(",
     "unhook(",
@@ -287,10 +293,10 @@ int g_agentPort = -1;
 std::string g_agentUnix;   // abstract AF_UNIX name when using the unix transport
 
 static const char* kJavaMethodActions[] = {
-    "dumpCode()", "dumpSmali()", "dumpNative()", "hook(", "hookallclassmethods(", "trace(", "break()", "address", "ptr", "artMethod", "isNative"
+    "dumpCode()", "dumpSmali()", "dumpNative()", "disassembly()", "decompile()", "hook(", "hookallclassmethods(", "trace(", "break()", "address", "ptr", "artMethod", "isNative"
 };
 static const char* kJavaClassActions[] = {
-    "dumpCode()", "dumpSmali()", "listMethods()", "findMethods(", "hookall("
+    "dumpCode()", "dumpSmali()", "disassembly()", "decompile()", "listMethods()", "findMethods(", "hookall(", "choose("
 };
 static const char* kNativeSymbolActions[] = {
     "dumpNative()", "break()", "hook(", "hexdump()", "address", "ptr", "readCString()", "readByteArray("
