@@ -1,7 +1,7 @@
 # ArtPI (Art Process Inspector)
 
 > 面向 Android ART 运行时的**高性能原生动态分析与注入工具包**。  
-> 支持 Java 方法 Hook、Smali 反汇编与**运行时 JADX 单类/单方法免 OOM Java 反编译**、堆内存实例枚举（`choose`）、Dalvik 字节码解释沙箱（单步 / StepIn / Mock）、Java↔Native 全栈混合追踪，并通过 **ptrace 一键注入 + 多 Payload 链式内嵌 + 内置 QuickJS REPL** 实现终端交互与脚本自动化。
+> 支持 Java 方法 Hook、Smali 反汇编与**运行时 JADX 单类/单方法免 OOM Java 反编译**、堆内存实例枚举（`choose`）、Dalvik 字节码解释沙箱（单步 / StepIn / Mock）、Java↔Native 全栈混合追踪，并通过 **ptrace(不喜欢ptrace可以后续自行更换注入方式) 一键注入 + 多 Payload 链式内嵌 + 内置 QuickJS REPL** 实现终端交互与脚本自动化。
 
 适用平台：**Android 7.0 ~ 15（arm64-v8a）**，进程注入需 root。
 
@@ -10,12 +10,10 @@
 | 属性 | 参数 / 说明 |
 |---|---|
 | **设备型号 (Model)** | Google Pixel 6 (`oriole`) |
-| **处理器 (SoC)** | Google Tensor (GS101, 8 核 64 位 arm64-v8a) |
 | **操作系统 (OS)** | Android 13 (Tiramisu, API Level 33) |
 | **系统构建号 (Build ID)** | `TP1A.220624.021` |
 | **Linux 内核 (Kernel)** | `5.10.107-android13-4-00005-ge05ae1680b1c-ab8715050` |
 | **Root 环境** | APatch (Kernel Patch, SuperUser v11039) / Magisk |
-| **SELinux 状态** | Permissive / Enforcing（内置安全上下文自动适配） |
 
 ---
 
@@ -333,24 +331,7 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 | `D()` / `detach()` | **一键解挂**：撤销全部 Java/Native Hook、Trace，唤醒所有挂起线程并清除断点 |
 
 ---
-
-## 7. 反编译架构与原理亮点
-
-为什么 ArtPI 能在 Android 移动端实现**秒级、免 OOM 的 Java 源码反编译**？
-
-1. **精准单 DEX 内存捕获**：
-   传统方式是将 App 的整包 `base.apk` 喂给 JADX，导致 JADX 构建数十万个类的全局交叉索引树，内存消耗高达 1GB~2GB，在移动端频繁遭遇 OOM 崩溃。  
-   ArtPI 凭借底层直接持有 `ArtMethod*` 与 `DexCache` 的优势，**直接从内存切片提取目标类所在的单 DEX 文件**（通常仅几 MB），耗时只需约 5ms，并附带 checksum 缓存校验。
-2. **轻量沙盒执行**：
-   通过调用独立进程的 `dalvikvm` 执行内嵌的 `jadxcli.jar`，参数限定为 `--no-res --single-class <className>`，整体反编译在独立的 128~256MB 堆内存沙箱中 2 秒内极速完成，既不干扰 App 自身运行时，也保证了绝对的稳定性。
-3. **方法级语法抽取**：
-   反编译引擎不仅支持整类查看，在针对单方法调用 `.disassembly()` 时，内部算法自动识别声明签名、注解（`@Override` / `JADX INFO` 等）并匹配大括号作用域，精确提取出整洁易读的 Java 方法实现体。
-4. **自包含分发**：
-   `jadxcli.jar` 随 `artpi-cli` 打包嵌入在二进制末尾，目标设备首次使用时自动透明释放，无需手动配置外部工具链。
-
----
-
-## 8. 依赖与致谢
+## 7. 依赖与致谢
 
 - [Pine](https://github.com/canyie/pine) —— Java 方法 Hook 底座（ART 跳板 / ArtMethod 劫持）
 - [JADX](https://github.com/skylot/jadx) —— Dex 转 Java 高性能反编译引擎
