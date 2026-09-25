@@ -85,6 +85,7 @@ impl_glm/
 │   ├── jadxcli.jar              # 反编译引擎（内嵌到 artpi-cli 中，运行时自动释放）
 │   └── artpi_repl.py            # Python 宿主端 REPL 客户端
 ├── external/                    # xdl (linker 绕过) / xz-embedded / frida-gum / qbdi
+├── assets/                      # 演示截图与展示资源 (findclasses, hookall, listMethods, trace)
 └── prebuild/                    # 构建产物 (libartpi.so / libartpi_static.a / libartpi_agent.so / artpi-cli)
 ```
 
@@ -147,9 +148,31 @@ adb shell su -c "/data/local/tmp/artpi-cli -k com.example.app -e 'findclass(\"*A
 
 ---
 
-## 5. JavaScript 运行时 API 手册
+## 5. 实机交互演示 (Showcase)
 
-### 5.1 动态代理链 (`dynamic.*`) — 首选交互方式
+ArtPI 注入目标进程后，通过终端进入内置 QuickJS REPL 即可获得交互式动态逆向体验：
+
+### 5.1 类检索与模糊匹配 (`findclass`)
+支持通配符与正则模式，秒级枚举当前运行时中所有已加载的类并输出唯一句柄：
+![Class Search](assets/findclasses.png)
+
+### 5.2 类声明方法与签名列举 (`listMethods`)
+快速列出目标类的所有声明方法、访问标志位（`public/private/static/final` 等）及底层 `ArtMethod*` 指针：
+![List Methods](assets/listMethods.png)
+
+### 5.3 一键批量 Hook 拦截 (`hookall`)
+无需繁琐编写单个钩子，一键完成整类非抽象/原生方法批量插桩，自动格式化打印被调对象、参数实参及返回结果：
+![Batch Hook](assets/hookall.png)
+
+### 5.4 跨层树形调用链路追踪 (`trace`)
+可视化调用链路树，精准记录每一步执行顺序、嵌套层级与内部方法调用关系：
+![Execution Trace](assets/trace.png)
+
+---
+
+## 6. JavaScript 运行时 API 手册
+
+### 6.1 动态代理链 (`dynamic.*`) — 首选交互方式
 
 `dynamic` 提供类似属性树的直观链式调用，支持点号智能路由（包名、类名、内部类、方法名全自动解析）。
 
@@ -217,7 +240,7 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 
 ---
 
-### 5.2 `Java.*` — 核心 Java 与 ART 域
+### 6.2 `Java.*` — 核心 Java 与 ART 域
 
 | API | 签名 | 返回值 | 说明 |
 |---|---|---|---|
@@ -238,7 +261,7 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 
 ---
 
-### 5.3 `Native.*` 与 `DebugSymbol.*` — 原生二进制与符号域
+### 6.3 `Native.*` 与 `DebugSymbol.*` — 原生二进制与符号域
 
 | API | 签名 | 说明 |
 |---|---|---|
@@ -252,7 +275,7 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 
 ---
 
-### 5.4 `Memory.*` — 内存安全读写
+### 6.4 `Memory.*` — 内存安全读写
 
 | API | 签名 | 说明 |
 |---|---|---|
@@ -264,7 +287,7 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 
 ---
 
-### 5.5 `Trace.*` 与 `Debug.*` — 协作式单步与追踪
+### 6.5 `Trace.*` 与 `Debug.*` — 协作式单步与追踪
 
 | API | 说明 |
 |---|---|
@@ -280,7 +303,7 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 
 ---
 
-## 6. 反编译架构与原理亮点
+## 7. 反编译架构与原理亮点
 
 为什么 ArtPI 能在 Android 移动端实现**秒级、免 OOM 的 Java 源码反编译**？
 
@@ -296,7 +319,7 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 
 ---
 
-## 7. 依赖与致谢
+## 8. 依赖与致谢
 
 - [Pine](https://github.com/canyie/pine) —— Java 方法 Hook 底座（ART 跳板 / ArtMethod 劫持）
 - [JADX](https://github.com/skylot/jadx) —— Dex 转 Java 高性能反编译引擎
