@@ -156,7 +156,7 @@ static std::string makeBranchPrefix(int depth, bool isEntry) {
 
 } // namespace
 
-void setupFullStackNativeCallbacks(int baseDepth) {
+void setupFullStackNativeCallbacks(int baseDepth, bool logMem) {
     UnifiedCallDepth::set(baseDepth);
     t_subcall_stack.clear();
     t_last_was_svc = false;
@@ -259,27 +259,82 @@ void setupFullStackNativeCallbacks(int baseDepth) {
         return 0; // CONTINUE
     });
 
-    engine->setMemoryAccessCallback([](uintptr_t insnPc, uintptr_t addr, size_t size,
-                                       bool isWrite, uint64_t val) {
-        (void) insnPc;
+    // Default: log changed registers after each instruction executes
+    engine->setPostInstructionCallback([](uintptr_t /*pc*/, void* rawPreGpr, void* rawPostGpr) {
+        if (!rawPreGpr || !rawPostGpr) return;
+        const auto* pre = static_cast<const QBDI::GPRState*>(rawPreGpr);
+        const auto* post = static_cast<const QBDI::GPRState*>(rawPostGpr);
+
         int base = UnifiedCallDepth::get();
         int subDepth = static_cast<int>(t_subcall_stack.size());
-        std::string memPfx = makeTreePrefix(base + subDepth) + "│   ";
+        std::string regPfx = makeTreePrefix(base + subDepth) + "│   ";
 
-        if (isWrite) {
+        std::string diffStr;
+        const uint64_t* preX = &pre->x0;
+        const uint64_t* postX = &post->x0;
+        for (int i = 0; i <= 28; i++) {
+            if (preX[i] != postX[i]) {
+                if (!diffStr.empty()) diffStr += "  ";
+                char buf[64];
+                snprintf(buf, sizeof(buf), "x%d=0x%lx", i, (unsigned long) postX[i]);
+                diffStr += buf;
+            }
+        }
+        if (pre->x29 != post->x29) {
+            if (!diffStr.empty()) diffStr += "  ";
+            char buf[64];
+            snprintf(buf, sizeof(buf), "x29=0x%lx", (unsigned long) post->x29);
+            diffStr += buf;
+        }
+        if (pre->lr != post->lr) {
+            if (!diffStr.empty()) diffStr += "  ";
+            char buf[64];
+            snprintf(buf, sizeof(buf), "lr=0x%lx", (unsigned long) post->lr);
+            diffStr += buf;
+        }
+        if (pre->sp != post->sp) {
+            if (!diffStr.empty()) diffStr += "  ";
+            char buf[64];
+            snprintf(buf, sizeof(buf), "sp=0x%lx", (unsigned long) post->sp);
+            diffStr += buf;
+        }
+
+        if (!diffStr.empty()) {
             PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree",
-                            "%s[mem] 0x%lx <- 0x%lx (%zu bytes)",
-                            memPfx.c_str(), (unsigned long) addr, (unsigned long) val, size);
-        } else {
-            PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree",
-                            "%s[mem] 0x%lx -> 0x%lx (%zu bytes)",
-                            memPfx.c_str(), (unsigned long) addr, (unsigned long) val, size);
+                            "%s%s",
+                            regPfx.c_str(), diffStr.c_str());
         }
     });
+
+    if (logMem) {
+        engine->setMemoryAccessCallback([](uintptr_t insnPc, uintptr_t addr, size_t size,
+                                           bool isWrite, uint64_t val) {
+            (void) insnPc;
+            int base = UnifiedCallDepth::get();
+            int subDepth = static_cast<int>(t_subcall_stack.size());
+            std::string memPfx = makeTreePrefix(base + subDepth) + "│   ";
+
+            if (isWrite) {
+                PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree",
+                                "%s[mem] 0x%lx <- 0x%lx (%zu bytes)",
+                                memPfx.c_str(), (unsigned long) addr, (unsigned long) val, size);
+            } else {
+                PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree",
+                                "%s[mem] 0x%lx -> 0x%lx (%zu bytes)",
+                                memPfx.c_str(), (unsigned long) addr, (unsigned long) val, size);
+            }
+        });
+    }
 }
 
 void cleanupFullStackNativeCallbacks() {
     t_subcall_stack.clear();
+    t_last_was_svc = false;
+    t_last_svc_name.clear();
+    Native::QBDIEngine* engine = Native::QBDIEngine::current();
+    if (engine != nullptr) {
+        engine->clearCallbacks();
+    }
 }
 
 }} // namespace PI::Trace

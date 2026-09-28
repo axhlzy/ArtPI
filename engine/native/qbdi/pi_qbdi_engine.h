@@ -69,9 +69,12 @@ public:
             return cb(pc, mnemonic, disasm, depth);
         });
     }
+    void setPostInstructionCallback(
+        std::function<void(uintptr_t pc, void* preGpr, void* postGpr)> cb);
     void setMemoryAccessCallback(
         std::function<void(uintptr_t insnPc, uintptr_t addr, size_t size,
                            bool isWrite, uint64_t val)> cb);
+    void clearCallbacks();
 
 private:
     struct Impl;

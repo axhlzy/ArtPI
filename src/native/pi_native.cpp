@@ -23,6 +23,8 @@ namespace PI {
 namespace {
 
 static bool IsDlsymLookupStub(void* entry) {
+    if (entry == nullptr || reinterpret_cast<uintptr_t>(entry) < 0x1000) return true;
+
     static void* stub = []() -> void* {
         void* h = xdl_open("libart.so", XDL_DEFAULT);
         if (!h) return nullptr;
@@ -31,7 +33,20 @@ static bool IsDlsymLookupStub(void* entry) {
         xdl_close(h);
         return s;
     }();
-    return stub != nullptr && entry == stub;
+    if (stub != nullptr && entry == stub) return true;
+
+    xdl_info_t info{};
+    void* cache = nullptr;
+    if (xdl_addr(entry, &info, &cache) != 0 && info.dli_fname != nullptr) {
+        const char* fname = info.dli_fname;
+        if (std::strstr(fname, "libart.so") != nullptr ||
+            std::strstr(fname, "libartd.so") != nullptr) {
+            xdl_addr_clean(&cache);
+            return true;
+        }
+    }
+    if (cache != nullptr) xdl_addr_clean(&cache);
+    return false;
 }
 
 } // namespace
@@ -237,6 +252,81 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
         ? ((max_instructions > 0) ? max_instructions : 21)
         : ((max_instructions > 0) ? max_instructions : 256);
 
+    // ---------------------------------------------------------------------------
+    // ARM64 Control Flow Graph (CFG) & Function Boundary Analysis
+    // ---------------------------------------------------------------------------
+    struct CFGBlock {
+        uintptr_t start_pc = 0;
+        uintptr_t end_pc = 0;
+        std::vector<uintptr_t> succs;
+        bool ends_with_ret = false;
+        bool ends_with_tail_call = false;
+    };
+
+    struct CFGResult {
+        uintptr_t func_start = 0;
+        uintptr_t func_end = 0;
+        std::set<uintptr_t> reachable_pcs;
+        std::set<uintptr_t> branch_targets;
+        std::vector<CFGBlock> blocks;
+    };
+
+    auto isNoreturnTarget = [](uintptr_t target_addr, void** xdl_cache) -> bool {
+        if (target_addr < 0x1000) return false;
+        xdl_info_t sym_info{};
+        if (xdl_addr(reinterpret_cast<void*>(target_addr), &sym_info, xdl_cache) != 0 && sym_info.dli_sname) {
+            const char* name = sym_info.dli_sname;
+            if (!name) return false;
+            if (strcmp(name, "abort") == 0 ||
+                strcmp(name, "exit") == 0 ||
+                strcmp(name, "_exit") == 0 ||
+                strcmp(name, "_Exit") == 0 ||
+                strcmp(name, "__stack_chk_fail") == 0 ||
+                strcmp(name, "__assert2") == 0 ||
+                strcmp(name, "__assert") == 0 ||
+                strcmp(name, "__cxa_throw") == 0 ||
+                strcmp(name, "panic") == 0 ||
+                strstr(name, "art_quick_throw_") != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto isFunctionPrologue = [](uint32_t w) -> bool {
+        if (w == 0xd503233f /* paciasp */) return true;
+        // stp x29, x30, [sp, -imm]! (pre-indexed frame setup)
+        if ((w & 0xffc00000) == 0xa9800000) {
+            uint32_t rt = w & 0x1f;
+            uint32_t rn = (w >> 5) & 0x1f;
+            uint32_t rt2 = (w >> 10) & 0x1f;
+            if (rn == 31 && rt == 29 && rt2 == 30) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto isTailCallTarget = [&](uintptr_t fstart, uintptr_t target_addr, void** xdl_cache) -> bool {
+        if (target_addr < fstart) return true;
+        if (target_addr >= fstart + 0x40000) return true;
+
+        xdl_info_t sym_info{};
+        if (xdl_addr(reinterpret_cast<void*>(target_addr), &sym_info, xdl_cache) != 0 && sym_info.dli_saddr) {
+            uintptr_t saddr = reinterpret_cast<uintptr_t>(sym_info.dli_saddr);
+            if (saddr == target_addr && target_addr != fstart) {
+                return true;
+            }
+        }
+        if (target_addr != fstart) {
+            const uint32_t* tw = reinterpret_cast<const uint32_t*>(target_addr);
+            if (isFunctionPrologue(*tw)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     // 3. Initialize Capstone ARM64 disassembler & Frida-Gum
     static std::once_flag s_cs_init_flag;
     std::call_once(s_cs_init_flag, []() {
@@ -254,8 +344,206 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
     }
     cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-    int max_limit = listing_window;
+    // 4. Perform CFG Reachability & Basic Block Analysis
+    CFGResult cfg;
+    cfg.func_start = func_start;
+    cfg.func_end = func_start + 4;
+
+    std::set<uintptr_t> visited_blocks;
+    std::vector<uintptr_t> worklist;
+    worklist.push_back(func_start);
+    visited_blocks.insert(func_start);
+
+    const size_t kMaxInsnsExplored = 4096;
+    size_t explored_count = 0;
+
+    while (!worklist.empty() && explored_count < kMaxInsnsExplored) {
+        uintptr_t block_start = worklist.back();
+        worklist.pop_back();
+
+        uintptr_t cur_pc = block_start;
+        CFGBlock block;
+        block.start_pc = block_start;
+
+        while (explored_count < kMaxInsnsExplored) {
+            if (cfg.reachable_pcs.count(cur_pc) && cur_pc != block_start) {
+                block.end_pc = cur_pc - 4;
+                block.succs.push_back(cur_pc);
+                break;
+            }
+
+            cfg.reachable_pcs.insert(cur_pc);
+            explored_count++;
+
+            const uint8_t* code_bytes = reinterpret_cast<const uint8_t*>(cur_pc);
+            cs_insn* insn = nullptr;
+            size_t count = cs_disasm(cs_handle, code_bytes, 4, cur_pc, 1, &insn);
+            if (count == 0 || !insn) {
+                block.end_pc = cur_pc;
+                break;
+            }
+
+            bool is_cond_branch = false;
+            bool is_uncond_branch = false;
+            bool is_ret = (insn->id == ARM64_INS_RET || insn->id == ARM64_INS_RETAA || insn->id == ARM64_INS_RETAB);
+            bool is_tail_call = false;
+            bool is_call = false;
+            bool is_noreturn = false;
+            uintptr_t target = 0;
+
+            if (insn->detail) {
+                auto& arm64 = insn->detail->arm64;
+                switch (insn->id) {
+                    case ARM64_INS_B:
+                        if (arm64.op_count >= 1 && arm64.operands[0].type == ARM64_OP_IMM) {
+                            target = static_cast<uintptr_t>(arm64.operands[0].imm);
+                            if (arm64.cc != ARM64_CC_AL && arm64.cc != ARM64_CC_INVALID) {
+                                is_cond_branch = true;
+                            } else {
+                                is_uncond_branch = true;
+                            }
+                        }
+                        break;
+                    case ARM64_INS_BC:
+                    case ARM64_INS_CBZ:
+                    case ARM64_INS_CBNZ:
+                    case ARM64_INS_TBZ:
+                    case ARM64_INS_TBNZ:
+                        is_cond_branch = true;
+                        if (insn->id == ARM64_INS_TBZ || insn->id == ARM64_INS_TBNZ) {
+                            if (arm64.op_count >= 3 && arm64.operands[2].type == ARM64_OP_IMM) target = static_cast<uintptr_t>(arm64.operands[2].imm);
+                        } else if (insn->id == ARM64_INS_CBZ || insn->id == ARM64_INS_CBNZ) {
+                            if (arm64.op_count >= 2 && arm64.operands[1].type == ARM64_OP_IMM) target = static_cast<uintptr_t>(arm64.operands[1].imm);
+                        } else {
+                            if (arm64.op_count >= 1 && arm64.operands[0].type == ARM64_OP_IMM) target = static_cast<uintptr_t>(arm64.operands[0].imm);
+                        }
+                        break;
+                    case ARM64_INS_BL:
+                        is_call = true;
+                        if (arm64.op_count >= 1 && arm64.operands[0].type == ARM64_OP_IMM) {
+                            target = static_cast<uintptr_t>(arm64.operands[0].imm);
+                            is_noreturn = isNoreturnTarget(target, &cache);
+                        }
+                        break;
+                    case ARM64_INS_BR:
+                    case ARM64_INS_BRAA:
+                    case ARM64_INS_BRAAZ:
+                    case ARM64_INS_BRAB:
+                    case ARM64_INS_BRABZ:
+                        is_tail_call = true;
+                        break;
+                    case ARM64_INS_BRK:
+                    case ARM64_INS_UDF:
+                    case ARM64_INS_HLT:
+                        is_noreturn = true;
+                        is_call = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            cs_free(insn, count);
+
+            if (is_ret) {
+                block.ends_with_ret = true;
+                block.end_pc = cur_pc;
+                cfg.blocks.push_back(block);
+                break;
+            }
+
+            if (is_tail_call) {
+                block.ends_with_tail_call = true;
+                block.end_pc = cur_pc;
+                cfg.blocks.push_back(block);
+                break;
+            }
+
+            if (is_uncond_branch) {
+                if (isTailCallTarget(func_start, target, &cache)) {
+                    block.ends_with_tail_call = true;
+                } else {
+                    cfg.branch_targets.insert(target);
+                    block.succs.push_back(target);
+                    if (visited_blocks.insert(target).second) {
+                        worklist.push_back(target);
+                    }
+                }
+                block.end_pc = cur_pc;
+                cfg.blocks.push_back(block);
+                break;
+            }
+
+            if (is_cond_branch) {
+                if (target >= func_start && target < func_start + 0x40000) {
+                    cfg.branch_targets.insert(target);
+                    block.succs.push_back(target);
+                    if (visited_blocks.insert(target).second) {
+                        worklist.push_back(target);
+                    }
+                }
+                uintptr_t fallthru = cur_pc + 4;
+                block.succs.push_back(fallthru);
+                if (visited_blocks.insert(fallthru).second) {
+                    worklist.push_back(fallthru);
+                }
+                block.end_pc = cur_pc;
+                cfg.blocks.push_back(block);
+                break;
+            }
+
+            if (is_call && is_noreturn) {
+                block.end_pc = cur_pc;
+                cfg.blocks.push_back(block);
+                break;
+            }
+
+            uintptr_t next_pc = cur_pc + 4;
+            if (known_size > 0 && (next_pc - func_start) >= known_size) {
+                block.end_pc = cur_pc;
+                cfg.blocks.push_back(block);
+                break;
+            }
+
+            if (cfg.branch_targets.count(next_pc)) {
+                block.end_pc = cur_pc;
+                block.succs.push_back(next_pc);
+                if (visited_blocks.insert(next_pc).second) {
+                    worklist.push_back(next_pc);
+                }
+                cfg.blocks.push_back(block);
+                break;
+            }
+
+            // If next_pc is the start of another ELF symbol, the current function has ended
+            if (next_pc != func_start) {
+                xdl_info_t sym_check{};
+                if (xdl_addr(reinterpret_cast<void*>(next_pc), &sym_check, &cache) != 0 && sym_check.dli_saddr) {
+                    if (reinterpret_cast<uintptr_t>(sym_check.dli_saddr) == next_pc) {
+                        block.end_pc = cur_pc;
+                        cfg.blocks.push_back(block);
+                        break;
+                    }
+                }
+            }
+
+            cur_pc = next_pc;
+        }
+    }
+
+    if (cfg.reachable_pcs.empty()) {
+        cfg.func_end = func_start + 4;
+    } else {
+        cfg.func_end = *cfg.reachable_pcs.rbegin() + 4;
+    }
+    if (known_size > 0 && known_size < 0x80000) {
+        cfg.func_end = std::min(cfg.func_end, func_start + known_size);
+    }
+
+    // 5. Linear instruction disassembly within CFG-determined function bounds
     uintptr_t dump_start = func_start;
+    uintptr_t dump_end = cfg.func_end;
+
     if (windowed) {
         uintptr_t center = (highlight_pc >= 0x1000) ? highlight_pc : pc;
         uintptr_t before = static_cast<uintptr_t>(listing_window / 2) * 4u;
@@ -264,18 +552,29 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
         if (center >= func_start && dump_start < func_start) {
             dump_start = func_start;
         }
-        max_limit = listing_window + 4;
+        dump_end = std::min(cfg.func_end, dump_start + static_cast<uintptr_t>(listing_window + 4) * 4u);
+    } else if (max_instructions > 0) {
+        dump_end = std::min(cfg.func_end, dump_start + static_cast<uintptr_t>(max_instructions) * 4u);
     }
+
     std::vector<NativeInsn> insns_list;
     uintptr_t cur_pc = dump_start;
-    uintptr_t max_forward_target = dump_start;
 
-    while (insns_list.size() < static_cast<size_t>(max_limit)) {
+    while (cur_pc < dump_end) {
         const uint8_t* code_bytes = reinterpret_cast<const uint8_t*>(cur_pc);
         cs_insn* insn = nullptr;
         size_t count = cs_disasm(cs_handle, code_bytes, 4, cur_pc, 1, &insn);
         if (count == 0 || !insn) {
-            break;
+            NativeInsn item;
+            item.addr = cur_pc;
+            std::memcpy(item.bytes, code_bytes, 4);
+            item.mnemonic = ".word";
+            char wb[32];
+            snprintf(wb, sizeof(wb), "0x%08x", *reinterpret_cast<const uint32_t*>(cur_pc));
+            item.op_str = wb;
+            insns_list.push_back(item);
+            cur_pc += 4;
+            continue;
         }
 
         NativeInsn item;
@@ -328,48 +627,15 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
         }
 
         insns_list.push_back(item);
-
-        if (item.is_branch && item.target_addr > cur_pc &&
-            item.target_addr < static_cast<uintptr_t>(func_start + 0x20000)) {
-            if (item.target_addr > max_forward_target) {
-                max_forward_target = item.target_addr;
-            }
-        }
-
-        bool is_ret = (insn->id == ARM64_INS_RET);
-        bool is_tail_branch = (insn->id == ARM64_INS_B && insn->detail &&
-                               insn->detail->arm64.op_count == 1 &&
-                               insn->detail->arm64.operands[0].type == ARM64_OP_IMM &&
-                               (insn->detail->arm64.operands[0].imm < static_cast<int64_t>(func_start) ||
-                                insn->detail->arm64.operands[0].imm > static_cast<int64_t>(func_start + 0x10000)));
-
         cs_free(insn, count);
-
         cur_pc += 4;
-
-        if (!windowed) {
-            if (known_size > 0 && (cur_pc - func_start) >= known_size) {
-                break;
-            }
-            if (known_size == 0 && (is_ret || is_tail_branch) && cur_pc >= max_forward_target) {
-                const uint32_t* next_word = reinterpret_cast<const uint32_t*>(cur_pc);
-                uint32_t w = *next_word;
-                if (w == 0 || w == 0xd503201f /* nop */ || w == 0xd503233f /* paciasp */ ||
-                    (w & 0xffc003e0) == 0xa98003e0 /* stp */) {
-                    break;
-                }
-                if (is_ret) {
-                    break;
-                }
-            }
-        }
     }
 
     cs_close(&cs_handle);
 
     size_t total_bytes = insns_list.size() * 4;
 
-    // 4. Construct intra-function CFG jump table & assign lanes
+    // 6. Construct intra-function CFG jump table & assign lanes
     struct JumpInfo {
         size_t src_idx = 0;
         size_t dst_idx = 0;
@@ -512,6 +778,10 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
         }
     }
 
+    ss << "  CFG Function Bounds: 0x" << std::hex << func_start << " - 0x" << cfg.func_end << std::dec
+       << " (0x" << std::hex << (cfg.func_end - func_start) << std::dec << " bytes, "
+       << ((cfg.func_end - func_start) / 4) << " instructions, "
+       << cfg.blocks.size() << " basic blocks)\n";
     ss << "  Size: " << total_bytes << " bytes (" << insns_list.size() << " instructions)";
     if (windowed && (win_begin > 0 || win_end < insns_list.size())) {
         ss << "  showing [" << win_begin << ".." << (win_end ? win_end - 1 : 0) << "]";

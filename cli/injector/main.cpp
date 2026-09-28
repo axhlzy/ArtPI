@@ -190,6 +190,7 @@ namespace {
         const char* targetPath = "/data/local/tmp/jadxcli.jar";
         struct stat st{};
         if (stat(targetPath, &st) == 0 && st.st_size > 1000000) {
+            chmod(targetPath, 0666);
             return;
         }
 

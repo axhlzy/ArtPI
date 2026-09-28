@@ -34,6 +34,8 @@ namespace {
 // dlsym 预热桩识别: entry == art_jni_dlsym_lookup_stub
 // ---------------------------------------------------------------------------
 bool isDlsymLookupStub(void* entry) {
+    if (entry == nullptr || reinterpret_cast<uintptr_t>(entry) < 0x1000) return true;
+
     static void* stub = []() -> void* {
         void* h = xdl_open("libart.so", XDL_DEFAULT);
         if (h == nullptr) return nullptr;
@@ -42,7 +44,22 @@ bool isDlsymLookupStub(void* entry) {
         xdl_close(h);
         return s;
     }();
-    return stub != nullptr && entry == stub;
+    if (stub != nullptr && entry == stub) return true;
+
+    // Release devices strip internal symbols, so check module name directly:
+    // Any entry point pointing inside libart.so is an ART internal stub/trampoline!
+    xdl_info_t info{};
+    void* cache = nullptr;
+    if (xdl_addr(entry, &info, &cache) != 0 && info.dli_fname != nullptr) {
+        const char* fname = info.dli_fname;
+        if (std::strstr(fname, "libart.so") != nullptr ||
+            std::strstr(fname, "libartd.so") != nullptr) {
+            xdl_addr_clean(&cache);
+            return true;
+        }
+    }
+    if (cache != nullptr) xdl_addr_clean(&cache);
+    return false;
 }
 
 // ---------------------------------------------------------------------------

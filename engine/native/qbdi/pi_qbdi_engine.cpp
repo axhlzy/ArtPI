@@ -26,16 +26,24 @@ struct QBDIEngine::Impl {
     bool     aborted = false;
 
     std::function<int(uintptr_t, const char*, const char*, int, void*)> insnCb;
+    std::function<void(uintptr_t, void*, void*)> postInsnCb;
     std::function<void(uintptr_t, uintptr_t, size_t, bool, uint64_t)> memCb;
 
     uint8_t* fakeStack = nullptr;
     static constexpr uint32_t kStackSize = 1u << 20;
 
-    uint32_t insnCbId = QBDI::INVALID_EVENTID;
-    uint32_t memCbId  = QBDI::INVALID_EVENTID;
+    uint32_t insnCbId     = QBDI::INVALID_EVENTID;
+    uint32_t postInsnCbId = QBDI::INVALID_EVENTID;
+    uint32_t memCbId      = QBDI::INVALID_EVENTID;
+
+    QBDI::GPRState lastPreGpr{};
+    uintptr_t lastInsnPc = 0;
+    bool hasPreGpr = false;
 
     static QBDI::VMAction budgetAndInsnTrampoline(QBDI::VMInstanceRef vm,
                                                   QBDI::GPRState*, QBDI::FPRState*, void*);
+    static QBDI::VMAction postInsnTrampoline(QBDI::VMInstanceRef vm,
+                                             QBDI::GPRState*, QBDI::FPRState*, void*);
     static QBDI::VMAction memTrampoline(QBDI::VMInstanceRef vm,
                               QBDI::GPRState*, QBDI::FPRState*, void*);
 };
@@ -71,17 +79,27 @@ QBDI::VMAction QBDIEngine::Impl::budgetAndInsnTrampoline(
         impl->aborted = true;
         return QBDI::VMAction::STOP;
     }
+
+    const QBDI::InstAnalysis* ana = vmRef->getInstAnalysis(
+        QBDI::ANALYSIS_INSTRUCTION | QBDI::ANALYSIS_DISASSEMBLY |
+        QBDI::ANALYSIS_SYMBOL | QBDI::ANALYSIS_OPERANDS);
+    impl->lastInsnPc = (uintptr_t) (ana ? ana->address : 0);
+
+    if (gpr != nullptr) {
+        impl->lastPreGpr = *gpr;
+        impl->hasPreGpr = true;
+    } else {
+        impl->hasPreGpr = false;
+    }
+
     if (impl->insnCb) {
-        const QBDI::InstAnalysis* ana = vmRef->getInstAnalysis(
-            QBDI::ANALYSIS_INSTRUCTION | QBDI::ANALYSIS_DISASSEMBLY |
-            QBDI::ANALYSIS_SYMBOL | QBDI::ANALYSIS_OPERANDS);
         // NOTE: do NOT call addInstrumentedModuleFromAddr() here. Mutating
         // instrumented ranges while the VM is running invalidates QBDI's code
         // cache and makes vm.run() return false (status EXECUTION_ERROR),
         // discarding the real return value. Target modules are pre-added by
         // the caller (e.g. JniNativeBridge::dispatchToNative) before run().
         int action = impl->insnCb(
-            (uintptr_t) (ana ? ana->address : 0),
+            impl->lastInsnPc,
             (ana && ana->mnemonic) ? ana->mnemonic : "",
             (ana && ana->disassembly) ? ana->disassembly : "",
             0,
@@ -91,6 +109,16 @@ QBDI::VMAction QBDIEngine::Impl::budgetAndInsnTrampoline(
             return QBDI::VMAction::STOP;
         }
     }
+    return QBDI::VMAction::CONTINUE;
+}
+
+QBDI::VMAction QBDIEngine::Impl::postInsnTrampoline(
+        QBDI::VMInstanceRef /*vmRef*/, QBDI::GPRState* gpr, QBDI::FPRState*, void* data) {
+    Impl* impl = static_cast<Impl*>(data);
+    if (impl->postInsnCb && impl->hasPreGpr && gpr != nullptr) {
+        impl->postInsnCb(impl->lastInsnPc, &impl->lastPreGpr, static_cast<void*>(gpr));
+    }
+    impl->hasPreGpr = false;
     return QBDI::VMAction::CONTINUE;
 }
 
@@ -145,10 +173,22 @@ void QBDIEngine::setInstructionCallback(
         std::function<int(uintptr_t, const char*, const char*, int, void*)> cb) {
     std::lock_guard<std::recursive_mutex> lock(impl_->vmMutex);
     impl_->insnCb = std::move(cb);
-    if (impl_->insnCbId == QBDI::INVALID_EVENTID) {
+    if (impl_->insnCb && impl_->insnCbId == QBDI::INVALID_EVENTID) {
         impl_->insnCbId = impl_->vm.addCodeCB(
             QBDI::InstPosition::PREINST,
             &QBDIEngine::Impl::budgetAndInsnTrampoline, impl_,
+            QBDI::PRIORITY_DEFAULT);
+    }
+}
+
+void QBDIEngine::setPostInstructionCallback(
+        std::function<void(uintptr_t, void*, void*)> cb) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->vmMutex);
+    impl_->postInsnCb = std::move(cb);
+    if (impl_->postInsnCb && impl_->postInsnCbId == QBDI::INVALID_EVENTID) {
+        impl_->postInsnCbId = impl_->vm.addCodeCB(
+            QBDI::InstPosition::POSTINST,
+            &QBDIEngine::Impl::postInsnTrampoline, impl_,
             QBDI::PRIORITY_DEFAULT);
     }
 }
@@ -157,13 +197,20 @@ void QBDIEngine::setMemoryAccessCallback(
         std::function<void(uintptr_t, uintptr_t, size_t, bool, uint64_t)> cb) {
     std::lock_guard<std::recursive_mutex> lock(impl_->vmMutex);
     impl_->memCb = std::move(cb);
-    if (impl_->memCbId == QBDI::INVALID_EVENTID) {
+    if (impl_->memCb && impl_->memCbId == QBDI::INVALID_EVENTID) {
         impl_->vm.recordMemoryAccess(QBDI::MEMORY_READ_WRITE);
         impl_->memCbId = impl_->vm.addMemAccessCB(
             QBDI::MEMORY_READ_WRITE,
             &QBDIEngine::Impl::memTrampoline, (void*) impl_,
             QBDI::PRIORITY_DEFAULT);
     }
+}
+
+void QBDIEngine::clearCallbacks() {
+    std::lock_guard<std::recursive_mutex> lock(impl_->vmMutex);
+    impl_->insnCb = nullptr;
+    impl_->postInsnCb = nullptr;
+    impl_->memCb = nullptr;
 }
 
 NativeRunResult QBDIEngine::run(void* functionAddr,

@@ -315,7 +315,12 @@ const char* kDynamicBootstrapJs = R"JS(
                 return out;
             },
             dumpSmali: function(maxInsns) {
-                return dumpsmali(cls, maxInsns !== undefined ? maxInsns : -1);
+                let ms = getDeclaredMethods();
+                let out = `=== DumpSmali for ${className} ===\n`;
+                for (let k in ms) {
+                    out += makeMethodBox(k).dumpSmali(maxInsns) + "\n";
+                }
+                return out;
             },
             disassembly: function() {
                 return Java.decompile(className);

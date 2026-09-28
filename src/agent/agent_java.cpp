@@ -660,19 +660,95 @@ JSValue JsEnumerateClassLoaders(JSContext* ctx, JSValueConst /*this_val*/, int /
 }
 
 JSValue JsDumpSmali(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    if (argc < 1) return JS_NewString(ctx, "Usage: dumpSmali(artMethodPtr, [maxInstructions])");
-    int64_t ptr = ParsePtr(ctx, argv[0]);
-    if (!ptr || ptr < 0x10000) {
-        return JS_NewString(ctx, "[!] Invalid ArtMethod pointer (address is null or below 0x10000)");
+    if (argc < 1) return JS_NewString(ctx, "Usage: dumpSmali(artMethodPtrOrClass, [maxInstructions])");
+    int maxInsn = -1;
+    if (argc >= 2) JS_ToInt32(ctx, &maxInsn, argv[1]);
+
+    JNIEnv* env = GetEnv();
+
+    // 1. If string argument: class name
+    if (JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (s) {
+            std::string name = s;
+            JS_FreeCString(ctx, s);
+            if (env) {
+                jclass cls = FindClassWithFallback(env, name);
+                if (cls) {
+                    jclass classCls = env->FindClass("java/lang/Class");
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    jmethodID getDeclaredMethods = classCls ? env->GetMethodID(classCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;") : nullptr;
+                    if (classCls && getDeclaredMethods) {
+                        auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        if (mArr) {
+                            jsize len = env->GetArrayLength(mArr);
+                            std::ostringstream ss;
+                            ss << "=== DumpSmali for " << name << " (" << len << " methods) ===\n\n";
+                            for (jsize i = 0; i < len; ++i) {
+                                jobject mObj = env->GetObjectArrayElement(mArr, i);
+                                if (mObj) {
+                                    PI::Method pm = PI::resolve(env, mObj);
+                                    if (pm.isValid()) {
+                                        ss << pm.dumpSmali(maxInsn) << "\n";
+                                    }
+                                    env->DeleteLocalRef(mObj);
+                                }
+                            }
+                            env->DeleteLocalRef(mArr);
+                            env->DeleteLocalRef(classCls);
+                            env->DeleteLocalRef(cls);
+                            return JS_NewString(ctx, ss.str().c_str());
+                        }
+                    }
+                    if (classCls) env->DeleteLocalRef(classCls);
+                    env->DeleteLocalRef(cls);
+                }
+            }
+        }
     }
 
+    int64_t ptr = ParsePtr(ctx, argv[0]);
+    if (!ptr || ptr < 0x1000) {
+        return JS_NewString(ctx, "[!] Invalid pointer (address is null or below 0x1000)");
+    }
+
+    // 2. Check if ptr is a jclass reference
+    if (env && ptr > 0x1000) {
+        jobject testObj = reinterpret_cast<jobject>(ptr);
+        if (g_c_Class && env->IsInstanceOf(testObj, g_c_Class)) {
+            jclass cls = reinterpret_cast<jclass>(testObj);
+            jmethodID getDeclaredMethods = env->GetMethodID(g_c_Class, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (getDeclaredMethods) {
+                auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (mArr) {
+                    jsize len = env->GetArrayLength(mArr);
+                    std::ostringstream ss;
+                    ss << "=== DumpSmali for Class (" << len << " methods) ===\n\n";
+                    for (jsize i = 0; i < len; ++i) {
+                        jobject mObj = env->GetObjectArrayElement(mArr, i);
+                        if (mObj) {
+                            PI::Method pm = PI::resolve(env, mObj);
+                            if (pm.isValid()) {
+                                ss << pm.dumpSmali(maxInsn) << "\n";
+                            }
+                            env->DeleteLocalRef(mObj);
+                        }
+                    }
+                    env->DeleteLocalRef(mArr);
+                    return JS_NewString(ctx, ss.str().c_str());
+                }
+            }
+        }
+    }
+
+    // 3. Otherwise treat as ArtMethod*
     PI::Method m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
     if (!m.isValid()) {
         return JS_NewString(ctx, "[!] Cannot resolve ArtMethod at given address");
     }
-
-    int maxInsn = -1;
-    if (argc >= 2) JS_ToInt32(ctx, &maxInsn, argv[1]);
 
     std::string smali = m.dumpSmali(maxInsn);
     return JS_NewString(ctx, smali.c_str());
@@ -767,23 +843,34 @@ static bool DumpDexFromArtMethod(ArtMethod* art, std::string& outDexPath) {
 }
 
 static std::string DecompileSingleClass(const std::string& className, const std::string& dexPath, const std::string& methodName) {
+    mkdir("/data/local/tmp/dalvik-cache", 0777);
+    chmod("/data/local/tmp/dalvik-cache", 0777);
+    mkdir("/data/local/tmp/jtmp", 0777);
+    chmod("/data/local/tmp/jtmp", 0777);
     mkdir("/data/local/tmp/jout", 0777);
     chmod("/data/local/tmp/jout", 0777);
+    chmod("/data/local/tmp/jadxcli.jar", 0666);
+    chmod(dexPath.c_str(), 0666);
 
     std::string relPath = className;
     for (char& c : relPath) { if (c == '.') c = '/'; }
     std::string targetJava1 = "/data/local/tmp/jout/" + relPath + ".java";
     std::string targetJava2 = "/data/local/tmp/jout/sources/" + relPath + ".java";
+    std::string targetJava3 = "/data/local/tmp/jout/decompiled.java";
     unlink(targetJava1.c_str());
     unlink(targetJava2.c_str());
+    unlink(targetJava3.c_str());
 
-    std::string cmd = "dalvikvm -Xmx256m -Djava.io.tmpdir=/data/local/tmp/jtmp -cp /data/local/tmp/jadxcli.jar jadx.cli.JadxCLI --no-res -ds /data/local/tmp/jout --single-class " + className + " " + dexPath + " >/dev/null 2>&1";
+    std::string cmd = "export ANDROID_DATA=/data/local/tmp; dalvikvm -Xmx256m -Djava.io.tmpdir=/data/local/tmp/jtmp -cp /data/local/tmp/jadxcli.jar jadx.cli.JadxCLI --no-res -ds /data/local/tmp/jout --single-class " + className + " --single-class-output " + targetJava3 + " " + dexPath + " >/dev/null 2>&1";
     int ret = system(cmd.c_str());
+    (void)ret;
 
-    FILE* fp = fopen(targetJava1.c_str(), "rb");
+    FILE* fp = fopen(targetJava3.c_str(), "rb");
+    if (!fp) fp = fopen(targetJava1.c_str(), "rb");
     if (!fp) fp = fopen(targetJava2.c_str(), "rb");
     if (!fp) {
-        return "[!] JADX decompilation failed for " + className + " (exit code " + std::to_string(ret) + ")";
+        // Return empty so caller falls back gracefully
+        return "";
     }
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
@@ -824,7 +911,14 @@ static std::string DecompileSingleClass(const std::string& className, const std:
         break;
     }
 
+    // Check for native or abstract method (which ends with ';' and has NO '{')
+    size_t semiColon = javaCode.find(';', pos);
     size_t braceOpen = javaCode.find('{', pos);
+    if (semiColon != std::string::npos && (braceOpen == std::string::npos || semiColon < braceOpen)) {
+        std::string methodCode = javaCode.substr(lineStart, semiColon - lineStart + 1);
+        return "// Decompiled " + className + "." + methodName + " via JADX:\n" + methodCode;
+    }
+
     if (braceOpen == std::string::npos) {
         return javaCode;
     }
@@ -916,21 +1010,54 @@ JSValue JsDecompile(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValue
         return JS_NewString(ctx, ("[!] Unable to resolve class or method: " + className).c_str());
     }
 
-    if (access("/data/local/tmp/jadxcli.jar", R_OK) != 0) {
-        PI::Method m = PI::resolve(targetArt);
-        std::string smali = m.dumpSmali(-1);
-        return JS_NewString(ctx, ("[*] /data/local/tmp/jadxcli.jar not found; fallback to Smali disassembly:\n\n" + smali).c_str());
-    }
-
+    bool jadxOk = (access("/data/local/tmp/jadxcli.jar", R_OK) == 0);
     std::string dexPath;
-    if (!DumpDexFromArtMethod(targetArt, dexPath)) {
-        PI::Method m = PI::resolve(targetArt);
-        std::string smali = m.dumpSmali(-1);
-        return JS_NewString(ctx, ("[*] Failed to dump DEX from memory; fallback to Smali:\n\n" + smali).c_str());
+    if (jadxOk && DumpDexFromArtMethod(targetArt, dexPath)) {
+        std::string res = DecompileSingleClass(className, dexPath, methodName);
+        if (!res.empty()) {
+            return JS_NewString(ctx, res.c_str());
+        }
     }
 
-    std::string res = DecompileSingleClass(className, dexPath, methodName);
-    return JS_NewString(ctx, res.c_str());
+    // Fallback: JADX not available or failed; provide full Class/Method disassembly
+    if (!methodName.empty()) {
+        PI::Method m = PI::resolve(targetArt);
+        std::string smali = m.dumpSmali(-1);
+        return JS_NewString(ctx, ("[*] JADX decompile unavailable; fallback to Smali disassembly:\n\n" + smali).c_str());
+    }
+
+    // Class-level fallback: reconstruct class structure with declarations and Smali
+    std::ostringstream ss;
+    ss << "// [*] JADX decompile unavailable; fallback to Smali/Class disassembly:\n";
+    ss << "// Class: " << className << "\n\n";
+
+    jclass cls = FindClassWithFallback(env, className);
+    if (cls) {
+        jclass classCls = env->FindClass("java/lang/Class");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jmethodID getDeclaredMethods = classCls ? env->GetMethodID(classCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;") : nullptr;
+        if (classCls && getDeclaredMethods) {
+            auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (mArr) {
+                jsize len = env->GetArrayLength(mArr);
+                for (jsize i = 0; i < len; ++i) {
+                    jobject mObj = env->GetObjectArrayElement(mArr, i);
+                    if (mObj) {
+                        PI::Method pm = PI::resolve(env, mObj);
+                        if (pm.isValid()) {
+                            ss << pm.dumpSmali(-1) << "\n";
+                        }
+                        env->DeleteLocalRef(mObj);
+                    }
+                }
+                env->DeleteLocalRef(mArr);
+            }
+            env->DeleteLocalRef(classCls);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    return JS_NewString(ctx, ss.str().c_str());
 }
 
 // ---------------------------------------------------------------------------

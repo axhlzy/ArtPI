@@ -89,7 +89,7 @@ public:
     static void pop();
 };
 
-void setupFullStackNativeCallbacks(int baseDepth);
+void setupFullStackNativeCallbacks(int baseDepth, bool logMem = false);
 void cleanupFullStackNativeCallbacks();
 
 }} // namespace PI::Trace

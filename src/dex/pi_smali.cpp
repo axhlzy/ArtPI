@@ -189,13 +189,22 @@ std::string dumpSmali(ArtMethod* method, int max_instructions, int highlight_pc)
        << " (" << PrettyAccessFlags(flags) << ")\n";
 
     if (method->IsNative()) {
-        ss << "  [!] Method is Native (JNI). Machine code is in native library, no Dex Smali bytecode.\n";
-        ss << "      Hint: Use dumpCode(...) or dumpNative(...) to disassemble native ARM64 instructions.\n";
+        void* native_entry = method->GetEntryPointFromJni();
+        std::string full = GetMethodFullName(method, flags);
+        ss << "----------------------------------------------------------------------\n";
+        ss << ".method " << PrettyAccessFlags(flags) << " " << full << "\n";
+        if (native_entry) {
+            ss << "    # [Native (JNI) Entry: " << native_entry << "]\n";
+        }
+        ss << ".end method\n";
         ss << "======================================================================\n";
         return ss.str();
     }
     if (method->HasAccessFlags(0x0400)) {
-        ss << "  [!] Method is Abstract (no code body).\n";
+        std::string full = GetMethodFullName(method, flags);
+        ss << "----------------------------------------------------------------------\n";
+        ss << ".method " << PrettyAccessFlags(flags) << " " << full << "\n";
+        ss << ".end method\n";
         ss << "======================================================================\n";
         return ss.str();
     }
