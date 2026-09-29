@@ -237,7 +237,55 @@ const char* kDynamicBootstrapJs = R"JS(
                 n++;
             }
             return `Hooked ${n} method(s) of ${className}` +
-                   (skipped ? ` (skipped ${skipped} abstract/native)` : "");
+                    (skipped ? ` (skipped ${skipped} abstract/native)` : "");
+        }
+
+        function formatPrettySignature(sig) {
+            if (!sig || typeof sig !== 'string' || sig[0] !== '(') return { params: "", ret: "" };
+            let closeIdx = sig.indexOf(')');
+            if (closeIdx === -1) return { params: "", ret: "" };
+
+            function parseType(s, pos) {
+                let dim = 0;
+                while (pos < s.length && s[pos] === '[') {
+                    dim++;
+                    pos++;
+                }
+                if (pos >= s.length) return { name: "unknown", next: pos };
+                let ch = s[pos++];
+                let base = "unknown";
+                if (ch === 'Z') base = "boolean";
+                else if (ch === 'B') base = "byte";
+                else if (ch === 'C') base = "char";
+                else if (ch === 'S') base = "short";
+                else if (ch === 'I') base = "int";
+                else if (ch === 'J') base = "long";
+                else if (ch === 'F') base = "float";
+                else if (ch === 'D') base = "double";
+                else if (ch === 'V') base = "void";
+                else if (ch === 'L') {
+                    let semi = s.indexOf(';', pos);
+                    if (semi === -1) {
+                        base = s.substring(pos).replace(/\//g, '.');
+                        pos = s.length;
+                    } else {
+                        base = s.substring(pos, semi).replace(/\//g, '.');
+                        pos = semi + 1;
+                    }
+                }
+                while (dim-- > 0) base += "[]";
+                return { name: base, next: pos };
+            }
+
+            let params = [];
+            let i = 1;
+            while (i < closeIdx) {
+                let res = parseType(sig, i);
+                params.push(res.name);
+                i = res.next;
+            }
+            let retRes = parseType(sig, closeIdx + 1);
+            return { params: params.join(", "), ret: retRes.name };
         }
 
         function makeMethodBox(mName) {
@@ -247,60 +295,69 @@ const char* kDynamicBootstrapJs = R"JS(
             let isNative = !!(info && info.isNative);
             let nativeEntry = (info && info.nativeEntry) ? info.nativeEntry : 0n;
 
-            let mBox = {
-                className: className,
-                methodName: mName,
-                // .artMethod: always the ArtMethod* (works for both smali & native)
-                artMethod: art,
-                isNative: isNative,
-                // .address: native code entry for native methods, otherwise the
-                //           ArtMethod* (i.e. the address to disassemble/trace).
-                address: isNative ? nativeEntry : art,
-                // .ptr: native function pointer, only meaningful for native methods.
-                ptr: nativeEntry,
-                dumpCode: function(maxInsns) {
-                    return dumpcode(art, maxInsns !== undefined ? maxInsns : -1);
-                },
-                dumpSmali: function(maxInsns) {
-                    return dumpsmali(art, maxInsns !== undefined ? maxInsns : -1);
-                },
-                dumpNative: function(maxInsns) {
-                    return dumpnative(isNative && nativeEntry ? nativeEntry : art,
-                                      maxInsns !== undefined ? maxInsns : -1);
-                },
-                disassembly: function() {
-                    return Java.decompile(art);
-                },
-                decompile: function() {
-                    return Java.decompile(art);
-                },
-                hook: function(cb) {
-                    let sig = (info && info.signature) ? info.signature : "";
-                    return jhook(art, cb, className, mName, sig);
-                },
-                trace: function(opt) {
-                    if (isNative && nativeEntry && typeof tracenative === 'function') {
-                        return tracenative(nativeEntry, opt);
-                    }
-                    if (typeof traceunified === 'function') return traceunified(art, opt);
-                    return tracejava(art, opt);
-                },
-                "break": function(cond) {
-                    let sig = (info && info.signature) ? info.signature : "";
-                    return brkj(art, cond, className, mName, sig);
-                },
-                // Hook every method of the declaring class (first overload per name).
-                hookallclassmethods: function(cb) {
-                    return hookAllMethods(cb);
-                },
-                toString: function() {
-                    let hex = art ? '0x' + art.toString(16) : 'null';
-                    let kind = isNative ? "native" : "smali";
-                    let mods = (info && info.modifiers) ? info.modifiers + ' ' : '';
-                    return `[JavaMethod ${mods}${className}.${mName} (${kind}) ArtMethod=${hex}]`;
+            let mFn = function(...args) {
+                if (typeof __native_jcall === 'function') {
+                    return __native_jcall(className, mName, ...args);
                 }
+                throw new Error("__native_jcall is not available");
             };
-            return mBox;
+
+            mFn.className = className;
+            mFn.methodName = mName;
+            // .artMethod: always the ArtMethod* (works for both smali & native)
+            mFn.artMethod = art;
+            mFn.isNative = isNative;
+            // .address: native code entry for native methods, otherwise the
+            //           ArtMethod* (i.e. the address to disassemble/trace).
+            mFn.address = isNative ? nativeEntry : art;
+            // .ptr: native function pointer, only meaningful for native methods.
+            mFn.ptr = nativeEntry;
+            mFn.signature = (info && info.signature) ? info.signature : "";
+
+            mFn.dumpCode = function(maxInsns) {
+                return dumpcode(art, maxInsns !== undefined ? maxInsns : -1);
+            };
+            mFn.dumpSmali = function(maxInsns) {
+                return dumpsmali(art, maxInsns !== undefined ? maxInsns : -1);
+            };
+            mFn.dumpNative = function(maxInsns) {
+                return dumpnative(isNative && nativeEntry ? nativeEntry : art,
+                                  maxInsns !== undefined ? maxInsns : -1);
+            };
+            mFn.disassembly = function() {
+                return Java.decompile(art);
+            };
+            mFn.decompile = function() {
+                return Java.decompile(art);
+            };
+            mFn.hook = function(cb) {
+                let sig = (info && info.signature) ? info.signature : "";
+                return jhook(art, cb, className, mName, sig);
+            };
+            mFn.trace = function(opt) {
+                if (isNative && nativeEntry && typeof tracenative === 'function') {
+                    return tracenative(nativeEntry, opt);
+                }
+                if (typeof traceunified === 'function') return traceunified(art, opt);
+                return tracejava(art, opt);
+            };
+            mFn["break"] = function(cond) {
+                let sig = (info && info.signature) ? info.signature : "";
+                return brkj(art, cond, className, mName, sig);
+            };
+            // Hook every method of the declaring class (first overload per name).
+            mFn.hookallclassmethods = function(cb) {
+                return hookAllMethods(cb);
+            };
+            mFn.toString = function() {
+                let hex = art ? '0x' + art.toString(16) : 'null';
+                let kind = isNative ? "native" : "smali";
+                let mods = (info && info.modifiers) ? info.modifiers + ' ' : '';
+                let sigObj = (info && info.signature) ? formatPrettySignature(info.signature) : { params: "", ret: "" };
+                let retStr = (sigObj.ret && sigObj.ret !== "void" && mName !== "<init>") ? (sigObj.ret + ' ') : (sigObj.ret === "void" ? "void " : "");
+                return `[JavaMethod ${mods}${retStr}${className}.${mName}(${sigObj.params}) (${kind}) ArtMethod=${hex}]`;
+            };
+            return mFn;
         }
 
         let cBox = {
@@ -363,7 +420,22 @@ const char* kDynamicBootstrapJs = R"JS(
                 let innerCls = Java.findClass(inner);
                 if (innerCls) return makeClassBox(inner);
 
+                // Static field access on class
+                if (typeof __native_jfget === 'function') {
+                    let fv = __native_jfget(className, prop);
+                    if (fv !== undefined) return fv;
+                }
+
                 return mb;
+            },
+            set(target, prop, value) {
+                if (typeof prop !== 'string') { target[prop] = value; return true; }
+                if (prop in target) { target[prop] = value; return true; }
+                if (typeof __native_jfset === 'function') {
+                    if (__native_jfset(className, prop, value)) return true;
+                }
+                target[prop] = value;
+                return true;
             }
         });
     }
