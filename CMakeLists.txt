@@ -184,7 +184,7 @@ endif()
 # cross-platform entrypoint and needs no external packaging scripts.
 
 # ==============================================================================
-# 构建流水线与模块依赖关系:
+# 构建流水线与模块依赖关系 (与 Gradle 保持一致):
 # 1. 核心库构建:
 #    - artpi (SHARED) + artpi_static (STATIC)
 # 2. 注入代理库构建:
@@ -193,6 +193,13 @@ endif()
 #    - artpi-cli (EXECUTABLE, 内嵌/部署 libartpi_agent.so, 支持交互式 REPL 与 --server 后台模式)
 # 4. 功能测试 (app_process + JNI 包装):
 #    - artpi_test (SHARED, 链接 artpi_static)
+#
+# 目标依赖链:  artpi / artpi_static  <-  artpi_agent  <-  artpi-cli
+# 与 Gradle 的 :libartpi <- :agent <- :cli 一一对应 (见 cli/injector/CMakeLists.txt),
+# 这样在 CLion 里单独构建某个 target 时也会按整条链编译。
+#
+# 注意: 内嵌 payload (agent / jadxcli.jar) 的打包与 prebuild/ 的发布仍由 Gradle
+# 完成, CMake 只负责编译出各 target 并保证依赖顺序。
 # ==============================================================================
 add_subdirectory(src/agent)
 add_subdirectory(cli/injector)

@@ -34,7 +34,18 @@ target_include_directories(artpi-cli PRIVATE
     ${XZ_EMBEDDED_DIR}/linux/include/linux
 )
 
-target_link_libraries(artpi-cli)
+# ==============================================================================
+# 依赖关系对齐 Gradle:
+#   :libartpi (artpi + artpi_static)  <-  :agent:build (artpi_agent)  <-  :cli:build
+# Gradle 的 :cli 通过 :agent:build 间接依赖整个核心库, 这里用 add_dependencies
+# 把同一条链补上, 否则在 CLion 里单独构建 artpi-cli 只会产出一个孤立的 CLI。
+#
+# 必须是 add_dependencies 而不是 target_link_libraries: CLI 并不链接 agent,
+# libartpi_agent.so 是在构建完成后被作为 payload 内嵌进二进制的
+# (见 cli/injector/build.gradle 的打包步骤与 payload.cpp 的 trailer 解析)。
+# 这里只约定构建顺序, 不能真的去链接它。
+# ==============================================================================
+add_dependencies(artpi-cli artpi artpi_static artpi_agent)
 
 if (CMAKE_STRIP)
     add_custom_command(TARGET artpi-cli POST_BUILD

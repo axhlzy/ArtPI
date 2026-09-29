@@ -44,6 +44,11 @@ target_link_libraries(artpi_js_test PRIVATE
     dl
 )
 
+# 依赖关系对齐 Gradle: test/js/build.gradle 的 targets 为
+# ['artpi_agent', 'artpi_js_test'] —— 本套件在运行期 dlopen libartpi_agent.so,
+# 所以必须先编出 agent (agent 又会带出 artpi_static)。
+add_dependencies(artpi_js_test artpi_agent)
+
 # ==============================================================================
 # Playground: ArtPI trace/hook harness (loaded by app_process)
 #   dlopen's libartpi_agent.so at runtime; runs a ticker loop over Target.*
@@ -59,3 +64,7 @@ target_link_libraries(artpi_harness PRIVATE
     ${log-lib}
     dl
 )
+
+# 依赖关系对齐 Gradle: test/harness/build.gradle 的 targets 为
+# ['artpi_agent', 'artpi_harness'] —— 同样是运行期 dlopen agent。
+add_dependencies(artpi_harness artpi_agent)
