@@ -212,6 +212,20 @@ const std::vector<std::string> kCompletions = {
     "Memory.readU32(",
     "Memory.writeU32(",
 
+    "UI.",
+    "UI.dump(",
+    "UI.views(",
+    "UI.find(",
+    "UI.click(",
+    "UI.longClick(",
+    "UI.swipe(",
+    "UI.setText(",
+    "UI.currentActivity()",
+    "UI.topActivity()",
+    "UI.pressBack()",
+    "UI.help()",
+    "ui.",
+
     "dynamic.java.",
     "dynamic.native.",
 
@@ -220,7 +234,7 @@ const std::vector<std::string> kCompletions = {
     "listmethods(",
     "findmethods(",
     "methodtoart(",
-    "artmethodtojmethod(",
+    "jmethodbox(",
     "enumloaders()",
 
     "dumpcode(",
@@ -240,6 +254,15 @@ const std::vector<std::string> kCompletions = {
     "traceunified(",
     "tracejava(",
     "tracenative(",
+
+    "dumpViews(",
+    "dumpviews(",
+    "findViews(",
+    "findviews(",
+    "click(",
+    "swipe(",
+    "currentActivity()",
+    "pressBack(",
 
     "brkj(",
     "brkn(",

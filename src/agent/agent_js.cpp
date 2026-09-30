@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <sstream>
 #include <cstring>
+#include <cctype>
+#include <cstdio>
+#include <string>
 #include <iomanip>
 
 namespace artpi { namespace agent {
@@ -88,7 +91,15 @@ static const std::map<std::string, std::string> kApiDocs = {
     {"artToMethod",
      "Usage: artToMethod(artMethodPtr)\n"
      "  - Converts an ArtMethod* pointer to a callable jmethodID."},
-    {"artmethodtojmethod", "Alias for artToMethod(artMethodPtr)"},
+
+    {"jmethodBox",
+     "Usage: jmethodBox(artMethodPtr)\n"
+     "  - Wraps a raw ArtMethod* into a dynamic method box (same shape as "
+     "dynamic.java.<Class>.<method>): .hook()/.trace()/.break()/.dumpSmali()/"
+     ".dumpNative()/.dumpCode()/.disassembly()/.decompile()/.artMethod/.address.\n"
+     "  - Example:  let m = jmethodBox(findmethod(\"com.example.App\",\"onCreate\")); m.hook(cb)"},
+    {"methodbox", "Alias for jmethodBox(artMethodPtr)"},
+    {"jmethodbox", "Alias for jmethodBox(artMethodPtr)"},
 
     {"enumloaders",
      "Usage: enumloaders()\n"
@@ -271,6 +282,67 @@ bool InitJs(JNIEnv* env) {
             }
         }
         if (loader) PI::Interp::RegisterAppClassLoader(env, loader);
+    }
+
+    // App-scope allowlist: only StepIn into classes owned by the app's own
+    // package. This is robust under R8/ProGuard repackaging (bundled libs such
+    // as kotlinx.coroutines lose their package and cannot be filtered by name).
+    {
+        std::string pkg;
+
+        // 1. Preferred: ActivityThread.currentPackageName() (real apps).
+        jclass atCls = env->FindClass("android/app/ActivityThread");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (atCls) {
+            jmethodID curPkg = env->GetStaticMethodID(atCls, "currentPackageName", "()Ljava/lang/String;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (curPkg) {
+                jstring js = (jstring) env->CallStaticObjectMethod(atCls, curPkg);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (js) {
+                    const char* c = env->GetStringUTFChars(js, nullptr);
+                    if (c) { pkg = c; env->ReleaseStringUTFChars(js, c); }
+                    env->DeleteLocalRef(js);
+                }
+            }
+            env->DeleteLocalRef(atCls);
+        }
+
+        // 2. Fallback (app_process / tests): scan /proc/self/cmdline for the
+        //    token that looks like a Java package/class; trim trailing
+        //    capitalized class segments (e.g. com.artpi.test.Main -> com.artpi.test).
+        if (pkg.empty()) {
+            char buf[512] = {0};
+            FILE* fp = fopen("/proc/self/cmdline", "rb");
+            if (fp) {
+                size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+                fclose(fp);
+                std::string best;
+                size_t i = 0;
+                while (i < n) {
+                    std::string tok(&buf[i]);
+                    i += tok.size() + 1;
+                    if (tok.empty() || tok[0] == '/') continue;
+                    if (tok.find('.') == std::string::npos) continue;
+                    best = tok;
+                }
+                size_t colon = best.find(':');
+                if (colon != std::string::npos) best = best.substr(0, colon);
+                while (true) {
+                    size_t dot = best.rfind('.');
+                    if (dot == std::string::npos) break;
+                    std::string last = best.substr(dot + 1);
+                    if (!last.empty() && std::isupper(static_cast<unsigned char>(last[0]))) {
+                        best = best.substr(0, dot);
+                    } else {
+                        break;
+                    }
+                }
+                pkg = best;
+            }
+        }
+
+        if (!pkg.empty()) PI::Interp::SetAppScopePackage(pkg);
     }
     return true;
 }

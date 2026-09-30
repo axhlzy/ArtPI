@@ -165,11 +165,47 @@ inline bool isSystemDescriptor(const std::string& desc) {
            desc.rfind("Landroid/", 0) == 0 ||
            desc.rfind("Landroidx/", 0) == 0 ||
            desc.rfind("Lkotlin/", 0) == 0 ||
+           desc.rfind("Lkotlinx/", 0) == 0 ||
+           desc.rfind("Lorg/jetbrains/", 0) == 0 ||
            desc.rfind("Ldalvik/", 0) == 0 ||
            desc.rfind("Llibcore/", 0) == 0 ||
            desc.rfind("Lsun/", 0) == 0 ||
            desc.rfind("Lorg/apache/harmony/", 0) == 0;
 }
+
+// Kotlin coroutine / suspend structural marker.
+//
+// Suspend functions compile with a trailing Continuation parameter
+// (e.g. `(...Lkotlin/coroutines/Continuation;)Ljava/lang/Object;`) and coroutine
+// state machines extend kotlin.coroutines.jvm.internal.*. Stepping into that
+// machinery with the interpreter breaks its control flow / exception handling,
+// so such methods are always black-boxed regardless of the app-scope policy.
+// This complements the app-scope allowlist for the case where R8 keeps the
+// (renamed) runtime classes under the app package.
+inline bool isCoroutineSignature(const std::string& sig) {
+    return sig.find("Lkotlin/coroutines/Continuation;") != std::string::npos ||
+           sig.find("Lkotlin/coroutines/jvm/internal/") != std::string::npos ||
+           sig.find("Lkotlin/coroutines/jvm/") != std::string::npos;
+}
+
+// ----------------------------------------------------------------------------
+// App-scope allowlist ("只解释 App 自己的类")
+//
+// The interpreter must not StepIn into framework/library code: R8/ProGuard
+// repackages and renames bundled libraries (e.g. kotlinx.coroutines becomes
+// top-level classes like `mz0`/`t80`), so a prefix blacklist (`kotlinx.`) fails
+// to catch them and the interpreter corrupts their control flow / exception
+// handling. Inverting to "is this an app-owned class?" is robust because the
+// app package prefix is stable even under repackaging.
+//
+// Set the package at init (from /proc/self/cmdline). When empty, the engine
+// falls back to the legacy `!isSystemDescriptor()` blacklist policy.
+void SetAppScopePackage(const std::string& dottedPackage);
+std::string GetAppScopePackage();
+
+// True when `desc` is an app-owned class (or when no app scope is configured,
+// true for anything that is not a system descriptor).
+bool isInterpretableDescriptor(const std::string& desc);
 
 // ============================================================================
 // 类型感知的值渲染 (复用 PI_VMTrace 的对象渲染: 纯 native, 无 Java 调用)

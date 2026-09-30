@@ -336,10 +336,10 @@ const char* kDynamicBootstrapJs = R"JS(
             return { params: params.join(", "), ret: retRes.name };
         }
 
-        function makeMethodBox(mName) {
-            let art = Java.findMethod(className, mName);
-            let info = (art && art !== 0n && typeof Java.methodInfo === 'function')
-                ? Java.methodInfo(art) : null;
+        // Build a method box from an already-resolved ArtMethod* + its metadata.
+        // Shared by class-box property access and the global `jmethodBox`
+        // (raw ArtMethod* -> dynamic-style box) entry point.
+        function buildMethodBox(mName, art, info) {
             let isNative = !!(info && info.isNative);
             let nativeEntry = (info && info.nativeEntry) ? info.nativeEntry : 0n;
 
@@ -408,9 +408,21 @@ const char* kDynamicBootstrapJs = R"JS(
             return mFn;
         }
 
+        // Resolve by name (class-box access path) then delegate to buildMethodBox.
+        function makeMethodBox(mName) {
+            let art = Java.findMethod(className, mName);
+            let info = (art && art !== 0n && typeof Java.methodInfo === 'function')
+                ? Java.methodInfo(art) : null;
+            return buildMethodBox(mName, art, info);
+        }
+
         let cBox = {
             $className: className,
             $class: cls,
+            // Build a box for an explicit ArtMethod* (used by global jmethodBox).
+            $makeMethodBox: function(art, info) {
+                return buildMethodBox((info && info.name) ? info.name : "", art, info);
+            },
             dumpCode: function(maxInsns) {
                 let ms = getDeclaredMethods();
                 let out = `=== DumpCode for ${className} ===\n`;
@@ -658,6 +670,34 @@ const char* kDynamicBootstrapJs = R"JS(
         dyn.register("objc", makeObjcRoot());
     }
     globalThis.dynamic = dyn;
+
+    // -------------------------------------------------------------------------
+    // Raw ArtMethod* -> dynamic-style method box.
+    //   let m = jmethodBox(findmethod("com.example.App", "onCreate"));
+    //   m.hook(cb) / m.dumpSmali() / m.trace() / m.break() ...
+    // -------------------------------------------------------------------------
+    function makeJavaMethodBox(artPtr) {
+        if (artPtr === undefined || artPtr === null) return null;
+        let art;
+        try {
+            art = (typeof artPtr === 'bigint') ? artPtr : BigInt(artPtr);
+        } catch (e) {
+            return null;
+        }
+        if (art === 0n) return null;
+        if (typeof Java === 'undefined' || typeof Java.methodInfo !== 'function') return null;
+        let info = Java.methodInfo(art);
+        if (!info || !info.className) return null;
+        if (info.artMethod !== undefined && info.artMethod !== null) art = info.artMethod;
+        let cb = makeClassBox(info.className);
+        return cb.$makeMethodBox(art, info);
+    }
+    globalThis.__makeJavaMethodBox = makeJavaMethodBox;
+    globalThis.jmethodBox = makeJavaMethodBox;
+    globalThis.jmethodbox = makeJavaMethodBox;
+    globalThis.methodBox = makeJavaMethodBox;
+    globalThis.methodbox = makeJavaMethodBox;
+    if (typeof Java === 'object' && Java) Java.methodBox = makeJavaMethodBox;
 })();
 )JS";
 

@@ -30,8 +30,9 @@
 | **字节码解释沙箱** | 内嵌 nmmvm 解释器重放方法体，支持指令级单步、`StepIn` 递归解释、`Mock` 返回值打桩、异常拦截 |
 | **全栈混合追踪** | Java 解释执行遇到 JNI 方法自动交接给 QBDI/Gum，Native 执行完无缝切回，输出连贯的跨层树形调用栈 |
 | **动态对象反射链** | `artobject(addr)` 持久化提升全局引用，支持链式属性读写、方法调用与 REPL Tab 实时补全 |
+| **界面自动化 (`UI.*`)** | `UI.dump` 打印 View 层级树，`UI.find` 附带祖先链与最近点击目标，`UI.click` / `swipe` / `setText` 免 ADB 直接操作界面 |
 | **ptrace 链式内嵌注入** | 单个 `artpi-cli` 二进制**联合内嵌 Agent SO 与 JADX CLI Jar**，自动解压部署，支持 `-P <pid>` / `-k <pkg>` / `-f <file>` |
-| **内置 QuickJS REPL** | 注入后直接进入交互终端，支持动态代理树 `dynamic.java` / `dynamic.native`，免重编动态分析 |
+| **内置 QuickJS REPL** | 注入后直接进入交互终端，支持可注册代理域 `dynamic.java` / `dynamic.native`（`unity` / `objc` 按运行时条件挂载），免重编动态分析 |
 
 ---
 
@@ -270,6 +271,49 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 });
 ```
 
+#### 3. 从 `ArtMethod*` 直接构造 MethodBox (`jmethodBox`)
+
+若手上已有一个裸 `ArtMethod*`（例如来自 `jhook` 回调、`UI.find` 的 `clickListener.artMethod`、或 `findmethod`），可直接包装成与 `dynamic.java` 完全一致的 MethodBox：
+
+```javascript
+let art = findmethod("com.example.App", "onCreate");
+
+let m = jmethodBox(art);          // 别名: jmethodbox / methodBox / methodbox / Java.methodBox
+m.className; m.methodName; m.artMethod; m.address; m.isNative; m.signature;
+
+m.hook(function(ctx) { ... });    // 安装 Hook
+m.dumpSmali(); m.dumpNative();    // 反汇编
+m.disassembly();                  // 反编译
+m.trace({ mode: "CALL_TREE" });   // 追踪
+m.break();                        // 断点
+```
+
+典型用途：拦截任意来源的 `ArtMethod*`，例如直接 Hook 某个按钮的点击回调：
+
+```javascript
+let item = UI.find("高级")[0];
+jmethodBox(item.clickTarget.clickListener.artMethod).hook(function(ctx) {
+    console.log("clicked!");
+});
+```
+
+#### 4. 多域注册与条件挂载 (`dynamic.unity` / `dynamic.objc`)
+
+`dynamic` 是可注册的域容器，各域仅在对应运行时存在时才挂载：
+
+| 域 | 挂载条件 | 状态 |
+|---|---|---|
+| `dynamic.java` | Android / ART 进程 | 完整实现 |
+| `dynamic.native` | 始终 | 完整实现 |
+| `dynamic.unity` | Android 进程检测到 `libil2cpp.so` / `libunity.so` | 空实现框架（预留） |
+| `dynamic.objc` | Apple 平台 | 空实现框架（预留） |
+
+```javascript
+dynamic.domains();                    // 已挂载域列表，如 ["java", "native"]
+dynamic.has("unity");                 // 是否挂载
+dynamic.register("mydomain", rootObj);// 注册自定义域
+```
+
 ---
 
 ### 6.2 `Java.*` — 核心 Java 与 ART 域
@@ -288,8 +332,9 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 | `Java.unhook` | `(id)` | `string` | 按 ID 卸载指定的 Hook |
 | `Java.unhookAll` | `()` | `string` | 卸载全部 Java Hook |
 | `Java.methodInfo` | `(artMethod)` | `object` | 提取方法的修饰符、类名、签名、编译状态及 nativeEntry |
+| `Java.methodBox` | `(artMethod)` | `MethodBox` | 将裸 `ArtMethod*` 包装为 `dynamic.java` 同款 MethodBox；全局别名 `jmethodBox` / `jmethodbox` / `methodBox` / `methodbox` |
 
-> **全局别名**：`findclass`、`findmethod`、`listmethods`、`dumpsmali`、`dumpcode`、`decompile`、`disassembly`、`choose`、`jhook`、`unhook`、`unhookall` 均可直接在全局作用域调用。
+> **全局别名**：`findclass`、`findmethod`、`listmethods`、`dumpsmali`、`dumpcode`、`decompile`、`disassembly`、`choose`、`jhook`、`unhook`、`unhookall`、`jmethodbox` 均可直接在全局作用域调用。
 
 ---
 
@@ -333,7 +378,52 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 | `getreg(n)` / `setreg(n, val)` | 读取或篡改寄存器值（支持整型、浮点、字符串及 Java 对象包装） |
 | `D()` / `detach()` | **一键解挂**：撤销全部 Java/Native Hook、Trace，唤醒所有挂起线程并清除断点 |
 
+> **追踪作用域**：为保证稳定性，解释器默认只步入 **App 自身包** 内的类（app-scope 允许列表，包名取自 `ActivityThread.currentPackageName()`，app_process 场景回退 `/proc/self/cmdline`）；系统/框架类一律黑盒透传。`suspend` 方法（签名含 `Continuation`）及 `kotlin` / `kotlinx` / `org.jetbrains` 等 Kotlin 运行时也会自动跳过，避免 R8 混淆后解释执行破坏协程的异常控制流。
+
 ---
+
+### 6.6 `UI.*` — 界面层级检查与自动化
+
+| API | 说明 |
+|---|---|
+| `UI.dump([filter])` | 打印当前窗口 View 层级树（别名 `dumpViews()` / `dumpviews()`） |
+| `UI.find(pattern)` / `UI.views(pattern)` | 按文本 / id / 类名 / 可点击查找视图（别名 `findViews()` / `findviews()`） |
+| `UI.click(view \| 'text' \| x, y)` | 点击视图、文本标签或屏幕坐标 |
+| `UI.longClick(...)` | 长按视图 / 文本 / 坐标 |
+| `UI.swipe(x1, y1, x2, y2, [ms])` | 平滑滑动 |
+| `UI.setText(view \| 'id', text)` | 设置 EditText / TextView 文本 |
+| `UI.currentActivity()` / `UI.topActivity()` | 获取当前前台 Activity（JRef） |
+| `UI.pressBack()` | 触发 Activity 返回 |
+| `UI.help()` | 列出全部 UI API |
+
+`UI.find` / `UI.views` 的返回项会附带**祖先链**与**最近点击目标**，方便顺着层级定位按钮的点击事件：
+
+```javascript
+let r = UI.find("高级");
+
+r[0].clickTarget;                            // 最近的、真正带 clickListener 的祖先节点
+r[0].clickTarget.clickListener.className;    // 监听类名，如 w5
+r[0].clickTarget.clickListener.artMethod;    // 监听方法 ArtMethod*
+r[0].parents;                                // 根 -> 直接父节点 的完整祖先链
+r[0].clickTarget.click();                    // 直接点击该节点
+```
+
+输出示例：
+
+```text
+[View ThemeTextView id/item_title "高级版本" [199,549,347,586]]
+  clickTarget: ThemeRelativeLayout [68,541,1012,702] [Click: w5 @0x7780288be8]  <-- click fires here
+  parents:
+    ├─ DecorView [0,0,1080,2400]
+    ├─ LinearLayout [0,0,1080,2400]
+    ...
+    └─ LinearLayout [199,541,933,594]
+```
+
+> `[CLICKABLE]` 表示 `View.isClickable()==true`；`[Click: 类名 @0x...]` 表示该节点实际挂有 `mOnClickListener`。匹配节点自身无监听时，`clickTarget` 会自动上溯到最近的有监听祖先。
+
+---
+
 ## 7. 依赖与致谢
 
 - [Pine](https://github.com/canyie/pine) —— Java 方法 Hook 底座（ART 跳板 / ArtMethod 劫持）

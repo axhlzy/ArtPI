@@ -511,8 +511,58 @@ static bool DispatchTouchSequence(JNIEnv* env, jobject decorView,
     return true;
 }
 
+// Build a JRef for a live view (persistent global ref), or JS_NULL.
+static JSValue MakeViewJRef(JNIEnv* env, JSContext* ctx, jobject view) {
+    if (!view) return JS_NULL;
+    void* artObj = PineNative_ToArtObject(env, view);
+    uint64_t addr = artObj ? reinterpret_cast<uintptr_t>(artObj) : reinterpret_cast<uintptr_t>(view);
+    DoRegisterObservedObject(env, addr, view);
+    int h = AddJRef(env, view, addr, /*persistent=*/true);
+    return CreateJRefValue(ctx, h);
+}
+
+// Lightweight descriptor for an ancestor node, so UI.find can show the parent
+// chain (and let you click the actual clickable parent) alongside the match.
+static JSValue MakeViewAncestorObject(JNIEnv* env, JSContext* ctx, const ViewNode& node) {
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "view", MakeViewJRef(env, ctx, node.view));
+    JS_SetPropertyStr(ctx, o, "className", JS_NewString(ctx, node.className.c_str()));
+    JS_SetPropertyStr(ctx, o, "simpleName", JS_NewString(ctx, node.simpleName.c_str()));
+    JS_SetPropertyStr(ctx, o, "id", JS_NewInt32(ctx, node.id));
+    JS_SetPropertyStr(ctx, o, "idName", JS_NewString(ctx, node.idName.c_str()));
+    JS_SetPropertyStr(ctx, o, "text", JS_NewString(ctx, node.text.c_str()));
+    JS_SetPropertyStr(ctx, o, "contentDesc", JS_NewString(ctx, node.contentDesc.c_str()));
+    JS_SetPropertyStr(ctx, o, "clickable", JS_NewBool(ctx, node.isClickable || !node.listenerClassName.empty()));
+
+    JSValue b = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, b, "left", JS_NewInt32(ctx, node.left));
+    JS_SetPropertyStr(ctx, b, "top", JS_NewInt32(ctx, node.top));
+    JS_SetPropertyStr(ctx, b, "right", JS_NewInt32(ctx, node.right));
+    JS_SetPropertyStr(ctx, b, "bottom", JS_NewInt32(ctx, node.bottom));
+    JS_SetPropertyStr(ctx, b, "cx", JS_NewInt32(ctx, node.cx));
+    JS_SetPropertyStr(ctx, b, "cy", JS_NewInt32(ctx, node.cy));
+    JS_SetPropertyStr(ctx, o, "bounds", b);
+
+    if (!node.listenerClassName.empty()) {
+        JSValue l = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, l, "className", JS_NewString(ctx, node.listenerClassName.c_str()));
+        if (node.listenerArtMethod) {
+            JS_SetPropertyStr(ctx, l, "artMethod", JS_NewBigInt64(ctx, node.listenerArtMethod));
+        }
+        JS_SetPropertyStr(ctx, o, "clickListener", l);
+    } else {
+        JS_SetPropertyStr(ctx, o, "clickListener", JS_NULL);
+    }
+
+    const char* kClickFn = "(function(){ return function(){ return UI.click(this); }; })()";
+    JS_SetPropertyStr(ctx, o, "click", JS_Eval(ctx, kClickFn, strlen(kClickFn), "<click_fn>", JS_EVAL_TYPE_GLOBAL));
+    return o;
+}
+
 static void FlattenViewNodes(JNIEnv* env, JSContext* ctx, const ViewNode& node,
-                             const UiFilterOptions& opt, JSValue arr, uint32_t& idx) {
+                             const UiFilterOptions& opt, JSValue arr, uint32_t& idx,
+                             std::vector<const ViewNode*>& ancestors) {
+    ancestors.push_back(&node);
     if (NodeMatchesFilter(node, opt)) {
         JSValue item = JS_NewObject(ctx);
         if (node.view) {
@@ -533,6 +583,7 @@ static void FlattenViewNodes(JNIEnv* env, JSContext* ctx, const ViewNode& node,
         JS_SetPropertyStr(ctx, item, "clickable", JS_NewBool(ctx, node.isClickable || !node.listenerClassName.empty()));
         JS_SetPropertyStr(ctx, item, "enabled", JS_NewBool(ctx, node.isEnabled));
         JS_SetPropertyStr(ctx, item, "visibility", JS_NewInt32(ctx, node.visibility));
+        JS_SetPropertyStr(ctx, item, "depth", JS_NewInt32(ctx, node.depth));
 
         JSValue b = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, b, "left", JS_NewInt32(ctx, node.left));
@@ -567,6 +618,37 @@ static void FlattenViewNodes(JNIEnv* env, JSContext* ctx, const ViewNode& node,
             JS_SetPropertyStr(ctx, item, "longClickListener", JS_NULL);
         }
 
+        // Ancestor chain (root .. immediate parent). Lets the user see the
+        // hierarchy and click the real clickable parent of a matched child.
+        JSValue parents = JS_NewArray(ctx);
+        size_t np = ancestors.size() > 0 ? ancestors.size() - 1 : 0;
+        for (size_t i = 0; i < np; i++) {
+            JS_SetPropertyUint32(ctx, parents, static_cast<uint32_t>(i),
+                                 MakeViewAncestorObject(env, ctx, *ancestors[i]));
+        }
+        JS_SetPropertyStr(ctx, item, "parents", parents);
+
+        // Effective click target: the nearest ancestor that actually has a
+        // click listener (the matched node itself if it has one). This is the
+        // node whose click handler will fire for this item.
+        const ViewNode* clickTarget = nullptr;
+        if (!node.listenerClassName.empty()) {
+            clickTarget = &node;   // self
+        } else {
+            for (size_t i = np; i-- > 0; ) {
+                if (!ancestors[i]->listenerClassName.empty()) {
+                    clickTarget = ancestors[i];
+                    break;
+                }
+            }
+        }
+        if (clickTarget && clickTarget != &node) {
+            JSValue ct = MakeViewAncestorObject(env, ctx, *clickTarget);
+            JS_SetPropertyStr(ctx, item, "clickTarget", ct);
+        } else {
+            JS_SetPropertyStr(ctx, item, "clickTarget", JS_NULL);
+        }
+
         const char* kClickFn = "(function(){ return function(){ return UI.click(this); }; })()";
         JS_SetPropertyStr(ctx, item, "click", JS_Eval(ctx, kClickFn, strlen(kClickFn), "<click_fn>", JS_EVAL_TYPE_GLOBAL));
 
@@ -576,15 +658,43 @@ static void FlattenViewNodes(JNIEnv* env, JSContext* ctx, const ViewNode& node,
         const char* kSetTextFn = "(function(){ return function(txt){ return UI.setText(this, txt); }; })()";
         JS_SetPropertyStr(ctx, item, "setText", JS_Eval(ctx, kSetTextFn, strlen(kSetTextFn), "<set_text_fn>", JS_EVAL_TYPE_GLOBAL));
 
-        const char* kStrFn = "(function(){ return function(){ var idStr = this.idName ? (' ' + this.idName) : ''; var txt = this.text ? (' \"' + this.text + '\"') : ''; var clk = this.clickListener ? (' [Click: ' + this.clickListener.className + ']') : ''; return '[View ' + this.simpleName + idStr + txt + ' bounds=[' + this.bounds.left + ',' + this.bounds.top + ',' + this.bounds.right + ',' + this.bounds.bottom + ']' + clk + ']'; }; })()";
+        const char* kStrFn =
+            "(function(){ return function(){"
+            "  function desc(o){"
+            "    var idStr = o.idName ? (' ' + o.idName) : '';"
+            "    var txt = o.text ? (' \"' + o.text + '\"') : '';"
+            "    var bb = o.bounds ? (' [' + o.bounds.left + ',' + o.bounds.top + ',' + o.bounds.right + ',' + o.bounds.bottom + ']') : '';"
+            "    var clk = '';"
+            "    if (o.clickListener) {"
+            "      clk = ' [Click: ' + o.clickListener.className;"
+            "      if (o.clickListener.artMethod !== undefined && o.clickListener.artMethod !== null) {"
+            "        clk += ' @0x' + o.clickListener.artMethod.toString(16);"
+            "      }"
+            "      clk += ']';"
+            "    } else if (o.clickable) {"
+            "      clk = ' [CLICKABLE]';"
+            "    }"
+            "    return o.simpleName + idStr + txt + bb + clk;"
+            "  }"
+            "  var s = '[View ' + desc(this) + ']';"
+            "  if (this.clickTarget) s += '\\n  clickTarget: ' + desc(this.clickTarget) + '  <-- click fires here';"
+            "  if (this.parents && this.parents.length) {"
+            "    s += '\\n  parents:';"
+            "    for (var i = 0; i < this.parents.length; i++) {"
+            "      s += '\\n    ' + (i === this.parents.length - 1 ? '└─ ' : '├─ ') + desc(this.parents[i]);"
+            "    }"
+            "  }"
+            "  return s;"
+            "}; })()";
         JS_SetPropertyStr(ctx, item, "toString", JS_Eval(ctx, kStrFn, strlen(kStrFn), "<view_str_fn>", JS_EVAL_TYPE_GLOBAL));
 
         JS_SetPropertyUint32(ctx, arr, idx++, item);
     }
 
     for (const auto& child : node.children) {
-        FlattenViewNodes(env, ctx, child, opt, arr, idx);
+        FlattenViewNodes(env, ctx, child, opt, arr, idx, ancestors);
     }
+    ancestors.pop_back();
 }
 
 static void FreeViewNodeTree(JNIEnv* env, ViewNode& node) {
@@ -1007,7 +1117,8 @@ static JSValue JsUiGetViews(JSContext* ctx, JSValueConst, int argc, JSValueConst
                          getChildCountMid, getChildAtMid, getTextMid,
                          csToStringMid, locArr, true);
 
-        FlattenViewNodes(env, ctx, rootNode, opt, arr, outIdx);
+        std::vector<const ViewNode*> ancestors;
+        FlattenViewNodes(env, ctx, rootNode, opt, arr, outIdx, ancestors);
         FreeViewNodeTree(env, rootNode);
         env->DeleteLocalRef(root);
     }

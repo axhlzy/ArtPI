@@ -30,8 +30,9 @@ Target Platform: **Android 7.0 ~ 15 (arm64-v8a)**, root privileges required for 
 | **Bytecode Sandbox & Emulation** | Embedded nmmvm interpreter for bytecode replay, supporting single-stepping, `StepIn` recursive interpretation, return value mocking, and exception interception |
 | **Unified Cross-Layer Tracing** | Full-stack tracing: Dalvik bytecode execution seamlessly delegates to Frida-Gum and QBDI when hitting JNI boundaries, rendering a continuous cross-layer call tree |
 | **Dynamic Reflective Proxies** | `artobject(addr)` wraps live heap instances into global references with chainable member calls, property access, and interactive REPL Tab completions |
+| **UI Automation (`UI.*`)** | `UI.dump` prints the view hierarchy, `UI.find` returns the ancestor chain and nearest click target, and `UI.click` / `swipe` / `setText` drive the UI directly without ADB |
 | **Self-Contained Multi-Payload Packing** | A single `artpi-cli` binary encapsulates the injector ELF, XZ-compressed `libartpi_agent.so`, and deflated `jadxcli.jar` (~10MB total), auto-extracting upon launch |
-| **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with dynamic proxy trees (`dynamic.java.*`, `dynamic.native.*`), eliminating script compilation overhead |
+| **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with registrable proxy domains (`dynamic.java.*`, `dynamic.native.*`; `unity` / `objc` mounted by runtime), eliminating script compilation overhead |
 
 ---
 
@@ -266,6 +267,49 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 });
 ```
 
+#### 3. Build a MethodBox from a raw `ArtMethod*` (`jmethodBox`)
+
+If you already hold a raw `ArtMethod*` (e.g. from a `jhook` callback, `UI.find`'s `clickListener.artMethod`, or `findmethod`), wrap it into a MethodBox identical to `dynamic.java`:
+
+```javascript
+let art = findmethod("com.example.App", "onCreate");
+
+let m = jmethodBox(art);          // aliases: jmethodbox / methodBox / methodbox / Java.methodBox
+m.className; m.methodName; m.artMethod; m.address; m.isNative; m.signature;
+
+m.hook(function(ctx) { ... });    // install hook
+m.dumpSmali(); m.dumpNative();    // disassemble
+m.disassembly();                  // decompile
+m.trace({ mode: "CALL_TREE" });   // trace
+m.break();                        // breakpoint
+```
+
+Typical use — hook an arbitrary `ArtMethod*`, for example a button's click callback:
+
+```javascript
+let item = UI.find("Advanced")[0];
+jmethodBox(item.clickTarget.clickListener.artMethod).hook(function(ctx) {
+    console.log("clicked!");
+});
+```
+
+#### 4. Domain registry & conditional mounting (`dynamic.unity` / `dynamic.objc`)
+
+`dynamic` is a registry of domains; each domain is mounted only when its runtime exists:
+
+| Domain | Mount condition | Status |
+|---|---|---|
+| `dynamic.java` | Android / ART process | Full |
+| `dynamic.native` | Always | Full |
+| `dynamic.unity` | Android process with `libil2cpp.so` / `libunity.so` loaded | Empty stub (reserved) |
+| `dynamic.objc` | Apple platform | Empty stub (reserved) |
+
+```javascript
+dynamic.domains();                    // mounted domains, e.g. ["java", "native"]
+dynamic.has("unity");                 // whether a domain is mounted
+dynamic.register("mydomain", rootObj);// register a custom domain
+```
+
 ---
 
 ### 6.2 `Java.*` — Core Java & ART Domain
@@ -284,8 +328,9 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 | `Java.unhook` | `(id)` | `string` | Uninstalls hook by ID |
 | `Java.unhookAll` | `()` | `string` | Uninstalls all active Java hooks |
 | `Java.methodInfo` | `(artMethod)` | `object` | Extracts modifiers, class name, signature, and native entry point |
+| `Java.methodBox` | `(artMethod)` | `MethodBox` | Wraps a raw `ArtMethod*` into a `dynamic.java`-style MethodBox; global aliases `jmethodBox` / `jmethodbox` / `methodBox` / `methodbox` |
 
-> **Global Aliases**: `findclass`, `findmethod`, `listmethods`, `dumpsmali`, `dumpcode`, `decompile`, `disassembly`, `choose`, `jhook`, `unhook`, `unhookall` are exposed in the global scope.
+> **Global Aliases**: `findclass`, `findmethod`, `listmethods`, `dumpsmali`, `dumpcode`, `decompile`, `disassembly`, `choose`, `jhook`, `unhook`, `unhookall`, `jmethodbox` are exposed in the global scope.
 
 ---
 
@@ -328,6 +373,50 @@ fn.hook(function(ctx) {           // Frida-Gum Inline Hook
 | `regs` / `dumpRegs()` | Prints active registers (`v0..vN` for Java, `x0..x30, fp, lr, sp` for Native) |
 | `getreg(n)` / `setreg(n, val)` | Inspects or modifies register contents |
 | `D()` / `detach()` | **Clean Detach**: unhooks all Java/Native hooks, resumes threads, and clears breakpoints |
+
+> **Trace scope**: for stability, the interpreter only steps into classes owned by the **app's own package** (app-scope allowlist; package from `ActivityThread.currentPackageName()`, falling back to `/proc/self/cmdline` for app_process). System/framework classes are black-boxed. `suspend` methods (signature contains `Continuation`) and Kotlin runtimes (`kotlin` / `kotlinx` / `org.jetbrains`) are skipped automatically, avoiding the coroutine exception-flow corruption that R8-obfuscated code can trigger.
+
+---
+
+### 6.6 `UI.*` — View Hierarchy Inspection & Automation
+
+| API | Description |
+|---|---|
+| `UI.dump([filter])` | Prints the active window view hierarchy (aliases `dumpViews()` / `dumpviews()`) |
+| `UI.find(pattern)` / `UI.views(pattern)` | Finds views by text / id / class / clickable (aliases `findViews()` / `findviews()`) |
+| `UI.click(view \| 'text' \| x, y)` | Clicks a view, text label, or screen coordinates |
+| `UI.longClick(...)` | Long-presses a view / text / coordinates |
+| `UI.swipe(x1, y1, x2, y2, [ms])` | Smooth swipe gesture |
+| `UI.setText(view \| 'id', text)` | Sets text on an EditText / TextView |
+| `UI.currentActivity()` / `UI.topActivity()` | Returns the foreground Activity (JRef) |
+| `UI.pressBack()` | Triggers Activity back |
+| `UI.help()` | Lists all UI APIs |
+
+Each item returned by `UI.find` / `UI.views` carries the **ancestor chain** and the **nearest click target**, so you can follow the hierarchy to find a button's click handler:
+
+```javascript
+let r = UI.find("Advanced");
+
+r[0].clickTarget;                            // nearest ancestor that actually has a clickListener
+r[0].clickTarget.clickListener.className;    // listener class, e.g. w5
+r[0].clickTarget.clickListener.artMethod;    // listener method ArtMethod*
+r[0].parents;                                // full ancestor chain (root -> immediate parent)
+r[0].clickTarget.click();                    // click that node directly
+```
+
+Sample output:
+
+```text
+[View ThemeTextView id/item_title "Advanced" [199,549,347,586]]
+  clickTarget: ThemeRelativeLayout [68,541,1012,702] [Click: w5 @0x7780288be8]  <-- click fires here
+  parents:
+    ├─ DecorView [0,0,1080,2400]
+    ├─ LinearLayout [0,0,1080,2400]
+    ...
+    └─ LinearLayout [199,541,933,594]
+```
+
+> `[CLICKABLE]` means `View.isClickable()==true`; `[Click: <class> @0x...]` means the node actually has an `mOnClickListener`. When the matched node has no listener, `clickTarget` walks up to the nearest ancestor that does.
 
 ---
 

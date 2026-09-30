@@ -3295,7 +3295,6 @@ void RegisterJavaApis(JSContext* ctx, JSValue global, JSValue java) {
     JS_SetPropertyStr(ctx, global, "methodToArt", JS_NewCFunction(ctx, JsMethodToArt, "methodToArt", 1));
     JS_SetPropertyStr(ctx, global, "methodtoart", JS_NewCFunction(ctx, JsMethodToArt, "methodtoart", 1));
     JS_SetPropertyStr(ctx, global, "artToMethod", JS_NewCFunction(ctx, JsArtToMethod, "artToMethod", 1));
-    JS_SetPropertyStr(ctx, global, "artmethodtojmethod", JS_NewCFunction(ctx, JsArtToMethod, "artmethodtojmethod", 1));
     JS_SetPropertyStr(ctx, global, "methodInfo", JS_NewCFunction(ctx, JsMethodInfo, "methodInfo", 1));
     JS_SetPropertyStr(ctx, global, "methodinfo", JS_NewCFunction(ctx, JsMethodInfo, "methodinfo", 1));
     JS_SetPropertyStr(ctx, global, "enumloaders", JS_NewCFunction(ctx, JsEnumerateClassLoaders, "enumloaders", 0));

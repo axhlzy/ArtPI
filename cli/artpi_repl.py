@@ -78,6 +78,20 @@ COMPLETIONS = [
     "Memory.readU32(",
     "Memory.writeU32(",
 
+    "UI.",
+    "UI.dump(",
+    "UI.views(",
+    "UI.find(",
+    "UI.click(",
+    "UI.longClick(",
+    "UI.swipe(",
+    "UI.setText(",
+    "UI.currentActivity()",
+    "UI.topActivity()",
+    "UI.pressBack()",
+    "UI.help()",
+    "ui.",
+
     "dynamic.java.",
     "dynamic.native.",
 
@@ -85,6 +99,8 @@ COMPLETIONS = [
     "findmethod(",
     "listmethods(",
     "findmethods(",
+    "jmethodbox(",
+    "methodbox(",
     "dumpcode(",
     "dumpsmali(",
     "dumpnative(",
@@ -105,6 +121,15 @@ COMPLETIONS = [
     "readstring(",
     "readu32(",
     "writeu32(",
+
+    "dumpViews(",
+    "dumpviews(",
+    "findViews(",
+    "findviews(",
+    "click(",
+    "swipe(",
+    "currentActivity()",
+    "pressBack(",
 
     "console.log(",
     "console.warn(",
@@ -519,6 +544,11 @@ def main():
                 print("  Native.findSymbol(mod, sym)  - Find native symbol")
                 print("  Native.dumpNative(addr)      - Disassemble ARM64 native code")
                 print("  Memory.hexdump(addr, len)    - Hexdump memory")
+                print("  UI.dump([filter])            - Dump UI hierarchy (alias: dumpViews())")
+                print("  UI.find(patternOrObj)        - Find views by text/id/class")
+                print("  UI.click(view | 'text' | x, y) - Click a view, text, or coordinates")
+                print("  UI.swipe(x1,y1,x2,y2,[ms])   - Swipe gesture")
+                print("  UI.setText(view | 'id', txt) - Set text on EditText/TextView")
                 continue
 
             last_cmd = line

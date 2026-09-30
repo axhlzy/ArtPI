@@ -33,6 +33,46 @@ static std::unordered_map<std::string, jclass> g_clsCache;
 static jobject   g_appLoader = nullptr;     // global ref to the app ClassLoader
 static jmethodID g_loadClassMid = nullptr;  // ClassLoader.loadClass(String)
 
+// App-scope allowlist (dotted package, e.g. "com.example.app"). Empty = disabled,
+// in which case the default `!isSystemDescriptor()` blacklist policy applies.
+static std::string g_appScopePkg;
+
+void SetAppScopePackage(const std::string& dottedPackage) {
+    std::lock_guard<std::mutex> lk(g_clsCacheMutex);
+    g_appScopePkg = dottedPackage;
+}
+
+std::string GetAppScopePackage() {
+    std::lock_guard<std::mutex> lk(g_clsCacheMutex);
+    return g_appScopePkg;
+}
+
+bool isInterpretableDescriptor(const std::string& desc) {
+    if (desc.empty()) return false;
+    std::string pkg;
+    {
+        std::lock_guard<std::mutex> lk(g_clsCacheMutex);
+        pkg = g_appScopePkg;
+    }
+    if (pkg.empty()) return !isSystemDescriptor(desc);
+
+    // Normalize dotted package to a descriptor prefix: com.example.app -> Lcom/example/app/
+    std::string prefix;
+    prefix.reserve(pkg.size() + 3);
+    prefix += 'L';
+    for (char c : pkg) prefix += (c == '.') ? '/' : c;
+    prefix += '/';
+
+    // Arrays: peel leading '[' before matching.
+    const std::string* d = &desc;
+    std::string peeled;
+    if (desc[0] == '[') {
+        peeled = desc.substr(desc.find_first_not_of('['));
+        d = &peeled;
+    }
+    return d->rfind(prefix, 0) == 0;
+}
+
 void RegisterAppClassLoader(JNIEnv* env, jobject loader) {
     if (!env || !loader) return;
     std::lock_guard<std::mutex> lk(g_clsCacheMutex);
@@ -146,11 +186,12 @@ namespace {
         return am;
     }
 
-    // scope filter (§8): system classes / blacklist / whitelist
+    // scope filter (§8): app-scope allowlist / system blacklist / whitelist
     bool passScopeFilter(const FilterOptions* f, const std::string& desc) {
         if (f == nullptr) {
-            // default policy: black-box system classes
-            return !isSystemDescriptor(desc);
+            // default policy: app-scope allowlist when configured, otherwise
+            // black-box system classes.
+            return isInterpretableDescriptor(desc);
         }
         if (f->filter_system_classes && isSystemDescriptor(desc)) return false;
         for (const auto& b : f->blacklist_pkgs) {
@@ -162,7 +203,10 @@ namespace {
                 if (desc.rfind(w, 0) == 0) { hit = true; break; }
             }
             if (!hit) return false;
+            return true;
         }
+        // No explicit whitelist: honor the global app-scope allowlist if set.
+        if (!GetAppScopePackage().empty()) return isInterpretableDescriptor(desc);
         return true;
     }
 
@@ -292,6 +336,7 @@ namespace {
         // default scope policy: system classes step-over, business classes
         // may step-in when enabled
         bool scopeAllows = passScopeFilter(s->filter, ref.class_descriptor) &&
+                           !isCoroutineSignature(ref.jni_signature) &&
                            !isNative &&
                            s->opts != nullptr && s->opts->step_in_enabled &&
                            s->depth < s->opts->max_depth;
@@ -341,6 +386,7 @@ namespace {
         if (v == InvokeVerdict::StepIn) {
             int maxDepth = (s->opts != nullptr) ? s->opts->max_depth : 8;
             if (!isNative && am != nullptr &&
+                !isCoroutineSignature(ref.jni_signature) &&
                 s->depth < maxDepth &&
                 passScopeFilter(s->filter, ref.class_descriptor)) {
                 return VM_INVOKE_STEP_IN;

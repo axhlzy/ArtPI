@@ -641,8 +641,9 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
     };
 
     cbs.onInvoke = [preset, FormatTraceTreePrefix](const PI::Interp::InvokeEvent& e, jvalue*) {
-        if (PI::Interp::isSystemDescriptor(e.className)) {
-            return PI::Interp::InvokeVerdict::JniDirect;   // 系统层黑盒透传
+        if (!PI::Interp::isInterpretableDescriptor(e.className) ||
+            PI::Interp::isCoroutineSignature(e.signature)) {
+            return PI::Interp::InvokeVerdict::JniDirect;   // 黑盒透传：系统/非 App/协程机
         }
         PI::Trace::UnifiedCallDepth::set(e.depth + 1);
 
@@ -671,7 +672,8 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
     };
     cbs.onInvokePost = [preset, FormatTraceTreePrefix](const PI::Interp::InvokeEvent& e,
                                 const jvalue* r, bool hasExc) {
-        if (PI::Interp::isSystemDescriptor(e.className)) return;
+        if (!PI::Interp::isInterpretableDescriptor(e.className) ||
+            PI::Interp::isCoroutineSignature(e.signature)) return;
         if (e.isNative) {
             if (preset == PI::Trace::TracePreset::FULL_STACK_NATIVE) {
                 PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s[Native JNI] %s() = %s",

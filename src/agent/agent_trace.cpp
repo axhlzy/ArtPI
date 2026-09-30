@@ -112,7 +112,8 @@ static void WarmInterpClass(JNIEnv* env, const std::string& dotted) {
 
 static bool IsSystemJavaName(const std::string& n) {
     static const char* kSys[] = {"java.", "javax.", "android.", "androidx.", "kotlin.",
-                                 "dalvik.", "libcore.", "sun.", "org.apache.harmony."};
+                                 "kotlinx.", "org.jetbrains.", "dalvik.", "libcore.",
+                                 "sun.", "org.apache.harmony."};
     for (const char* p : kSys) {
         if (n.rfind(p, 0) == 0) return true;
     }
