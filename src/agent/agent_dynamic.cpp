@@ -172,6 +172,54 @@ static JSValue JsGetClassMethods(JSContext* ctx, JSValueConst /*this_val*/, int 
 
 const char* kDynamicBootstrapJs = R"JS(
 (function() {
+    function createUnavailableDomain(name, reason) {
+        let box = {
+            $domain: name,
+            $available: false,
+            $reason: reason || "unavailable",
+            isAvailable: function() { return false; },
+            toString: function() { return `[DynamicDomain ${name}: unavailable - ${this.$reason}]`; }
+        };
+        return new Proxy(box, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (prop in target) return target[prop];
+                return undefined;
+            }
+        });
+    }
+
+    function createDynamicRoot() {
+        let root = {
+            __domains: {},
+            register: function(name, rootObj) {
+                if (!name || !rootObj) return rootObj;
+                this.__domains[name] = rootObj;
+                this[name] = rootObj;
+                return rootObj;
+            },
+            has: function(name) {
+                return !!this.__domains[name];
+            },
+            domains: function() {
+                return Object.keys(this.__domains).sort();
+            },
+            __getCompletionData: function() {
+                return __native_getCompletionData();
+            },
+            __findMatchingClasses: function(prefix, limit) {
+                return __native_findMatchingClasses(prefix, limit);
+            },
+            __getModuleSymbols: function(mod) {
+                return __native_getModuleSymbols(mod);
+            },
+            __getClassMethods: function(cls) {
+                return __native_getClassMethods(cls);
+            }
+        };
+        return root;
+    }
+
     // =========================================================================
     // 1. Dynamic Java Class & Method Proxy
     // =========================================================================
@@ -440,6 +488,13 @@ const char* kDynamicBootstrapJs = R"JS(
         });
     }
 
+    function makeJavaRoot() {
+        if (typeof Java === 'undefined' || !Java.findClass) {
+            return createUnavailableDomain("java", "Java/ART runtime is not available in this process");
+        }
+        return makeJavaPackage("");
+    }
+
     function makeJavaPackage(path) {
         let pkgObj = {
             $path: path,
@@ -551,24 +606,93 @@ const char* kDynamicBootstrapJs = R"JS(
         }
     });
 
-    globalThis.dynamic = {
-        java: makeJavaPackage(""),
-        native: nativeRoot,
-        __getCompletionData: function() {
-            return __native_getCompletionData();
-        },
-        __findMatchingClasses: function(prefix, limit) {
-            return __native_findMatchingClasses(prefix, limit);
-        },
-        __getModuleSymbols: function(mod) {
-            return __native_getModuleSymbols(mod);
-        },
-        __getClassMethods: function(cls) {
-            return __native_getClassMethods(cls);
-        }
-    };
+    // =========================================================================
+    // 3. Dynamic Unity & ObjC stubs
+    // =========================================================================
+    function makeUnityRoot() {
+        let root = {
+            $domain: "unity",
+            $available: true,
+            isAvailable: function() { return true; },
+            findAssemblies: function() { return []; },
+            findClasses: function() { return []; },
+            findMethods: function() { return []; },
+            toString: function() { return "[UnityDomain available: empty implementation]"; }
+        };
+        return new Proxy(root, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (prop in target) return target[prop];
+                return createUnavailableDomain("unity." + prop, "Unity metadata resolver is not implemented yet");
+            }
+        });
+    }
+
+    function makeObjcRoot() {
+        let root = {
+            $domain: "objc",
+            $available: true,
+            isAvailable: function() { return true; },
+            findClasses: function() { return []; },
+            findMethods: function() { return []; },
+            toString: function() { return "[ObjCDomain available: empty implementation]"; }
+        };
+        return new Proxy(root, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (prop in target) return target[prop];
+                return createUnavailableDomain("objc." + prop, "Objective-C runtime bridge is not implemented yet");
+            }
+        });
+    }
+
+    let dyn = createDynamicRoot();
+    if (typeof __native_dynamicHasJava === 'function' && __native_dynamicHasJava()) {
+        dyn.register("java", makeJavaRoot());
+    }
+    dyn.register("native", nativeRoot);
+    if (typeof __native_dynamicHasUnity === 'function' && __native_dynamicHasUnity()) {
+        dyn.register("unity", makeUnityRoot());
+    }
+    if (typeof __native_dynamicHasObjc === 'function' && __native_dynamicHasObjc()) {
+        dyn.register("objc", makeObjcRoot());
+    }
+    globalThis.dynamic = dyn;
 })();
 )JS";
+
+static bool HasLoadedModuleByName(const char* needle) {
+    if (!needle || !needle[0]) return false;
+    auto modules = CollectAllLoadedModules();
+    for (const auto& name : modules) {
+        if (name == needle) return true;
+    }
+    return false;
+}
+
+static JSValue JsDynamicHasJava(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+#if defined(__ANDROID__)
+    return JS_NewBool(ctx, true);
+#else
+    return JS_NewBool(ctx, false);
+#endif
+}
+
+static JSValue JsDynamicHasUnity(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+#if defined(__ANDROID__)
+    return JS_NewBool(ctx, HasLoadedModuleByName("libil2cpp.so") || HasLoadedModuleByName("libunity.so"));
+#else
+    return JS_NewBool(ctx, false);
+#endif
+}
+
+static JSValue JsDynamicHasObjc(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+#if defined(__APPLE__)
+    return JS_NewBool(ctx, true);
+#else
+    return JS_NewBool(ctx, false);
+#endif
+}
 
 } // namespace
 
@@ -584,6 +708,12 @@ void RegisterDynamicApis(JSContext* ctx) {
                       JS_NewCFunction(ctx, JsGetModuleSymbols, "__native_getModuleSymbols", 1));
     JS_SetPropertyStr(ctx, global, "__native_getClassMethods",
                       JS_NewCFunction(ctx, JsGetClassMethods, "__native_getClassMethods", 1));
+    JS_SetPropertyStr(ctx, global, "__native_dynamicHasJava",
+                      JS_NewCFunction(ctx, JsDynamicHasJava, "__native_dynamicHasJava", 0));
+    JS_SetPropertyStr(ctx, global, "__native_dynamicHasUnity",
+                      JS_NewCFunction(ctx, JsDynamicHasUnity, "__native_dynamicHasUnity", 0));
+    JS_SetPropertyStr(ctx, global, "__native_dynamicHasObjc",
+                      JS_NewCFunction(ctx, JsDynamicHasObjc, "__native_dynamicHasObjc", 0));
 
     // Evaluate dynamic bootstrap script to create globalThis.dynamic proxy tree
     JSValue res = JS_Eval(ctx, kDynamicBootstrapJs, strlen(kDynamicBootstrapJs), "<dynamic_bootstrap>", JS_EVAL_TYPE_GLOBAL);
