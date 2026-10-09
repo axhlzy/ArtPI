@@ -27,9 +27,12 @@ extern "C" {
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <cctype>
 #include <cstring>
 #include <memory>
 #include <sys/stat.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -3219,6 +3222,477 @@ static JSValue JsJavaChoose(JSContext* ctx, JSValueConst /*this_val*/, int argc,
     return JS_NewString(ctx, ss.str().c_str());
 }
 
+// ===========================================================================
+// Complete in-memory DEX dumping / unpacking
+//   Java.dumpAllDex([dir]) / Java.dumpalldex() / dynamic.java.dumpalldex()
+//
+// Enumerates every DexFile reachable from the application ClassLoader's
+// DexPathList, pulls the raw in-memory DEX image (works for packers that only
+// materialise dex in memory), verifies the DEX Adler-32 checksum and repairs it
+// in-place when mismatched, then writes each unique dex into the target app's
+// files dir (or a caller-supplied directory).
+// ===========================================================================
+
+static const char* kDumpDexDirName = "artpi_dex";
+
+static uint32_t DexAdler32(const uint8_t* data, size_t len) {
+    const uint32_t MOD = 65521;
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; ++i) {
+        a += data[i];
+        if (a >= MOD) a -= MOD;
+        b += a;
+        if (b >= MOD) b -= MOD;
+    }
+    return (b << 16) | a;
+}
+
+// Crash-safe read of another (possibly bogus) address in our own process.
+static bool SafeReadMem(void* dst, const void* src, size_t len) {
+    if (!src || !dst || len == 0) return false;
+    struct iovec local_iov = { dst, len };
+    struct iovec remote_iov = { const_cast<void*>(src), len };
+    ssize_t n = syscall(SYS_process_vm_readv, getpid(), &local_iov, 1, &remote_iov, 1, 0);
+    return n == static_cast<ssize_t>(len);
+}
+
+static bool SafeDexMagic(const void* p, uint8_t outMagic[8]) {
+    if (!SafeReadMem(outMagic, p, 8)) return false;
+    return std::memcmp(outMagic, "dex\n", 4) == 0 || std::memcmp(outMagic, "cdex", 4) == 0;
+}
+
+// mirror::Class* -> DexCache (+0x10) -> art::DexFile* (+0x10)
+static const void* DexFilePtrFromKlass(void* klass) {
+    if (!klass) return nullptr;
+    auto* k = static_cast<const uint8_t*>(klass);
+    uint32_t dex_cache_ref = *reinterpret_cast<const uint32_t*>(k + 0x10);
+    if (!dex_cache_ref) return nullptr;
+    auto* dex_cache = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(dex_cache_ref));
+    return *reinterpret_cast<const void* const*>(dex_cache + 0x10);
+}
+
+// art::DexFile layout: begin_ (+0x08), size_ (+0x10), data_begin_ (+0x18).
+// Returns the byte start (whose magic is valid) and sets outSize. The incoming
+// pointer is range-checked because it may originate from a raw cookie value.
+static const uint8_t* DexMemoryFromArtDexFile(const void* dex_file, size_t& outSize) {
+    outSize = 0;
+
+    // Read the art::DexFile fields crash-safely (the pointer may be untrusted).
+    uint8_t fields[0x20];
+    if (!SafeReadMem(fields, dex_file, sizeof(fields))) return nullptr;
+    const uint8_t* dex_begin = *reinterpret_cast<const uint8_t* const*>(fields + 0x08);
+    size_t         dex_size  = *reinterpret_cast<const size_t*>(fields + 0x10);
+    const uint8_t* dex_data_begin = *reinterpret_cast<const uint8_t* const*>(fields + 0x18);
+    if (!dex_data_begin) dex_data_begin = dex_begin;
+
+    uint8_t magic[8];
+    const uint8_t* base = nullptr;
+    if (SafeDexMagic(dex_begin, magic)) base = dex_begin;
+    else if (SafeDexMagic(dex_data_begin, magic)) base = dex_data_begin;
+    if (!base) return nullptr;
+
+    // Prefer the authoritative file_size from the DEX header (offset 0x20).
+    uint32_t header_file_size = 0;
+    if (SafeReadMem(&header_file_size, base + 0x20, 4)
+        && header_file_size >= 0x70 && header_file_size < 0x10000000) {
+        dex_size = header_file_size;
+    }
+    if (dex_size < 0x70 || dex_size > 0x10000000) return nullptr;
+
+    outSize = dex_size;
+    return base;
+}
+
+// Verify the DEX Adler-32 checksum and repair it in the copied buffer.
+static bool BuildRepairedDex(const uint8_t* base, size_t size, std::vector<uint8_t>& out,
+                             bool& repaired, std::string& kind) {
+    if (!base || size < 0x70) return false;
+    out.assign(base, base + size);
+    kind = (std::memcmp(out.data(), "cdex", 4) == 0) ? "CompactDex" : "StandardDex";
+
+    uint32_t stored = *reinterpret_cast<const uint32_t*>(out.data() + 8);
+    uint32_t calc = DexAdler32(out.data() + 12, out.size() - 12);
+    repaired = (stored != calc);
+    if (repaired) {
+        *reinterpret_cast<uint32_t*>(out.data() + 8) = calc;
+    }
+    return true;
+}
+
+static void EnsureDirRecursive(const std::string& dir) {
+    if (dir.empty()) return;
+    std::string cur;
+    cur.reserve(dir.size());
+    for (size_t i = 0; i < dir.size(); ++i) {
+        cur.push_back(dir[i]);
+        if (dir[i] == '/' && cur.size() > 1) mkdir(cur.c_str(), 0777);
+    }
+    mkdir(dir.c_str(), 0777);
+    chmod(dir.c_str(), 0777);
+}
+
+static bool WriteFileAll(const std::string& path, const std::vector<uint8_t>& data) {
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0) return false;
+    size_t written = 0;
+    while (written < data.size()) {
+        ssize_t w = write(fd, data.data() + written, data.size() - written);
+        if (w <= 0) { close(fd); return false; }
+        written += static_cast<size_t>(w);
+    }
+    close(fd);
+    chmod(path.c_str(), 0666);
+    return true;
+}
+
+static std::string BaseNameOf(const std::string& p) {
+    size_t s = p.find_last_of('/');
+    return (s == std::string::npos) ? p : p.substr(s + 1);
+}
+
+static std::string SanitizeName(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        if (isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-') out.push_back(c);
+        else out.push_back('_');
+    }
+    return out.empty() ? std::string("classes") : out;
+}
+
+static std::string StripDexExt(std::string n) {
+    for (const char* ext : {".dex", ".apk", ".jar", ".zip"}) {
+        size_t l = std::strlen(ext);
+        if (n.size() > l && n.compare(n.size() - l, l, ext) == 0) { n.resize(n.size() - l); break; }
+    }
+    return n;
+}
+
+// Context.getFilesDir().getAbsolutePath() for the current application.
+static std::string ResolveAppFilesDir(JNIEnv* env) {
+    jclass atCls = env->FindClass("android/app/ActivityThread");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); atCls = nullptr; }
+    if (!atCls) return "";
+
+    std::string result;
+    jmethodID cam = env->GetStaticMethodID(atCls, "currentApplication", "()Landroid/app/Application;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jobject app = cam ? env->CallStaticObjectMethod(atCls, cam) : nullptr;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); app = nullptr; }
+    if (app) {
+        jclass ctxCls = env->FindClass("android/content/Context");
+        if (env->ExceptionCheck()) { env->ExceptionClear(); ctxCls = nullptr; }
+        jmethodID gfd = ctxCls ? env->GetMethodID(ctxCls, "getFilesDir", "()Ljava/io/File;") : nullptr;
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jobject file = gfd ? env->CallObjectMethod(app, gfd) : nullptr;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); file = nullptr; }
+        if (file) {
+            jclass fileCls = env->FindClass("java/io/File");
+            if (env->ExceptionCheck()) { env->ExceptionClear(); fileCls = nullptr; }
+            jmethodID gap = fileCls ? env->GetMethodID(fileCls, "getAbsolutePath", "()Ljava/lang/String;") : nullptr;
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            auto js = gap ? (jstring)env->CallObjectMethod(file, gap) : nullptr;
+            if (env->ExceptionCheck()) { env->ExceptionClear(); js = nullptr; }
+            if (js) {
+                const char* c = env->GetStringUTFChars(js, nullptr);
+                if (c) { result = c; env->ReleaseStringUTFChars(js, c); }
+                env->DeleteLocalRef(js);
+            }
+            if (fileCls) env->DeleteLocalRef(fileCls);
+            env->DeleteLocalRef(file);
+        }
+        if (ctxCls) env->DeleteLocalRef(ctxCls);
+        env->DeleteLocalRef(app);
+    }
+    env->DeleteLocalRef(atCls);
+    return result;
+}
+
+static std::string PackageFromCmdline() {
+    FILE* fp = fopen("/proc/self/cmdline", "rb");
+    if (!fp) return "";
+    char buf[256] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    if (n == 0) return "";
+    std::string name(buf);
+    size_t colon = name.find(':');
+    if (colon != std::string::npos) name.resize(colon);
+    return name;
+}
+
+// Fetch any ArtMethod of `cls` (declared methods first, then constructors) so
+// the declaring class' backing art::DexFile can be reached.
+static ArtMethod* FirstArtMethodOfClass(JNIEnv* env, jclass cls) {
+    jclass classCls = env->FindClass("java/lang/Class");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    if (!classCls) return nullptr;
+
+    struct Getter { const char* name; const char* sig; };
+    const Getter getters[] = {
+        { "getDeclaredMethods",      "()[Ljava/lang/reflect/Method;" },
+        { "getDeclaredConstructors", "()[Ljava/lang/reflect/Constructor;" },
+    };
+
+    ArtMethod* found = nullptr;
+    for (const auto& g : getters) {
+        if (found) break;
+        jmethodID mid = env->GetMethodID(classCls, g.name, g.sig);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+        if (!mid) continue;
+        auto arr = (jobjectArray)env->CallObjectMethod(cls, mid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+        if (!arr) continue;
+        jsize n = env->GetArrayLength(arr);
+        for (jsize i = 0; i < n && !found; ++i) {
+            jobject mObj = env->GetObjectArrayElement(arr, i);
+            if (mObj) {
+                PI::Method pm = PI::resolve(env, mObj);
+                env->DeleteLocalRef(mObj);
+                if (pm.isValid()) found = pm.getArtMethod();
+            }
+        }
+        env->DeleteLocalRef(arr);
+    }
+
+    env->DeleteLocalRef(classCls);
+    return found;
+}
+
+// Load any class defined in `dexFile` and return one of its ArtMethods.
+static ArtMethod* FirstArtMethodOfDexFile(JNIEnv* env, jobject dexFile) {
+    jclass dfCls = env->FindClass("dalvik/system/DexFile");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); dfCls = nullptr; }
+    if (!dfCls) return nullptr;
+    jmethodID entriesMid = env->GetMethodID(dfCls, "entries", "()Ljava/util/Enumeration;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(dfCls);
+    if (!entriesMid) return nullptr;
+
+    jclass enumCls = env->FindClass("java/util/Enumeration");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); enumCls = nullptr; }
+    jmethodID hasMore = enumCls ? env->GetMethodID(enumCls, "hasMoreElements", "()Z") : nullptr;
+    jmethodID nextEl  = enumCls ? env->GetMethodID(enumCls, "nextElement", "()Ljava/lang/Object;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (enumCls) env->DeleteLocalRef(enumCls);
+    if (!hasMore || !nextEl) return nullptr;
+
+    jobject en = env->CallObjectMethod(dexFile, entriesMid);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); en = nullptr; }
+
+    ArtMethod* found = nullptr;
+    int tried = 0;
+    while (en && tried < 128 && !found) {
+        jboolean more = env->CallBooleanMethod(en, hasMore);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
+        if (!more) break;
+        auto s = (jstring)env->CallObjectMethod(en, nextEl);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); s = nullptr; }
+        if (s) {
+            const char* c = env->GetStringUTFChars(s, nullptr);
+            if (c) {
+                jclass cls = FindClassWithFallback(env, std::string(c));
+                env->ReleaseStringUTFChars(s, c);
+                if (cls) {
+                    found = FirstArtMethodOfClass(env, cls);
+                    env->DeleteLocalRef(cls);
+                }
+            }
+            env->DeleteLocalRef(s);
+        }
+        ++tried;
+    }
+    if (en) env->DeleteLocalRef(en);
+    return found;
+}
+
+// A dalvik.system.DexFile cookie (mInternalCookie / mCookie) is a long[] whose
+// entries are the native art::DexFile* pointers backing that entry. This is how
+// a single Element (one APK) exposes all of its multidex parts.
+static void CollectDexPtrsFromField(JNIEnv* env, jobject dexFile, jfieldID fid,
+                                    std::vector<const void*>& out) {
+    if (!fid) return;
+    jobject cookie = env->GetObjectField(dexFile, fid);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); cookie = nullptr; }
+    if (!cookie) return;
+    jclass ccls = env->GetObjectClass(cookie);
+    std::string cn = ccls ? JavaClassName(env, ccls) : "";
+    if (ccls) env->DeleteLocalRef(ccls);
+    if (cn == "[J") {
+        jsize n = env->GetArrayLength(reinterpret_cast<jarray>(cookie));
+        jlong* data = env->GetLongArrayElements(reinterpret_cast<jlongArray>(cookie), nullptr);
+        if (data) {
+            for (jsize i = 0; i < n; ++i) {
+                out.push_back(reinterpret_cast<const void*>(static_cast<uintptr_t>(data[i])));
+            }
+            env->ReleaseLongArrayElements(reinterpret_cast<jlongArray>(cookie), data, JNI_ABORT);
+        }
+    }
+    env->DeleteLocalRef(cookie);
+}
+
+static JSValue JsDumpAllDex(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    JNIEnv* env = GetEnv();
+    if (!env) return JS_NewString(ctx, "[!] dumpAllDex: no JNIEnv available");
+
+    std::string dirArg;
+    if (argc >= 1 && JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (s) { dirArg = s; JS_FreeCString(ctx, s); }
+    }
+
+    std::string outDir = dirArg;
+    if (outDir.empty()) {
+        std::string filesDir = ResolveAppFilesDir(env);
+        if (!filesDir.empty()) {
+            outDir = filesDir + "/" + kDumpDexDirName;
+        } else {
+            std::string pkg = PackageFromCmdline();
+            outDir = pkg.empty() ? std::string("/data/local/tmp/") + kDumpDexDirName
+                                 : "/data/data/" + pkg + "/files/" + kDumpDexDirName;
+        }
+    }
+    EnsureDirRecursive(outDir);
+
+    jobject cl = GetAppClassLoader(env);
+    if (!cl) return JS_NewString(ctx, "[!] dumpAllDex: unable to locate application ClassLoader");
+
+    jclass baseCls = env->FindClass("dalvik/system/BaseDexClassLoader");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); baseCls = nullptr; }
+    jfieldID pathListField = baseCls ? env->GetFieldID(baseCls, "pathList", "Ldalvik/system/DexPathList;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jobject pathList = pathListField ? env->GetObjectField(cl, pathListField) : nullptr;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); pathList = nullptr; }
+
+    jclass dplCls = env->FindClass("dalvik/system/DexPathList");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); dplCls = nullptr; }
+    jfieldID dexElementsField = dplCls ? env->GetFieldID(dplCls, "dexElements", "[Ldalvik/system/DexPathList$Element;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    if (!pathList || !dexElementsField) {
+        if (baseCls) env->DeleteLocalRef(baseCls);
+        if (dplCls) env->DeleteLocalRef(dplCls);
+        if (pathList) env->DeleteLocalRef(pathList);
+        return JS_NewString(ctx, "[!] dumpAllDex: DexPathList.dexElements unavailable");
+    }
+
+    auto dexElements = (jobjectArray)env->GetObjectField(pathList, dexElementsField);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); dexElements = nullptr; }
+
+    jclass elemCls = env->FindClass("dalvik/system/DexPathList$Element");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); elemCls = nullptr; }
+    jfieldID dexFileField = elemCls ? env->GetFieldID(elemCls, "dexFile", "Ldalvik/system/DexFile;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jfieldID pathField = elemCls ? env->GetFieldID(elemCls, "path", "Ljava/lang/String;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    // Cookie fields on dalvik.system.DexFile (long[] of native DexFile* pointers).
+    jclass dexFileCls = env->FindClass("dalvik/system/DexFile");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); dexFileCls = nullptr; }
+    jfieldID internalCookieField = dexFileCls ? env->GetFieldID(dexFileCls, "mInternalCookie", "Ljava/lang/Object;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jfieldID cookieField = dexFileCls ? env->GetFieldID(dexFileCls, "mCookie", "Ljava/lang/Object;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (dexFileCls) env->DeleteLocalRef(dexFileCls);
+
+    std::unordered_set<uint64_t> seen;
+    std::unordered_set<const void*> seenPtrs;
+    std::ostringstream details;
+    size_t index = 0, dumped = 0, repairedCount = 0, skipped = 0;
+
+    if (dexElements && dexFileField) {
+        jsize len = env->GetArrayLength(dexElements);
+        for (jsize i = 0; i < len; ++i) {
+            jobject elem = env->GetObjectArrayElement(dexElements, i);
+            if (!elem) continue;
+
+            std::string origName = "classes";
+            if (pathField) {
+                auto ps = (jstring)env->GetObjectField(elem, pathField);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); ps = nullptr; }
+                if (ps) {
+                    const char* c = env->GetStringUTFChars(ps, nullptr);
+                    if (c) { origName = BaseNameOf(c); env->ReleaseStringUTFChars(ps, c); }
+                    env->DeleteLocalRef(ps);
+                }
+            }
+
+            jobject dexFile = env->GetObjectField(elem, dexFileField);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); dexFile = nullptr; }
+
+            if (dexFile) {
+                // Collect every native DexFile* reachable from this entry's
+                // cookie (covers multidex inside a single APK).
+                std::vector<const void*> dexPtrs;
+                CollectDexPtrsFromField(env, dexFile, internalCookieField, dexPtrs);
+                CollectDexPtrsFromField(env, dexFile, cookieField, dexPtrs);
+
+                // Fallback: reach the backing DexFile* through a class defined here.
+                if (dexPtrs.empty()) {
+                    ArtMethod* art = FirstArtMethodOfDexFile(env, dexFile);
+                    if (art) {
+                        uint32_t kr = art->GetDeclaringClass();
+                        if (kr) {
+                            const void* dfp = DexFilePtrFromKlass(reinterpret_cast<void*>(static_cast<uintptr_t>(kr)));
+                            if (dfp) dexPtrs.push_back(dfp);
+                        }
+                    }
+                }
+
+                for (const void* dfp : dexPtrs) {
+                    if (!dfp || !seenPtrs.insert(dfp).second) continue;
+                    size_t size = 0;
+                    const uint8_t* base = DexMemoryFromArtDexFile(dfp, size);
+                    std::vector<uint8_t> buf;
+                    bool repaired = false;
+                    std::string kind;
+                    if (!base || !BuildRepairedDex(base, size, buf, repaired, kind)) {
+                        ++skipped;
+                        continue;
+                    }
+                    uint32_t crc = *reinterpret_cast<const uint32_t*>(buf.data() + 8);
+                    uint64_t key = (static_cast<uint64_t>(buf.size()) << 32) ^ crc;
+                    if (!seen.insert(key).second) continue;
+                    ++index;
+                    char crcStr[16];
+                    snprintf(crcStr, sizeof(crcStr), "%08x", crc);
+                    char prefix[16];
+                    snprintf(prefix, sizeof(prefix), "%04zu_", index);
+                    std::string fname = std::string(prefix) + StripDexExt(SanitizeName(origName))
+                                        + "_" + crcStr + ".dex";
+                    std::string outPath = outDir + "/" + fname;
+                    if (WriteFileAll(outPath, buf)) {
+                        ++dumped;
+                        if (repaired) ++repairedCount;
+                        details << (repaired ? "  [fixed] " : "  [ok]    ") << fname
+                                << "  " << buf.size() << " bytes  (" << kind << ")\n";
+                    } else {
+                        ++skipped;
+                        details << "  [write-fail] " << outPath << "\n";
+                    }
+                }
+                env->DeleteLocalRef(dexFile);
+            } else {
+                ++skipped;
+            }
+            env->DeleteLocalRef(elem);
+        }
+    }
+
+    if (dexElements) env->DeleteLocalRef(dexElements);
+    if (elemCls) env->DeleteLocalRef(elemCls);
+    if (dplCls) env->DeleteLocalRef(dplCls);
+    if (baseCls) env->DeleteLocalRef(baseCls);
+    env->DeleteLocalRef(pathList);
+
+    std::ostringstream out;
+    out << "[*] dumpAllDex -> " << outDir << "\n";
+    out << "    dumped=" << dumped << " (checksum repaired=" << repairedCount
+        << ", skipped=" << skipped << ")\n";
+    out << details.str();
+    return JS_NewString(ctx, out.str().c_str());
+}
+
 // UI implementation is large and kept in a separate include while it still uses
 // JRef/static helpers from this translation unit.
 #include "agent_java_ui.inc"
@@ -3277,6 +3751,9 @@ void RegisterJavaApis(JSContext* ctx, JSValue global, JSValue java) {
     JS_SetPropertyStr(ctx, java, "unhookAll", JS_NewCFunction(ctx, JsJavaUnhookAll, "unhookAll", 0));
     JS_SetPropertyStr(ctx, java, "prepare", JS_NewCFunction(ctx, JsPrepare, "prepare", 1));
     JS_SetPropertyStr(ctx, java, "object", JS_NewCFunction(ctx, JsArtObject, "object", 1));
+    JS_SetPropertyStr(ctx, java, "dumpAllDex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpAllDex", 1));
+    JS_SetPropertyStr(ctx, java, "dumpalldex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpalldex", 1));
+    JS_SetPropertyStr(ctx, java, "dumpDex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpDex", 1));
 
     // Flat global aliases
     JS_SetPropertyStr(ctx, global, "prepare", JS_NewCFunction(ctx, JsPrepare, "prepare", 1));
@@ -3307,6 +3784,9 @@ void RegisterJavaApis(JSContext* ctx, JSValue global, JSValue java) {
     JS_SetPropertyStr(ctx, global, "jhook", JS_NewCFunction(ctx, JsJavaHook, "jhook", 2));
     JS_SetPropertyStr(ctx, global, "unhook", JS_NewCFunction(ctx, JsJavaUnhook, "unhook", 1));
     JS_SetPropertyStr(ctx, global, "unhookall", JS_NewCFunction(ctx, JsJavaUnhookAll, "unhookall", 0));
+    JS_SetPropertyStr(ctx, global, "dumpAllDex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpAllDex", 1));
+    JS_SetPropertyStr(ctx, global, "dumpalldex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpalldex", 1));
+    JS_SetPropertyStr(ctx, global, "dumpdex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpdex", 1));
 
     #include "agent_java_ui_register.inc"
     #include "agent_java_jref_register.inc"

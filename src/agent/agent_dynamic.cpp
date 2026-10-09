@@ -504,7 +504,39 @@ const char* kDynamicBootstrapJs = R"JS(
         if (typeof Java === 'undefined' || !Java.findClass) {
             return createUnavailableDomain("java", "Java/ART runtime is not available in this process");
         }
-        return makeJavaPackage("");
+        // The java root doubles as a package proxy; special-case a handful of
+        // top-level helpers that would otherwise be shadowed by package lookup
+        // (e.g. dynamic.java.dumpalldex()).
+        let pkgRoot = makeJavaPackage("");
+        let specials = {
+            dumpAllDex: function(dir) {
+                if (typeof Java.dumpAllDex !== 'function') throw new Error("Java.dumpAllDex is unavailable");
+                return Java.dumpAllDex(dir);
+            },
+            dumpalldex: function(dir) {
+                if (typeof Java.dumpallDex !== 'function') throw new Error("Java.dumpAllDex is unavailable");
+                return Java.dumpallDex(dir);
+            },
+            dumpDex: function(dir) {
+                if (typeof Java.dumpDex !== 'function') throw new Error("Java.dumpAllDex is unavailable");
+                return Java.dumpDex(dir);
+            },
+            $path: "",
+            toString: function() { return "[JavaDomain]"; }
+        };
+        return new Proxy(specials, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (prop in target) return target[prop];
+                return pkgRoot[prop];
+            },
+            set(target, prop, value) {
+                if (typeof prop !== 'string') { target[prop] = value; return true; }
+                if (prop in target) { target[prop] = value; return true; }
+                pkgRoot[prop] = value;
+                return true;
+            }
+        });
     }
 
     function makeJavaPackage(path) {

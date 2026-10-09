@@ -512,6 +512,14 @@ static std::vector<std::string> GetCandidatesForToken(const std::string& token) 
             results.push_back("dynamic.java.");
         } else {
             std::string rest = token.size() >= 13 ? token.substr(13) : "";
+
+            // Java-domain top-level helpers (implemented directly on the java
+            // root proxy, not real classes).
+            for (const char* special : {"dumpAllDex", "dumpalldex", "dumpDex"}) {
+                std::string cand = std::string("dynamic.java.") + special;
+                if (StartsWithIgnoreCase(cand, token)) results.push_back(cand);
+            }
+
             std::string matchedClass;
             for (const auto& cls : g_dynamicClasses) {
                 if (rest.rfind(cls + ".", 0) == 0 || rest == cls) {
