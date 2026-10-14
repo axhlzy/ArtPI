@@ -20,6 +20,14 @@ extern JSContext* g_ctx;
 extern std::mutex g_jsMutex;
 extern JavaVM* g_jvm;
 
+// Thread-local reentrancy depth of the JS engine. >0 means the current thread is
+// executing JS (inside EvalJs or a JS-triggered JNI call). Hook/trace callbacks that
+// fire on such a thread MUST NOT try to run JS again: QuickJS is not reentrant and
+// g_jsMutex is non-recursive, so it would deadlock (a very common footgun when you
+// install a hook and then trigger the hooked method from the same `-e`/`-f` eval via
+// __native_jcall). Guarded callbacks skip the JS invocation and just pass through.
+extern thread_local int t_jsReentrancyDepth;
+
 // JNI Thread Attaching Helper
 JNIEnv* GetEnv();
 

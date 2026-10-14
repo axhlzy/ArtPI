@@ -347,15 +347,48 @@ bool InitJs(JNIEnv* env) {
     return true;
 }
 
+// RAII: mark the current thread as "executing JS" for the duration of an eval.
+// Hook/trace callbacks check t_jsReentrancyDepth to avoid re-entering QuickJS /
+// deadlocking on g_jsMutex when the hooked method is triggered from within an eval.
+namespace {
+struct JsReentrancyGuard {
+    JsReentrancyGuard() { ++artpi::agent::t_jsReentrancyDepth; }
+    ~JsReentrancyGuard() { --artpi::agent::t_jsReentrancyDepth; }
+};
+} // namespace
+
 std::string EvalJs(const std::string& script, const char* filename) {
     std::lock_guard<std::mutex> lk(g_jsMutex);
     if (!g_ctx) return "[!] QuickJS context not initialized";
+    JsReentrancyGuard jsGuard;
 
     std::string trimmed = script;
     while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t' || trimmed.back() == '\n' || trimmed.back() == ';')) trimmed.pop_back();
     while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
 
     JSValue val = JS_Eval(g_ctx, script.c_str(), script.size(), filename, JS_EVAL_TYPE_GLOBAL);
+
+    // The QuickJS context persists across -e/-f invocations. A top-level `let`/`const`
+    // from a previous run makes the next one fail with a "redeclaration" SyntaxError.
+    // Auto-retry inside a fresh function scope so repeated evals don't collide.
+    if (JS_IsException(val)) {
+        JSValue exc = JS_GetException(g_ctx);
+        const char* estr = JS_ToCString(g_ctx, exc);
+        std::string emsg = estr ? estr : "";
+        if (estr) JS_FreeCString(g_ctx, estr);
+        bool redecl = emsg.find("redeclaration") != std::string::npos ||
+                      emsg.find("already declared") != std::string::npos;
+        JS_FreeValue(g_ctx, val);
+        if (redecl) {
+            JS_FreeValue(g_ctx, exc);
+            std::string wrapped = "(function(){\n" + script + "\n})()";
+            val = JS_Eval(g_ctx, wrapped.c_str(), wrapped.size(), filename, JS_EVAL_TYPE_GLOBAL);
+        } else {
+            // Re-throw the original exception so the normal handler below prints it.
+            val = JS_Throw(g_ctx, exc);
+        }
+    }
+
     std::string res;
 
     if (JS_IsException(val)) {

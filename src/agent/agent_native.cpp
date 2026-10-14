@@ -813,6 +813,37 @@ static JSValue JsNativeHook(JSContext* ctx, JSValueConst /*this_val*/, int argc,
             BroadcastLog("hook", "[NativeHook] entered");
             return;
         }
+        if (t_jsReentrancyDepth > 0) {
+            // Fired on the JS eval thread -> running the callback would re-enter
+            // QuickJS / deadlock on g_jsMutex. Log the raw register args instead.
+            char rbuf[192];
+            snprintf(rbuf, sizeof(rbuf),
+                     "[NativeHook] entered (reentrant) x0=%llx x1=%llx x2=%llx x3=%llx x4=%llx x5=%llx",
+                     (unsigned long long) gum_invocation_context_get_nth_argument(g, 0),
+                     (unsigned long long) gum_invocation_context_get_nth_argument(g, 1),
+                     (unsigned long long) gum_invocation_context_get_nth_argument(g, 2),
+                     (unsigned long long) gum_invocation_context_get_nth_argument(g, 3),
+                     (unsigned long long) gum_invocation_context_get_nth_argument(g, 4),
+                     (unsigned long long) gum_invocation_context_get_nth_argument(g, 5));
+            BroadcastLog("hook", rbuf);
+            // Best-effort raw dump of each plausible pointer arg (used e.g. to capture
+            // mbedtls rsa context / plaintext buffers). Guarded to avoid faulting.
+            for (int ri = 0; ri < 6; ri++) {
+                uintptr_t a = (uintptr_t) gum_invocation_context_get_nth_argument(g, ri);
+                if (a > 0x1000000000ULL && a < 0x100000000000ULL) {
+                    unsigned char tmp[160];
+                    memcpy(tmp, (const void*) a, sizeof(tmp));
+                    std::string hx;
+                    char b[4];
+                    for (int i = 0; i < (int) sizeof(tmp); i++) {
+                        snprintf(b, sizeof(b), "%02x", tmp[i]);
+                        hx += b;
+                    }
+                    BroadcastLog("hook", "[arg" + std::to_string(ri) + " mem] " + hx);
+                }
+            }
+            return;
+        }
         std::lock_guard<std::mutex> lk(g_jsMutex);
         JSValue o = MakeNativeHookCtx(jsctx, g, addrForLog, false);
         JSValue r = JS_Call(jsctx, *cbEnter, JS_UNDEFINED, 1, &o);
@@ -830,6 +861,7 @@ static JSValue JsNativeHook(JSContext* ctx, JSValueConst /*this_val*/, int argc,
         onLeave = [cbLeave, addrForLog](GumInvocationContext* g) {
             JSContext* jsctx = g_ctx;
             if (!jsctx) return;
+            if (t_jsReentrancyDepth > 0) return;  // reentrant on JS thread: skip
             std::lock_guard<std::mutex> lk(g_jsMutex);
             JSValue o = MakeNativeHookCtx(jsctx, g, addrForLog, true);
             JSValue r = JS_Call(jsctx, *cbLeave, JS_UNDEFINED, 1, &o);

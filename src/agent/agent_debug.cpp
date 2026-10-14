@@ -710,6 +710,9 @@ static bool EvalCond(const std::shared_ptr<JSValue>& cond, JSValueConst ev) {
     if (!cond || JS_IsUndefined(*cond)) return true;
     JSContext* c = g_ctx;
     if (!c) return true;
+    // Reentrant on the JS eval thread: evaluating the condition would re-enter
+    // QuickJS / deadlock, and pausing the JS thread would block the REPL. Skip it.
+    if (t_jsReentrancyDepth > 0) return false;
     std::lock_guard<std::mutex> lk(g_jsMutex);
     JSValue r = JS_Call(c, *cond, JS_UNDEFINED, 1, &ev);
     bool ok = true;

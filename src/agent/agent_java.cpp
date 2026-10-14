@@ -2902,6 +2902,28 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
             BroadcastLog("debug", "[hook] " + entryLog + " entered");
 
             bool overrideResult = false;
+            if (t_jsReentrancyDepth > 0) {
+                // This hook fired on the JS eval thread itself (the hooked method was
+                // invoked from within an eval, e.g. via __native_jcall). Running the JS
+                // callback here would re-enter QuickJS and deadlock on g_jsMutex, so we
+                // log the raw arguments (no JS) and pass through to the original impl.
+                std::string argdump;
+                int an = frame.getArgCount();
+                for (int i = 0; i < an; i++) {
+                    argdump += " a";
+                    argdump += std::to_string(i);
+                    argdump += "=";
+                    argdump += frame.getArgString(i);
+                }
+                BroadcastLog("debug", "[hook] " + entryLog +
+                             " (reentrant, JS cb skipped) args:" + argdump);
+                frame.invokeOriginal();
+                BroadcastLog("debug", "[hook] " + entryLog + " -> original return: " +
+                                      frame.getResultString());
+                PopJRefsTo(cbEnv, jrefBase);
+                if (cbEnv) cbEnv->PopLocalFrame(nullptr);
+                return;
+            }
             {
                 std::lock_guard<std::mutex> lk(g_jsMutex);
 

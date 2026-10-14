@@ -912,53 +912,157 @@ static bool FindHitViewAt(JNIEnv* env, int x, int y, HitViewResult& out) {
     return found;
 }
 
+// Fully unwrap a Context to the underlying Activity, following arbitrarily
+// nested ContextWrapper / ContextThemeWrapper chains (the original code only
+// unwrapped a single level, which made currentActivity() return null whenever
+// the top window's context was themed with a wrapped/application context).
+// Returns a new local ref owned by the caller, or nullptr if none was found.
+static jobject UnwrapContextToActivity(JNIEnv* env, jobject ctx,
+                                       jclass activityCls, jclass ctxWrapperCls,
+                                       jmethodID getBaseMid) {
+    if (!env || !ctx || !activityCls) return nullptr;
+    jobject cur = env->NewLocalRef(ctx);
+    jobject act = nullptr;
+    for (int depth = 0; depth < 16 && cur; depth++) {
+        if (env->IsInstanceOf(cur, activityCls)) { act = cur; cur = nullptr; break; }
+        bool isWrapper = ctxWrapperCls && getBaseMid && env->IsInstanceOf(cur, ctxWrapperCls);
+        if (!isWrapper) break;
+        jobject base = env->CallObjectMethod(cur, getBaseMid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); base = nullptr; }
+        env->DeleteLocalRef(cur);
+        cur = base;
+    }
+    if (cur) env->DeleteLocalRef(cur);
+    return act;
+}
+
+// Fallback resolver: walk ActivityThread.mActivities and return the most
+// recently created, non-finishing Activity. Needed when no root view exposes an
+// Activity context (e.g. the top window belongs to a PopupWindow / Dialog that
+// was themed with the application context).
+static jobject GetActivityFromActivityThread(JNIEnv* env, jclass activityCls) {
+    if (!env || !activityCls) return nullptr;
+    jclass atCls = FindClassWithFallback(env, "android.app.ActivityThread");
+    if (!atCls) return nullptr;
+
+    jobject act = nullptr;
+    jmethodID curMid = env->GetStaticMethodID(atCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); curMid = nullptr; }
+    jobject at = curMid ? env->CallStaticObjectMethod(atCls, curMid) : nullptr;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); at = nullptr; }
+
+    if (at) {
+        jclass atObjCls = env->GetObjectClass(at);
+        jfieldID fid = env->GetFieldID(atObjCls, "mActivities", "Landroid/util/ArrayMap;");
+        if (env->ExceptionCheck()) { env->ExceptionClear(); fid = nullptr; }
+        jobject map = fid ? env->GetObjectField(at, fid) : nullptr;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); map = nullptr; }
+
+        if (map) {
+            jclass mapCls = env->GetObjectClass(map);
+            jmethodID valuesMid = env->GetMethodID(mapCls, "values", "()Ljava/util/Collection;");
+            if (env->ExceptionCheck()) { env->ExceptionClear(); valuesMid = nullptr; }
+            jobject coll = valuesMid ? env->CallObjectMethod(map, valuesMid) : nullptr;
+            if (env->ExceptionCheck()) { env->ExceptionClear(); coll = nullptr; }
+
+            if (coll) {
+                jclass collCls = env->GetObjectClass(coll);
+                jmethodID toArrayMid = env->GetMethodID(collCls, "toArray", "()[Ljava/lang/Object;");
+                if (env->ExceptionCheck()) { env->ExceptionClear(); toArrayMid = nullptr; }
+                jobjectArray arr = toArrayMid ? (jobjectArray) env->CallObjectMethod(coll, toArrayMid) : nullptr;
+                if (env->ExceptionCheck()) { env->ExceptionClear(); arr = nullptr; }
+
+                if (arr) {
+                    jclass recCls = FindClassWithFallback(env, "android.app.ActivityThread$ActivityClientRecord");
+                    jfieldID actFid = recCls ? env->GetFieldID(recCls, "activity", "Landroid/app/Activity;") : nullptr;
+                    if (env->ExceptionCheck()) { env->ExceptionClear(); actFid = nullptr; }
+                    jsize n = env->GetArrayLength(arr);
+                    for (jsize i = n - 1; i >= 0 && !act; i--) {
+                        jobject rec = env->GetObjectArrayElement(arr, i);
+                        if (!rec) continue;
+                        jobject a = actFid ? env->GetObjectField(rec, actFid) : nullptr;
+                        if (env->ExceptionCheck()) { env->ExceptionClear(); a = nullptr; }
+                        if (a) {
+                            if (env->IsInstanceOf(a, activityCls)) {
+                                jclass aCls = env->GetObjectClass(a);
+                                jmethodID finMid = env->GetMethodID(aCls, "isFinishing", "()Z");
+                                if (env->ExceptionCheck()) { env->ExceptionClear(); finMid = nullptr; }
+                                bool finishing = finMid && env->CallBooleanMethod(a, finMid);
+                                if (env->ExceptionCheck()) { env->ExceptionClear(); finishing = false; }
+                                if (!finishing) act = a;
+                                else env->DeleteLocalRef(a);
+                                env->DeleteLocalRef(aCls);
+                            } else {
+                                env->DeleteLocalRef(a);
+                            }
+                        }
+                        env->DeleteLocalRef(rec);
+                    }
+                    if (recCls) env->DeleteLocalRef(recCls);
+                    env->DeleteLocalRef(arr);
+                }
+                env->DeleteLocalRef(collCls);
+                env->DeleteLocalRef(coll);
+            }
+            env->DeleteLocalRef(mapCls);
+            env->DeleteLocalRef(map);
+        }
+        env->DeleteLocalRef(atObjCls);
+        env->DeleteLocalRef(at);
+    }
+    env->DeleteLocalRef(atCls);
+    return act;
+}
+
 static jobject GetCurrentActivity(JNIEnv* env) {
-    jobject mViews = GetWindowManagerViews(env);
-    if (!mViews) return nullptr;
+    if (!env) return nullptr;
 
-    jclass listCls = env->FindClass("java/util/List");
-    jmethodID sizeMid = listCls ? env->GetMethodID(listCls, "size", "()I") : nullptr;
-    jmethodID getMid = listCls ? env->GetMethodID(listCls, "get", "(I)Ljava/lang/Object;") : nullptr;
-    int numRoots = (listCls && sizeMid) ? env->CallIntMethod(mViews, sizeMid) : 0;
-    if (env->ExceptionCheck()) { env->ExceptionClear(); numRoots = 0; }
-
-    jclass viewCls = env->FindClass("android/view/View");
-    jmethodID getContextMid = viewCls ? env->GetMethodID(viewCls, "getContext", "()Landroid/content/Context;") : nullptr;
-    jclass activityCls = env->FindClass("android/app/Activity");
-    jclass wrapperCls = env->FindClass("android/view/ContextThemeWrapper");
-    jmethodID getBaseMid = wrapperCls ? env->GetMethodID(wrapperCls, "getBaseContext", "()Landroid/content/Context;") : nullptr;
-    if (env->ExceptionCheck()) env->ExceptionClear();
+    jclass activityCls = FindClassWithFallback(env, "android.app.Activity");
+    jclass ctxWrapperCls = FindClassWithFallback(env, "android.content.ContextWrapper");
+    jmethodID getBaseMid = ctxWrapperCls ? env->GetMethodID(ctxWrapperCls, "getBaseContext", "()Landroid/content/Context;") : nullptr;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); getBaseMid = nullptr; }
 
     jobject resultAct = nullptr;
-    for (int i = numRoots - 1; i >= 0 && !resultAct; i--) {
-        jobject root = env->CallObjectMethod(mViews, getMid, i);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
-        if (!root) continue;
-        if (getContextMid) {
-            jobject ctx = env->CallObjectMethod(root, getContextMid);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            if (ctx) {
-                if (activityCls && env->IsInstanceOf(ctx, activityCls)) {
-                    resultAct = ctx;
-                } else if (wrapperCls && env->IsInstanceOf(ctx, wrapperCls) && getBaseMid) {
-                    jobject base = env->CallObjectMethod(ctx, getBaseMid);
-                    if (env->ExceptionCheck()) env->ExceptionClear();
-                    if (base && activityCls && env->IsInstanceOf(base, activityCls)) {
-                        resultAct = base;
-                    }
-                    if (base && base != resultAct) env->DeleteLocalRef(base);
+
+    // Method A: scan WindowManagerGlobal.mViews roots, fully unwrapping contexts.
+    jobject mViews = GetWindowManagerViews(env);
+    if (mViews && activityCls) {
+        jclass listCls = env->FindClass("java/util/List");
+        jmethodID sizeMid = listCls ? env->GetMethodID(listCls, "size", "()I") : nullptr;
+        jmethodID getMid = listCls ? env->GetMethodID(listCls, "get", "(I)Ljava/lang/Object;") : nullptr;
+        int numRoots = (listCls && sizeMid) ? env->CallIntMethod(mViews, sizeMid) : 0;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); numRoots = 0; }
+
+        jclass viewCls = FindClassWithFallback(env, "android.view.View");
+        jmethodID getContextMid = viewCls ? env->GetMethodID(viewCls, "getContext", "()Landroid/content/Context;") : nullptr;
+        if (env->ExceptionCheck()) env->ExceptionClear();
+
+        for (int i = numRoots - 1; i >= 0 && !resultAct; i--) {
+            jobject root = env->CallObjectMethod(mViews, getMid, i);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+            if (!root) continue;
+            if (getContextMid) {
+                jobject ctx = env->CallObjectMethod(root, getContextMid);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (ctx) {
+                    resultAct = UnwrapContextToActivity(env, ctx, activityCls, ctxWrapperCls, getBaseMid);
+                    env->DeleteLocalRef(ctx);
                 }
-                if (ctx != resultAct) env->DeleteLocalRef(ctx);
             }
+            env->DeleteLocalRef(root);
         }
-        env->DeleteLocalRef(root);
+        if (viewCls) env->DeleteLocalRef(viewCls);
+        if (listCls) env->DeleteLocalRef(listCls);
+        env->DeleteLocalRef(mViews);
     }
 
-    if (wrapperCls) env->DeleteLocalRef(wrapperCls);
+    // Method B: fall back to ActivityThread.mActivities.
+    if (!resultAct) {
+        resultAct = GetActivityFromActivityThread(env, activityCls);
+    }
+
+    if (ctxWrapperCls) env->DeleteLocalRef(ctxWrapperCls);
     if (activityCls) env->DeleteLocalRef(activityCls);
-    if (viewCls) env->DeleteLocalRef(viewCls);
-    if (listCls) env->DeleteLocalRef(listCls);
-    env->DeleteLocalRef(mViews);
     return resultAct;
 }
 

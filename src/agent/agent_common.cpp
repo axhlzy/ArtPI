@@ -14,6 +14,8 @@ JSContext* g_ctx = nullptr;
 std::mutex g_jsMutex;
 JavaVM* g_jvm = nullptr;
 
+thread_local int t_jsReentrancyDepth = 0;
+
 static jobject g_appClassLoader = nullptr;
 static std::mutex g_clMutex;
 

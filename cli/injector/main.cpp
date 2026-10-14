@@ -97,7 +97,7 @@ namespace {
         exit(0);
     }
 
-    bool MkdirP(const std::string &path, uid_t uid, gid_t gid) {
+    [[maybe_unused]] bool MkdirP(const std::string &path, uid_t uid, gid_t gid) {
         std::string cur;
         size_t i = 0;
         while (i < path.size()) {
@@ -111,14 +111,62 @@ namespace {
         return true;
     }
 
-    void ApplySelinux(const std::string &src, const std::string &dst) {
+    void ApplySelinux(const std::string &src, const std::string &dst,
+                      const char *fallback = "u:object_r:apk_data_file:s0") {
         char ctx[256] = {0};
         ssize_t n = getxattr(src.c_str(), "security.selinux", ctx, sizeof(ctx) - 1);
         if (n <= 0) {
-            strncpy(ctx, "u:object_r:apk_data_file:s0", sizeof(ctx) - 1);
+            strncpy(ctx, fallback, sizeof(ctx) - 1);
             n = (ssize_t) strlen(ctx);
         }
         setxattr(dst.c_str(), "security.selinux", ctx, (size_t) n, 0);
+    }
+
+    // Read the first NUL-terminated field of /proc/<pid>/cmdline.
+    std::string ReadProcCmdline(pid_t pid) {
+        std::string path = "/proc/" + std::to_string(pid) + "/cmdline";
+        FILE *fp = fopen(path.c_str(), "rb");
+        if (!fp) return "";
+        char buf[256] = {0};
+        size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+        fclose(fp);
+        std::string s(buf, n);
+        size_t nul = s.find('\0');
+        if (nul != std::string::npos) s = s.substr(0, nul);
+        return s;
+    }
+
+    // Resolve the target app's private data dir: /data/user/<userId>/<pkg>.
+    // This dir (unlike the apk's lib/ directory) is writable and is part of the
+    // app linker namespace's permitted paths, so the agent can be dlopen'd from it.
+    bool ResolveAppDataDir(pid_t pid, const std::string &pkgName,
+                           std::string &outDataDir, std::string &err) {
+        std::string pkg = pkgName;
+        if (pkg.empty()) {
+            pkg = ReadProcCmdline(pid);
+            size_t colon = pkg.find(':');
+            if (colon != std::string::npos) pkg = pkg.substr(0, colon);
+        }
+        if (pkg.empty()) {
+            err = "cannot determine package name for pid " + std::to_string(pid);
+            return false;
+        }
+
+        struct stat procSt{};
+        if (stat(("/proc/" + std::to_string(pid)).c_str(), &procSt) != 0) {
+            err = "cannot stat /proc/" + std::to_string(pid) + ": " + strerror(errno);
+            return false;
+        }
+        unsigned long userId = (unsigned long) procSt.st_uid / 100000UL;
+        std::string dir = "/data/user/" + std::to_string(userId) + "/" + pkg;
+
+        struct stat dirSt{};
+        if (stat(dir.c_str(), &dirSt) != 0 || !S_ISDIR(dirSt.st_mode)) {
+            err = "app data dir not found: " + dir;
+            return false;
+        }
+        outDataDir = dir;
+        return true;
     }
 
     bool FindAppLibDir(pid_t pid, const std::string &pkgName,
@@ -157,19 +205,22 @@ namespace {
         return false;
     }
 
-    bool DeployPayload(const std::string &libDir, const std::string &apkPath,
+    // Write the payload into `deployDir` (which must already exist and be
+    // writable). We do NOT create parent dirs here: chown'ing every path
+    // component would clobber system dirs like /data, /data/user, /data/user/0.
+    bool DeployPayload(const std::string &deployDir, const std::string &labelSrc,
                        const std::vector<uint8_t> &payload,
                        std::string &outPath, std::string &err) {
-        struct stat apkSt{};
-        if (stat(apkPath.c_str(), &apkSt) != 0) {
-            err = "cannot stat " + apkPath + ": " + strerror(errno);
+        struct stat dirSt{};
+        if (stat(deployDir.c_str(), &dirSt) != 0) {
+            err = "cannot stat " + deployDir + ": " + strerror(errno);
             return false;
         }
-        if (!MkdirP(libDir, apkSt.st_uid, apkSt.st_gid)) {
-            err = "cannot create " + libDir + ": " + strerror(errno);
+        if (!S_ISDIR(dirSt.st_mode)) {
+            err = deployDir + " is not a directory";
             return false;
         }
-        outPath = libDir + "/libartpi_agent.so";
+        outPath = deployDir + "/libartpi_agent.so";
         int fd = open(outPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
         if (fd < 0) { err = outPath + ": " + strerror(errno); return false; }
         size_t done = 0;
@@ -181,8 +232,8 @@ namespace {
         }
         close(fd);
         chmod(outPath.c_str(), 0755);
-        chown(outPath.c_str(), apkSt.st_uid, apkSt.st_gid);
-        ApplySelinux(apkPath, outPath);
+        chown(outPath.c_str(), dirSt.st_uid, dirSt.st_gid);
+        ApplySelinux(labelSrc, outPath);
         return true;
     }
 
@@ -304,14 +355,34 @@ int main(int argc, char **argv) {
     }
     printf("[*] payload ready (%zu bytes)\n", payload.size());
 
+    // apkPath is only used to pick the linker-namespace caller (base.apk mapping).
     std::string libDir, apkPath;
     if (!FindAppLibDir(opt.pid, opt.pkgName, libDir, apkPath)) {
-        fprintf(stderr, "[!] cannot find app apk/lib mapping for pid %d\n", opt.pid);
+        fprintf(stderr, "[!] cannot find app apk mapping for pid %d\n", opt.pid);
         return 1;
     }
 
+    // Deploy the agent into the app's PRIVATE DATA DIR rather than the apk's
+    // lib/ directory. Apps installed incrementally (Google Play incremental
+    // install -> incremental-fs) expose /data/app/<pkg> as a read-only mount, so
+    // writing libartpi_agent.so there fails with EACCES even as root. The data
+    // dir is writable, owned by the app uid, and lies within the app linker
+    // namespace's permitted paths, so dlopen of the absolute path still resolves
+    // inside the app's namespace (caller = base.apk mapping).
     std::string deployedSoPath;
-    if (!DeployPayload(libDir, apkPath, payload, deployedSoPath, err)) {
+    bool deployed = false;
+    std::string dataDir;
+    std::string dataErr;
+    if (ResolveAppDataDir(opt.pid, opt.pkgName, dataDir, dataErr)) {
+        if (DeployPayload(dataDir, dataDir, payload, deployedSoPath, err)) {
+            deployed = true;
+        } else {
+            fprintf(stderr, "[i] deploy to app data dir failed (%s), falling back to lib dir\n", err.c_str());
+        }
+    } else {
+        fprintf(stderr, "[i] %s, falling back to lib dir\n", dataErr.c_str());
+    }
+    if (!deployed && !DeployPayload(libDir, apkPath, payload, deployedSoPath, err)) {
         fprintf(stderr, "[!] deploy failed: %s\n", err.c_str());
         return 1;
     }
