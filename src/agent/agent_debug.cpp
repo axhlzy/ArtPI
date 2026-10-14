@@ -245,12 +245,38 @@ static bool IsValidArtMethod(void* ptr) {
     return true;
 }
 
+// Crash-safe method pretty-printer. ART's PrettyMethod() dereferences the
+// declaring class' DexCache and FATAL-aborts on a garbage ArtMethod*, which is
+// easy to hit when unwinding a stack that contains Pine/trampoline synthetic
+// frames. Only resolve via ART when the pointer actually lives in a mapped
+// module; otherwise return the raw pointer annotated as untrusted.
+static std::string SafePrettyMethod(void* m) {
+    if (!m) return "<null>";
+    uintptr_t a = reinterpret_cast<uintptr_t>(m);
+    if (a < 0x1000 || (a & (alignof(void*) - 1)) != 0) {
+        char b[32]; snprintf(b, sizeof(b), "%p", m); return b;
+    }
+    Dl_info di;
+    if (!dladdr(m, &di) || !di.dli_fname) {
+        char b[48]; snprintf(b, sizeof(b), "%p(heap?)", m); return b;
+    }
+    if (!IsValidArtMethod(m)) {
+        char b[96]; snprintf(b, sizeof(b), "%p(%s invalid)", m, di.dli_fname); return b;
+    }
+    std::string s = PI::getPrettyMethodSignature(reinterpret_cast<ArtMethod*>(m));
+    if (s.empty()) { char b[96]; snprintf(b, sizeof(b), "%p(%s)", m, di.dli_fname); return b; }
+    return s;
+}
+
 struct ShadowFrameHeader {
-    void* link;           // offset 0: ShadowFrame* link_
-    void* method;         // offset 8: ArtMethod* method_
-    void* lock_count;     // offset 16: LockCountData
-    uint32_t num_vregs;   // offset 24
-    uint32_t dex_pc;      // offset 28
+    void* link;             // 0: ShadowFrame* link_
+    void* method;           // 8: ArtMethod* method_
+    void* result_register;  // 16
+    void* dex_pc_ptr;       // 24
+    void* dex_instructions; // 32
+    void* lock_count_data;  // 40
+    uint32_t num_vregs;     // 48 (const uint32_t number_of_vregs_)
+    uint32_t dex_pc;        // 52
 };
 
 struct ManagedStackFragment {
@@ -380,8 +406,16 @@ static std::string CaptureJavaStack(ArtMethod* curMethod, const PI::Interp::Insn
         char buf[512];
         void* m = frames[i].artMethod;
         uint32_t pc = frames[i].dexPc;
-        int line = ResolveLineNumber(m, pc);
-        std::string sig = PI::getPrettyMethodSignature(reinterpret_cast<ArtMethod*>(m));
+        // Frame #00 is the breakpoint target (always a valid ArtMethod) -> name it
+        // directly. Walked caller frames may be garbage (Pine synthetic frames), so
+        // resolve those defensively to avoid PrettyMethod() FATAL-aborts.
+        std::string sig = (i == 0)
+            ? PI::getPrettyMethodSignature(reinterpret_cast<ArtMethod*>(m))
+            : SafePrettyMethod(m);
+        bool trusted = i == 0 || (!sig.empty() && sig[0] != '0' &&
+                       sig.find("(heap?)") == std::string::npos &&
+                       sig.find("invalid)") == std::string::npos);
+        int line = trusted ? ResolveLineNumber(m, pc) : -1;
         if (sig.empty()) sig = "<unknown method>";
 
         if (line > 0) {
