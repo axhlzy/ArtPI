@@ -419,7 +419,7 @@ dynamic.register("mydomain", rootObj);// 注册自定义域
 
 ```javascript
 // 示例 1：默认方法调用树追踪
-let t = dynamic.java.com.example.App.Z.trace();
+dynamic.java.com.example.App.Z.trace();
 
 // 示例 2：逐指令 Smali + 寄存器状态追踪（可通过 dumpAfter 切换指令执行后/前寄存器）
 dynamic.java.com.example.App.Z.trace({
@@ -432,8 +432,6 @@ dynamic.java.com.example.App.Z.trace({
     mode: "FULL_STACK_NATIVE"
 });
 
-// 停止追踪
-t.stop();   // 或 untrace(t._id) / untrace()
 ```
 
 > **追踪作用域**：为保证稳定性，解释器默认只步入 **App 自身包** 内的类（app-scope 允许列表，包名取自 `ActivityThread.currentPackageName()`，app_process 场景回退 `/proc/self/cmdline`）；系统/框架类一律黑盒透传。`suspend` 方法（签名含 `Continuation`）及 `kotlin` / `kotlinx` / `org.jetbrains` 等 Kotlin 运行时也会自动跳过，避免 R8 混淆后解释执行破坏协程的异常控制流。
