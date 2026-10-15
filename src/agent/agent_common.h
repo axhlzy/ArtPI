@@ -50,4 +50,13 @@ jclass AgentCachedClass(const char* slashName);
 // Console Logging & Event Broadcaster
 void InstallConsole(JSContext* ctx);
 
+// Instrumentation ownership: one ArtMethod carries at most one Pine trampoline,
+// so jhook / trace / breakpoint must never stack on the same method. Releases
+// any existing instrumentation on `artMethod` so the next feature installs
+// cleanly ("last one wins"; avoid replacing a hot method while another thread
+// is executing inside its trampoline). Returns a bitmask of what was released:
+// 1=hook, 2=trace, 4=breakpoint.
+int AgentReleaseMethodInstrumentation(void* artMethod);
+std::string FormatReleasedInstrumentation(int mask);
+
 }} // namespace artpi::agent

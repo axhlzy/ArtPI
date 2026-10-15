@@ -378,9 +378,17 @@ const char* kDynamicBootstrapJs = R"JS(
             mFn.decompile = function() {
                 return Java.decompile(art);
             };
-            mFn.hook = function(cb) {
+            // .hook(cb): single callback (Frida-style) — cb.setResult(v) overrides
+            //            the return and skips the original method.
+            // .hook(onEnter, onLeave): two-callback form — onEnter may inspect/mutate
+            //            args, the original ALWAYS runs, then onLeave observes the
+            //            result and may override it via onLeave.setResult(v).
+            mFn.hook = function(onEnter, onLeave) {
                 let sig = (info && info.signature) ? info.signature : "";
-                return jhook(art, cb, className, mName, sig);
+                if (typeof onLeave === 'function') {
+                    return jhook(art, onEnter, onLeave, className, mName, sig);
+                }
+                return jhook(art, onEnter, className, mName, sig);
             };
             mFn.trace = function(opt) {
                 if (isNative && nativeEntry && typeof tracenative === 'function') {

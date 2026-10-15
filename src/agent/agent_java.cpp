@@ -4,6 +4,7 @@
 #include "agent_java.h"
 #include "agent_common.h"
 #include "agent_net.h"
+#include "agent_debug.h"
 #include "../../include/ArtPI.h"
 #include "art/art_method.h"
 
@@ -2782,22 +2783,58 @@ static std::string FormatJavaObject(JNIEnv* env, jobject obj) {
     return buf;
 }
 
+static std::shared_ptr<JSValue> GuardJsHookCb(JSValue v) {
+    return std::shared_ptr<JSValue>(new JSValue(v), [](JSValue* p) {
+        if (p) {
+            if (g_ctx && !JS_IsUndefined(*p)) JS_FreeValue(g_ctx, *p);
+            delete p;
+        }
+    });
+}
+
+static JSValue JsHookGetStackFn(JSContext* ctx, JSValueConst /*this_val*/,
+                                int /*argc*/, JSValueConst* /*argv*/,
+                                int /*magic*/, JSValue* func_data) {
+    int64_t sp = ParsePtr(ctx, func_data[0]);
+    if (!sp) return JS_NewString(ctx, "");
+    std::string s = CaptureCallerStackFromSp(reinterpret_cast<void*>(static_cast<uintptr_t>(sp)));
+    return JS_NewString(ctx, s.c_str());
+}
+
+static void AttachLazyStackGetter(JSContext* jsctx, JSValue obj, const PI::CallFrame& frame) {
+    uintptr_t sp = (frame.ctx != nullptr) ? static_cast<uintptr_t>(frame.ctx->sp) : 0;
+    JSValue spData[1] = { JS_NewBigInt64(jsctx, static_cast<int64_t>(sp)) };
+    JSValue getter = JS_NewCFunctionData(jsctx, JsHookGetStackFn, 0, 0, 1, spData);
+    JS_FreeValue(jsctx, spData[0]);
+    JSAtom atom = JS_NewAtom(jsctx, "stack");
+    JS_DefinePropertyGetSet(jsctx, obj, atom, getter, JS_UNDEFINED, JS_PROP_C_W_E);
+    JS_FreeAtom(jsctx, atom);
+}
+
 JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    if (argc < 1) return JS_NewString(ctx, "Usage: jhook(artMethod, [callback], [className], [methodName], [sig])");
+    if (argc < 1) return JS_NewString(ctx, "Usage: jhook(artMethod, [onEnter], [onLeave], [className], [methodName], [sig])");
     int64_t ptr = ParsePtr(ctx, argv[0]);
     if (!ptr || ptr < 0x1000) return JS_NewString(ctx, "[!] Invalid method pointer");
 
+    // Callback/metadata layout is positional:
+    //   jhook(art, cb)                                  -> single callback, no metadata
+    //   jhook(art, cb, className, methodName, sig)      -> single callback + metadata
+    //   jhook(art, onEnter, onLeave, className, mName, sig) -> two callbacks + metadata
+    // If argv[2] is a function it is the onLeave callback (metadata starts at 3);
+    // otherwise it is the className (metadata starts at 2).
+    bool twoCb = (argc >= 3 && JS_IsFunction(ctx, argv[2]));
+    int metaBase = twoCb ? 3 : 2;
     std::string optClass, optMethod, optSig;
-    if (argc >= 3 && JS_IsString(argv[2])) {
-        const char* s = JS_ToCString(ctx, argv[2]);
+    if (argc >= metaBase + 0 && JS_IsString(argv[metaBase + 0])) {
+        const char* s = JS_ToCString(ctx, argv[metaBase + 0]);
         if (s) { optClass = s; JS_FreeCString(ctx, s); }
     }
-    if (argc >= 4 && JS_IsString(argv[3])) {
-        const char* s = JS_ToCString(ctx, argv[3]);
+    if (argc >= metaBase + 1 && JS_IsString(argv[metaBase + 1])) {
+        const char* s = JS_ToCString(ctx, argv[metaBase + 1]);
         if (s) { optMethod = s; JS_FreeCString(ctx, s); }
     }
-    if (argc >= 5 && JS_IsString(argv[4])) {
-        const char* s = JS_ToCString(ctx, argv[4]);
+    if (argc >= metaBase + 2 && JS_IsString(argv[metaBase + 2])) {
+        const char* s = JS_ToCString(ctx, argv[metaBase + 2]);
         if (s) { optSig = s; JS_FreeCString(ctx, s); }
     }
 
@@ -2822,22 +2859,19 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
     }
     if (!m.isValid()) return JS_NewString(ctx, "[!] Cannot resolve ArtMethod");
 
-    // Idempotent: re-hooking an ArtMethod that already has a live hook re-enters
-    // the installed trampoline and crashes. Return the existing hook id instead.
+    // last-one-wins: drop any existing hook/trace/breakpoint on this ArtMethod
+    // before installing a fresh trampoline (a method carries only one).
     {
-        std::lock_guard<std::mutex> lk(g_hooksMutex);
-        for (size_t i = 0; i < g_activeHooks.size(); i++) {
-            if (g_activeHooks[i].isHooked() &&
-                reinterpret_cast<void*>(g_activeHooks[i].getArtMethod()) == reinterpret_cast<void*>(ptr)) {
-                char resBuf[96];
-                snprintf(resBuf, sizeof(resBuf), "Already hooked (id: %zu)", i);
-                return JS_NewString(ctx, resBuf);
-            }
+        int rel = AgentReleaseMethodInstrumentation(reinterpret_cast<void*>(m.getArtMethod()));
+        if (rel) {
+            BroadcastLog("console", std::string("[hook] replaced existing ") +
+                                        FormatReleasedInstrumentation(rel) +
+                                        " on " + m.getDeclaringClassName() + "." + m.getName());
         }
     }
 
     PI::HookHandle handle;
-    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) {
+    if (!twoCb && (argc < 2 || !JS_IsFunction(ctx, argv[1]))) {
         // No callback -> default "call log" hook: Box-drawing call hierarchy with clear return packets.
         handle = m.hook([](JNIEnv* cbEnv, PI::CallFrame& frame) {
             if (cbEnv) cbEnv->PushLocalFrame(32);
@@ -2880,10 +2914,129 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
 
             if (cbEnv) cbEnv->PopLocalFrame(nullptr);
         });
+    } else if (twoCb) {
+        // Two-callback form: onEnter(argv[1], optional) + onLeave(argv[2]). The original
+        // method ALWAYS runs between them; onLeave observes the return value and
+        // may override it via setResult.
+        auto onEnterGuard = JS_IsFunction(ctx, argv[1])
+            ? GuardJsHookCb(JS_DupValue(ctx, argv[1]))
+            : nullptr;
+        auto onLeaveGuard = GuardJsHookCb(JS_DupValue(ctx, argv[2]));
+        handle = m.hook([onEnterGuard, onLeaveGuard](JNIEnv* cbEnv, PI::CallFrame& frame) {
+            JSContext* jsctx = g_ctx;
+            if (!jsctx) { frame.invokeOriginal(); return; }
+
+            size_t jrefBase;
+            {
+                std::lock_guard<std::mutex> lk(g_jrefMutex);
+                jrefBase = g_jrefs.size();
+            }
+            if (cbEnv) cbEnv->PushLocalFrame(64);
+
+            std::string entryLog = frame.class_name.empty()
+                                       ? frame.getMethodName()
+                                       : (frame.class_name + "." + frame.getMethodName());
+
+            if (t_jsReentrancyDepth > 0) {
+                std::string argdump;
+                int an = frame.getArgCount();
+                for (int i = 0; i < an; i++) {
+                    argdump += " a" + std::to_string(i) + "=" + frame.getArgString(i);
+                }
+                BroadcastLog("debug", "[hook] " + entryLog + " (reentrant, JS cb skipped) args:" + argdump);
+                frame.invokeOriginal();
+                PopJRefsTo(cbEnv, jrefBase);
+                if (cbEnv) cbEnv->PopLocalFrame(nullptr);
+                return;
+            }
+
+            int n = frame.getArgCount();
+            if (onEnterGuard) {
+                std::lock_guard<std::mutex> lk(g_jsMutex);
+
+                JSValue argsArr = JS_NewArray(jsctx);
+                for (int i = 0; i < n; i++) {
+                    JS_SetPropertyUint32(jsctx, argsArr, static_cast<uint32_t>(i),
+                                         JsValueFromFrameArg(jsctx, frame, i));
+                }
+
+                // ---- onEnter ----
+                JSValue obj = JS_NewObject(jsctx);
+                JS_SetPropertyStr(jsctx, obj, "method", JS_NewString(jsctx, frame.getMethodName().c_str()));
+                JS_SetPropertyStr(jsctx, obj, "class", JS_NewString(jsctx, frame.class_name.c_str()));
+                JS_SetPropertyStr(jsctx, obj, "args", JS_DupValue(jsctx, argsArr));
+                JS_SetPropertyStr(jsctx, obj, "argc", JS_NewInt32(jsctx, n));
+                JS_SetPropertyStr(jsctx, obj, "thiz",
+                                  frame.is_static ? JS_NULL
+                                                  : JavaObjectToJsValue(jsctx, GetEnv(), frame.getThisObject()));
+                AttachLazyStackGetter(jsctx, obj, frame);
+
+                JSValue r1 = JS_Call(jsctx, *onEnterGuard, JS_UNDEFINED, 1, &obj);
+                if (JS_IsException(r1)) {
+                    JSValue exc = JS_GetException(jsctx);
+                    const char* err = JS_ToCString(jsctx, exc);
+                    if (err) { BroadcastLog("console", std::string("[hook callback] ") + err); JS_FreeCString(jsctx, err); }
+                    JS_FreeValue(jsctx, exc);
+                }
+                JS_FreeValue(jsctx, r1);
+                JS_FreeValue(jsctx, obj);
+
+                // Write back mutated args.
+                for (int i = 0; i < n; i++) {
+                    JSValue v = JS_GetPropertyUint32(jsctx, argsArr, static_cast<uint32_t>(i));
+                    JsValueToFrameArg(jsctx, frame, i, v);
+                    JS_FreeValue(jsctx, v);
+                }
+                JS_FreeValue(jsctx, argsArr);
+            }
+
+            // ---- original ALWAYS runs ----
+            frame.invokeOriginal();
+
+            {
+                std::lock_guard<std::mutex> lk(g_jsMutex);
+
+                // ---- onLeave ----
+                JsHookRet leaveRet;
+                JSValue obj2 = JS_NewObject(jsctx);
+                JS_SetPropertyStr(jsctx, obj2, "method", JS_NewString(jsctx, frame.getMethodName().c_str()));
+                JS_SetPropertyStr(jsctx, obj2, "class", JS_NewString(jsctx, frame.class_name.c_str()));
+                JS_SetPropertyStr(jsctx, obj2, "ret", JS_NewString(jsctx, frame.getResultString().c_str()));
+                JS_SetPropertyStr(jsctx, obj2, "thiz",
+                                  frame.is_static ? JS_NULL
+                                                  : JavaObjectToJsValue(jsctx, GetEnv(), frame.getThisObject()));
+                AttachLazyStackGetter(jsctx, obj2, frame);
+                JSValue data[1] = { JS_NewBigInt64(jsctx, static_cast<int64_t>(reinterpret_cast<uintptr_t>(&leaveRet))) };
+                JS_SetPropertyStr(jsctx, obj2, "setResult", JS_NewCFunctionData(jsctx, JsHookSetResultFn, 1, 0, 1, data));
+                JS_FreeValue(jsctx, data[0]);
+
+                JSValue r2 = JS_Call(jsctx, *onLeaveGuard, JS_UNDEFINED, 1, &obj2);
+                if (JS_IsException(r2)) {
+                    JSValue exc = JS_GetException(jsctx);
+                    const char* err = JS_ToCString(jsctx, exc);
+                    if (err) { BroadcastLog("console", std::string("[hook callback] ") + err); JS_FreeCString(jsctx, err); }
+                    JS_FreeValue(jsctx, exc);
+                }
+                JS_FreeValue(jsctx, r2);
+
+                if (leaveRet.set) {
+                    JsValueToFrameResult(jsctx, frame, leaveRet.val);
+                    const char* rv = JS_ToCString(jsctx, leaveRet.val);
+                    BroadcastLog("debug", "[hook] " + entryLog + " -> return MODIFIED to "
+                                              + (rv ? rv : "<null>"));
+                    if (rv) JS_FreeCString(jsctx, rv);
+                    JS_FreeValue(jsctx, leaveRet.val);
+                }
+                JS_FreeValue(jsctx, obj2);
+            }
+
+            PopJRefsTo(cbEnv, jrefBase);
+            if (cbEnv) cbEnv->PopLocalFrame(nullptr);
+        });
     } else {
         // Keep the callback alive for the hook's lifetime; the deleter frees the
         // JSValue when the hook is removed (Pine destroys the std::function).
-        auto cbGuard = std::make_shared<JSValue>(JS_DupValue(ctx, argv[1]));
+        auto cbGuard = GuardJsHookCb(JS_DupValue(ctx, argv[1]));
         handle = m.hook([cbGuard](JNIEnv* cbEnv, PI::CallFrame& frame) {
             JSContext* jsctx = g_ctx;
             if (!jsctx) { frame.invokeOriginal(); return; }
@@ -2943,6 +3096,10 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
                 JS_SetPropertyStr(jsctx, obj, "thiz",
                                   frame.is_static ? JS_NULL
                                                   : JavaObjectToJsValue(jsctx, GetEnv(), frame.getThisObject()));
+
+                // ctx.stack: lazy getter that walks the Java caller chain from
+                // the trampoline's saved SP only when read by the JS callback.
+                AttachLazyStackGetter(jsctx, obj, frame);
 
                 JSValue data[1] = { JS_NewBigInt64(jsctx, static_cast<int64_t>(reinterpret_cast<uintptr_t>(&retSlot))) };
                 JS_SetPropertyStr(jsctx, obj, "setResult",
@@ -3737,9 +3894,12 @@ size_t JavaUnhookAllCount() {
 bool JavaUnhookMethod(void* artMethod) {
     std::lock_guard<std::mutex> lk(g_hooksMutex);
     bool done = false;
+    // Keep vector slots intact so existing hookId indices (used by unhook(id))
+    // do not shift when a hook is replaced via last-one-wins.
     for (auto& h : g_activeHooks) {
         if (h.isHooked() && reinterpret_cast<void*>(h.getArtMethod()) == artMethod) {
             h.unhook();
+            h = PI::HookHandle();
             done = true;
         }
     }

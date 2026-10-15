@@ -263,6 +263,10 @@ struct ManagedStackSnapshot {
     uint64_t link = 0;
     uint64_t topShadowFrame = 0;
     size_t managedStackOffset = 0;
+    // PineNativeContext::sp captured at hook entry == the hooked method's entry
+    // SP == its caller's quick-frame base (caller ArtMethod* lives at this
+    // address). Used by bt to walk the compiled caller chain natively.
+    void* callerFrameBase = nullptr;
 };
 bool getManagedStackSnapshot(ManagedStackSnapshot& out);
 
@@ -279,6 +283,10 @@ void RegisterAppClassLoader(JNIEnv* env, jobject loader);
 // Cache-first class lookup (returns a GLOBAL ref; do not DeleteLocalRef).
 // Falls back to env->FindClass only when the name is not cached.
 jclass FindClassRefCached(JNIEnv* env, const char* jniName);
+
+// Choose whether the per-instruction trace dumps register values AFTER the
+// instruction executes (true, default) or BEFORE (false, buffered pre-state).
+void SetDumpRegsAfter(bool after);
 
 // ---------------------------------------------------------------------------
 // logcat per-instruction trace ("PI_VMTrace" lines; see pi_interp_tracer.cpp)

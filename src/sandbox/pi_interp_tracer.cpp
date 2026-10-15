@@ -117,7 +117,16 @@ jclass FindClassRefCached(JNIEnv* env, const char* name) {
             for (char& c : dotted) if (c == '/') c = '.';
             jstring jn = env->NewStringUTF(dotted.c_str());
             jclass l = jn ? static_cast<jclass>(env->CallObjectMethod(loader, lc, jn)) : nullptr;
-            if (env->ExceptionCheck()) { env->ExceptionClear(); l = nullptr; }
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                __android_log_print(ANDROID_LOG_WARN, "Interp",
+                                    "FindClassRefCached '%s': loadClass threw exception",
+                                    dotted.c_str());
+                if (l) {
+                    env->DeleteLocalRef(l);
+                    l = nullptr;
+                }
+            }
             if (jn) env->DeleteLocalRef(jn);
             if (l) {
                 jclass g = static_cast<jclass>(env->NewGlobalRef(l));
@@ -126,6 +135,13 @@ jclass FindClassRefCached(JNIEnv* env, const char* name) {
                 g_clsCache[name] = g;
                 return g;
             }
+            __android_log_print(ANDROID_LOG_WARN, "Interp",
+                                "FindClassRefCached '%s': loadClass returned null (loader=%p)",
+                                dotted.c_str(), loader);
+        } else {
+            __android_log_print(ANDROID_LOG_WARN, "Interp",
+                                "FindClassRefCached '%s': NO loader (loader=%p lc=%p)",
+                                name, loader, lc);
         }
     }
 
@@ -686,18 +702,33 @@ void destroyFrameCtx(void* frameCtx) {
 #include <atomic>
 #include <cstdio>
 
+// Exported switch: choose whether the per-instruction trace dumps registers
+// AFTER the instruction (default) or BEFORE. Kept thread-local and captured into
+// each TraceContext so concurrent traces on different threads do not collide.
+static thread_local bool tl_dumpRegsAfter = true;
+void SetDumpRegsAfter(bool after) {
+    tl_dumpRegsAfter = after;
+}
+
 namespace {
 
 std::atomic<bool> g_traceEnabled{false};
 
 struct TraceContext {
     bool active = false;
+    bool dumpAfter = true;
     const void* artDexFile = nullptr;
     const uint16_t* insnsBase = nullptr;
     uint32_t regsSize = 0;
     uint32_t insnsTraced = 0;
     const DexResolver* dex = nullptr;   // for invoke shorty lookup
     char label[72] = {0};               // method label for section markers
+    bool hasPending = false;            // deferred insn waiting for post-execution regs
+    uint32_t pendingPc = 0;
+    int pendingDepth = 0;
+    JNIEnv* lastEnv = nullptr;
+    const regptr_t* lastRegs = nullptr;
+    const u1* lastRegFlags = nullptr;
 };
 thread_local TraceContext t_trace;
 
@@ -1129,24 +1160,9 @@ std::string formatWideReg(uint32_t idx, regptr_t value) {
     return buf;
 }
 
-void vmTraceHookImpl(JNIEnv* env, const vmCode* /*code*/, u4 pcOffset, u2 /*inst*/,
-                     const regptr_t* regs, const u1* regFlags) {
-    TraceContext& ctx = t_trace;
-    if (!ctx.active || regs == nullptr || regFlags == nullptr ||
-        ctx.insnsBase == nullptr) {
-        return;
-    }
-    if (ctx.insnsTraced >= kMaxInsnsPerRun) {
-        if (ctx.insnsTraced == kMaxInsnsPerRun) {
-            PI::Logger::log(PI::LogLevel::WARN, "PI_VMTrace",
-                            "=== trace limit %u reached, stopping ===",
-                            kMaxInsnsPerRun);
-            ctx.insnsTraced++;
-        }
-        return;
-    }
-    ctx.insnsTraced++;
-
+void emitTracedInstruction(JNIEnv* env, const TraceContext& ctx, u4 pcOffset, int depth,
+                           const regptr_t* useRegs, const u1* useFlags) {
+    if (!env || !ctx.insnsBase || !useRegs || !useFlags) return;
     ScopedJniFrame jniFrame(env, 32);
 
     const uint16_t* insn = ctx.insnsBase + pcOffset;
@@ -1161,8 +1177,8 @@ void vmTraceHookImpl(JNIEnv* env, const vmCode* /*code*/, u4 pcOffset, u2 /*inst
             if (!regsLine.empty()) regsLine += "  ";
             uint16_t r = refs[i].reg;
             regsLine += refs[i].wide
-                ? formatWideReg(r, regs[r])
-                : formatReg(env, r, regs[r], regFlags[r]);
+                ? formatWideReg(r, useRegs[r])
+                : formatReg(env, r, useRegs[r], useFlags[r]);
         }
     } else if (isWideValueOpcode(opcode)) {
         uint16_t regList[kMaxRegsPerLine];
@@ -1170,7 +1186,7 @@ void vmTraceHookImpl(JNIEnv* env, const vmCode* /*code*/, u4 pcOffset, u2 /*inst
                                           kMaxRegsPerLine);
         for (size_t i = 0; i < regCount; i++) {
             if (!regsLine.empty()) regsLine += "  ";
-            regsLine += formatWideReg(regList[i], regs[regList[i]]);
+            regsLine += formatWideReg(regList[i], useRegs[regList[i]]);
         }
     } else {
         uint16_t regList[kMaxRegsPerLine];
@@ -1179,13 +1195,12 @@ void vmTraceHookImpl(JNIEnv* env, const vmCode* /*code*/, u4 pcOffset, u2 /*inst
         for (size_t i = 0; i < regCount; i++) {
             if (!regsLine.empty()) regsLine += "  ";
             uint16_t r = regList[i];
-            regsLine += formatReg(env, r, regs[r], regFlags[r]);
+            regsLine += formatReg(env, r, useRegs[r], useFlags[r]);
         }
     }
 
     std::string text = ::PI::formatSingleInstruction(insn, ctx.artDexFile);
 
-    int depth = Trace::UnifiedCallDepth::get();
     std::string prefix;
     prefix.reserve(static_cast<size_t>((depth + 1) * 4));
     for (int i = 0; i <= depth; i++) {
@@ -1197,7 +1212,6 @@ void vmTraceHookImpl(JNIEnv* env, const vmCode* /*code*/, u4 pcOffset, u2 /*inst
                         "%s0x%04x: %s",
                         prefix.c_str(), pcOffset, text.c_str());
     } else {
-        // Default trace output includes the register snapshot for each step.
         PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree",
                         "%s0x%04x: %s   %s",
                         prefix.c_str(), pcOffset, text.c_str(), regsLine.c_str());
@@ -1210,6 +1224,54 @@ void vmTraceHookImpl(JNIEnv* env, const vmCode* /*code*/, u4 pcOffset, u2 /*inst
         PI::Logger::log(PI::LogLevel::TRACE, "PI_VMTrace",
                             "[0x%04x]  %s  | regs: %s",
                             pcOffset, text.c_str(), regsLine.c_str());
+    }
+}
+
+// Note: nmmvm's FINISH() macro calls g_vmTraceHook BEFORE dispatching `inst`
+// at `pcOffset`, so `regs` passed here is the pre-instruction state of `pcOffset`
+// (and the post-instruction state of the immediately preceding instruction).
+void vmTraceHookImpl(JNIEnv* env, const vmCode* /*code*/, u4 pcOffset, u2 /*inst*/,
+                     const regptr_t* regs, const u1* regFlags) {
+    TraceContext& ctx = t_trace;
+    if (!ctx.active || regs == nullptr || regFlags == nullptr ||
+        ctx.insnsBase == nullptr) {
+        return;
+    }
+
+    // Flush the previous instruction now that its handler has finished executing
+    // and `regs` holds its post-instruction state.
+    if (ctx.hasPending) {
+        emitTracedInstruction(env, ctx, ctx.pendingPc, ctx.pendingDepth, regs, regFlags);
+        ctx.hasPending = false;
+    }
+
+    if (ctx.insnsTraced >= kMaxInsnsPerRun) {
+        if (ctx.insnsTraced == kMaxInsnsPerRun) {
+            PI::Logger::log(PI::LogLevel::WARN, "PI_VMTrace",
+                            "=== trace limit %u reached, stopping ===",
+                            kMaxInsnsPerRun);
+            ctx.insnsTraced++;
+        }
+        return;
+    }
+    ctx.insnsTraced++;
+
+    const uint16_t* insn = ctx.insnsBase + pcOffset;
+    uint8_t opcode = (*insn) & 0xFF;
+    int depth = Trace::UnifiedCallDepth::get();
+
+    // Emit immediately when pre-instruction state is requested (!dumpAfter), or
+    // for invoke-* opcodes (which only read input args and must appear in the
+    // call tree before stepping into the callee).
+    if (!ctx.dumpAfter || isInvokeOpcode(opcode)) {
+        emitTracedInstruction(env, ctx, pcOffset, depth, regs, regFlags);
+    } else {
+        ctx.hasPending = true;
+        ctx.pendingPc = pcOffset;
+        ctx.pendingDepth = depth;
+        ctx.lastEnv = env;
+        ctx.lastRegs = regs;
+        ctx.lastRegFlags = regFlags;
     }
 }
 
@@ -1233,6 +1295,8 @@ TraceGuard::TraceGuard(JNIEnv* env, const void* artDexFile,
     state_->savedHook = ::g_vmTraceHook;
     state_->savedCtx = std::move(t_trace);   // reentrancy: save outer run
 
+    t_trace = TraceContext{};
+    t_trace.dumpAfter = tl_dumpRegsAfter;
     t_trace.artDexFile = artDexFile;
     t_trace.insnsBase = insnsBase;
     t_trace.regsSize = regsSize;
@@ -1252,6 +1316,11 @@ TraceGuard::TraceGuard(JNIEnv* env, const void* artDexFile,
 
 TraceGuard::~TraceGuard() {
     if (!active_) return;
+    if (t_trace.hasPending && t_trace.lastEnv && t_trace.lastRegs && t_trace.lastRegFlags) {
+        emitTracedInstruction(t_trace.lastEnv, t_trace, t_trace.pendingPc,
+                              t_trace.pendingDepth, t_trace.lastRegs, t_trace.lastRegFlags);
+        t_trace.hasPending = false;
+    }
     PI::Logger::log(PI::LogLevel::INFO, "PI_VMTrace",
                         "=== VMTrace end (%u insns) ===", t_trace.insnsTraced);
     ::g_vmTraceHook = state_->savedHook;

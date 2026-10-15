@@ -245,16 +245,40 @@ console.log(oc.disassembly());    // 或 oc.decompile()
 console.log(oc.dumpSmali());      // dump 该方法的 Smali 字节码
 console.log(oc.dumpCode());       // 自动识别 Java/Native 并 dump 代码
 
-// 安装 Hook
-oc.hook(function(ctx) {
-    console.log("onCreate called! this=" + ctx.thiz);
-    // 可选篡改返回值：ctx.setResult(...);
+// 安装 Hook（支持无参默认日志、单回调、onEnter + onLeave 双回调三种形式）
+oc.hook();                        // 1) 无参：自动树形打印入参与返回值
+oc.hook(function(o) {             // 2) 单回调：入口触发，调用 o.setResult(...) 可直接跳过原方法
+    console.log("onCreate called! this=" + o.thiz + "\n" + o.stack);
+    // o.args[0] = ...;           // 直接修改数组元素即可篡改入参
+    // o.setResult(...);          // 篡改返回值并跳过原方法执行
 });
+oc.hook(                          // 3) 双回调：原方法必定在 onEnter 与 onLeave 之间执行
+    function(o) {                 // onEnter（可传 null 仅监听 onLeave）
+        console.log("enter " + o.class + "." + o.method, "argc=" + o.argc);
+    },
+    function(o) {                 // onLeave：观察原方法返回值 o.ret，或用 o.setResult(v) 覆写
+        console.log("leave ret=" + o.ret);
+        // o.setResult(newVal);
+    }
+);
 
 // 单步调试与断点
 oc.break();                       // 在该方法入口下断点，进入单步调试模式
 oc.trace({ mode: "CALL_TREE" });  // 树形追踪执行链路
 ```
+
+**`hook` 回调参数对象 `o` 字段说明**：
+
+| 字段 / 方法 | 适用阶段 | 类型 | 说明 |
+|---|---|---|---|
+| `o.method` | `cb` / `onEnter` / `onLeave` | `string` | 当前被调方法名 |
+| `o.class` | `cb` / `onEnter` / `onLeave` | `string` | 声明类名（点分隔） |
+| `o.argc` | `cb` / `onEnter` | `number` | 参数个数 |
+| `o.args` | `cb` / `onEnter` | `Array` | 参数数组（`o.args[0]`、`o.args[1]`…）；**直接赋值修改 `o.args[i]` 会自动写回底层调用栈篡改实参** |
+| `o.thiz` | `cb` / `onEnter` / `onLeave` | `JRef` / `null` | 当前实例对象（`static` 方法为 `null`） |
+| `o.stack` | `cb` / `onEnter` / `onLeave` | `string` | 当前 Java 调用栈字符串（`#00 ...`，基于原生 Quick Frame 懒加载回溯，不访问零开销） |
+| `o.ret` | 仅 `onLeave` | `string` | 原方法执行后的返回值格式化字符串 |
+| `o.setResult(v)` | `cb` / `onLeave` | `function` | 篡改返回值：在单回调 `hook(cb)` 中调用会**直接跳过原方法**并返回 `v`；在双回调 `onLeave` 中调用则会**覆盖原方法已产出的返回值** |
 
 #### 2. Native 动态库与符号代理 (`dynamic.native.*`)
 
@@ -328,7 +352,7 @@ dynamic.register("mydomain", rootObj);// 注册自定义域
 | `Java.dumpSmali` | `(artMethod[, maxInsn])` | `string` | 纯 Native 内存直接解析输出规范 Smali 指令流 |
 | `Java.dumpCode` | `(artOrAddr[, maxInsn])` | `string` | 统一反汇编（自动分发 Smali 或 ARM64 汇编） |
 | `Java.choose` | `(className[, callbacks])` | `array` / `number` | **堆实例枚举**；传回调为异步消费模式，省略回调同步返回实例数组 |
-| `Java.hook` | `(artMethod[, callback])` | `string` | 安装 Hook；不传回调为默认入参/出参格式化打印模式 |
+| `Java.hook` | `(artMethod[, onEnter[, onLeave]])` | `string` | 安装 Hook；支持不传回调（默认入参/出参树形打印）、单回调 `cb(o)`、双回调 `(onEnter, onLeave)` |
 | `Java.unhook` | `(id)` | `string` | 按 ID 卸载指定的 Hook |
 | `Java.unhookAll` | `()` | `string` | 卸载全部 Java Hook |
 | `Java.methodInfo` | `(artMethod)` | `object` | 提取方法的修饰符、类名、签名、编译状态及 nativeEntry |
@@ -368,8 +392,10 @@ dynamic.register("mydomain", rootObj);// 注册自定义域
 
 | API | 说明 |
 |---|---|
-| `Trace.unified(target, opt)` | **真·Java↔Native 全栈贯通追踪**；自动处理跨层调用树 |
-| `Trace.java(artMethod, opt)` | Java 方法执行追踪（支持 `CALL_TREE` 树形模式与 `INSN_STEP` 逐指令快照） |
+| `Trace.unified(target[, opt])` | **Java ↔ Native 统一追踪**（`MethodBox.trace(opt)` 底层默认调用此接口） |
+| `Trace.java(artMethod[, opt])` | Java 方法执行追踪（支持 `CALL_TREE` 与 `INSN_STEP` 自定义 `onInsn` 回调） |
+| `Trace.native(addr[, opt])` | Native 函数入口/出口追踪 |
+| `untrace([id])` | 停止指定 `id` 的追踪会话；不传参则停止全部活跃追踪（亦可调用句柄 `t.stop()`） |
 | `brkj(method[, cond])` | 在指定 Java 方法处下断点，命中时暂停线程并启动单步调试 |
 | `brkn(addr[, cond])` | 在指定 Native 内存地址下断点 |
 | `s` / `n` / `r` / `c` | 单步步入 (Step-In) / 单步步过 (Step-Over) / 步出当前方法 (Step-Return) / 继续运行 (Continue) |
@@ -377,6 +403,38 @@ dynamic.register("mydomain", rootObj);// 注册自定义域
 | `regs` / `dumpRegs()` | 打印当前断点处的全部寄存器（Java 模式显示 `v0..vN`，Native 模式显示 `x0..x30, fp, lr, sp`） |
 | `getreg(n)` / `setreg(n, val)` | 读取或篡改寄存器值（支持整型、浮点、字符串及 Java 对象包装） |
 | `D()` / `detach()` | **一键解挂**：撤销全部 Java/Native Hook、Trace，唤醒所有挂起线程并清除断点 |
+
+**`.trace([opt])` 配置参数（`opt` 对象或 `new TraceOption()`）**：
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `mode` | `string` | `"CALL_TREE"` | 追踪模式：<br>• `"CALL_TREE"`：仅输出方法级调用树（轻量默认）<br>• `"INSN_STEP"` / `"INSTRUCTION_DIFF"`：方法调用树 + 逐条 Smali 指令及关联寄存器快照<br>• `"FULL_STACK_NATIVE"`：遇到 JNI 调用自动通过 QBDI 步入 Native 机器码做跨层全栈追踪 |
+| `dumpAfter` | `boolean` | `true` | 逐指令追踪时寄存器取值时机：`true` 打印该指令**执行后**的寄存器状态；`false` 打印该指令**执行前**的寄存器状态 |
+| `maxDepth` | `number` | `8` | 最大调用递归深度（在 `Trace.java` + `onInsn` 模式下兼作单次最大指令数预算） |
+| `excludeSystem` | `boolean` | `true` | 过滤系统/框架层调用 |
+| `includeNative` | `string` | `""` | Native 模块名过滤子串（如 `"libencrypt"`） |
+| `onEnter` | `function(ev)` | `null` | 方法入口回调（`ev` 含 `layer`, `symbol`, `method`, `class`, `argc`, `args`, `str`） |
+| `onLeave` | `function(ev)` | `null` | 方法出口回调（除入口字段外额外包含 `ev.ret`） |
+| `onInsn` | `function(ev)` | `null` | 逐指令/逐行回调（在 `Trace.unified` 中收到 `{layer: "UNIFIED", text}`；在 `Trace.java` 的 `INSN_STEP` 模式下收到 `{depth, pc, inst, count, smali, regs}`，返回 `false` 可中止追踪） |
+
+```javascript
+// 示例 1：默认方法调用树追踪
+let t = dynamic.java.com.example.App.Z.trace();
+
+// 示例 2：逐指令 Smali + 寄存器状态追踪（可通过 dumpAfter 切换指令执行后/前寄存器）
+dynamic.java.com.example.App.Z.trace({
+    mode: "INSN_STEP",
+    dumpAfter: true
+});
+
+// 示例 3：Java <-> Native 跨 JNI 全栈追踪
+dynamic.java.com.example.App.Z.trace({
+    mode: "FULL_STACK_NATIVE"
+});
+
+// 停止追踪
+t.stop();   // 或 untrace(t._id) / untrace()
+```
 
 > **追踪作用域**：为保证稳定性，解释器默认只步入 **App 自身包** 内的类（app-scope 允许列表，包名取自 `ActivityThread.currentPackageName()`，app_process 场景回退 `/proc/self/cmdline`）；系统/框架类一律黑盒透传。`suspend` 方法（签名含 `Continuation`）及 `kotlin` / `kotlinx` / `org.jetbrains` 等 Kotlin 运行时也会自动跳过，避免 R8 混淆后解释执行破坏协程的异常控制流。
 

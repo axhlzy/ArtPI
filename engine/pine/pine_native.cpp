@@ -1079,6 +1079,83 @@ static std::mutex g_method_hook_mutex;
 static std::unordered_map<void*, MethodHookEntry> g_method_hooks;
 static thread_local std::unordered_set<void*> tl_active_hooks;
 
+// ---------------------------------------------------------------------------
+// Managed-stack boundary for hook execution.
+//
+// Pine's trampoline overwrites the hooked method's would-be quick frame with
+// PineNativeContext and leaves a stale shadow-frame chain in the thread's
+// ManagedStack. Any stack walk during the hook (the hooked method's own
+// `new Throwable()` -> fillInStackTrace, GC, or an ANR watchdog) then reads a
+// garbage ArtMethod and FATAL-aborts.
+//
+// Null the whole fragment (top_quick_frame_/link_/top_shadow_frame_) for the
+// duration of the hook so StackVisitor::WalkStack terminates cleanly. Keep it
+// fully empty (do NOT point the quick frame at the caller chain): the hooked
+// method runs natively here (callOriginal), and nterp's own field-resolution /
+// exception-delivery path chokes if the top quick frame is a synthetic pointer.
+// (The break/interpreter path re-points the quick frame at the caller chain
+// separately via route-3 so GC can still see the callers during the pause, and
+// reads the pre-hook snapshot via PineNative_GetSavedHookManagedStack.)
+// ---------------------------------------------------------------------------
+static size_t HookManagedStackOffset() {
+    // AOSP art/runtime/thread.h: tlsPtr_.managed_stack (3 pointer-sized fields:
+    // top_quick_frame_, link_, top_shadow_frame_).
+#if defined(__aarch64__)
+    const int v = Android::version;
+    if (v >= Android::kS) return 0xa8;   // Android 12..15
+    if (v >= Android::kQ) return 0xa0;   // Android 10..11
+    if (v >= Android::kO) return 0x98;   // Android 8..9
+    return 0x90;                         // Android 7
+#else
+    return 0x58;                         // 32-bit baseline
+#endif
+}
+
+struct ScopedHookManagedStack {
+    unsigned char* thread = nullptr;
+    uintptr_t saved[3] = {0, 0, 0};
+    bool active = false;
+    const ScopedHookManagedStack* prev = nullptr;
+    inline static thread_local const ScopedHookManagedStack* s_current = nullptr;
+
+    explicit ScopedHookManagedStack(JNIEnv* env) {
+        prev = s_current;
+        s_current = this;
+        thread = reinterpret_cast<unsigned char*>(art::Thread::Current(env));
+        if (thread == nullptr) return;
+        auto* ms = reinterpret_cast<uintptr_t*>(thread + HookManagedStackOffset());
+        saved[0] = ms[0]; saved[1] = ms[1]; saved[2] = ms[2];
+        ms[0] = 0;   // top_quick_frame_
+        ms[1] = 0;   // link_
+        ms[2] = 0;   // top_shadow_frame_
+        active = true;
+    }
+    ~ScopedHookManagedStack() {
+        s_current = prev;
+        if (!active || thread == nullptr) return;
+        auto* ms = reinterpret_cast<uintptr_t*>(thread + HookManagedStackOffset());
+        ms[0] = saved[0]; ms[1] = saved[1]; ms[2] = saved[2];
+        active = false;
+    }
+    ScopedHookManagedStack(const ScopedHookManagedStack&) = delete;
+    ScopedHookManagedStack& operator=(const ScopedHookManagedStack&) = delete;
+};
+
+extern "C" PINE_EXPORT size_t PineNative_GetManagedStackOffset(void) {
+    return HookManagedStackOffset();
+}
+
+extern "C" PINE_EXPORT bool PineNative_GetSavedHookManagedStack(uintptr_t out_saved[3]) {
+    if (!ScopedHookManagedStack::s_current || !ScopedHookManagedStack::s_current->active) {
+        return false;
+    }
+    const auto* cur = ScopedHookManagedStack::s_current;
+    out_saved[0] = cur->saved[0];
+    out_saved[1] = cur->saved[1];
+    out_saved[2] = cur->saved[2];
+    return true;
+}
+
 static void MethodHookDispatcher(void* target, PineNativeContext* ctx, void* origin) {
     if (tl_active_hooks.find(target) != tl_active_hooks.end()) {
         // Recursion detected on this thread for this method! Directly invoke origin/backup.
@@ -1103,6 +1180,10 @@ static void MethodHookDispatcher(void* target, PineNativeContext* ctx, void* ori
         LOGE("MethodHookDispatcher: Failed to get current JNIEnv");
         return;
     }
+
+    // Make the managed stack walkable for the whole hook body (JS callback +
+    // callOriginal), so the hooked method's own stack walks don't abort.
+    ScopedHookManagedStack msguard(env);
 
     tl_active_hooks.insert(target);
     struct RecursionGuard {

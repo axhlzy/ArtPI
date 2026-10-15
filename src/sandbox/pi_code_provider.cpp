@@ -141,6 +141,19 @@ static bool buildCompactCodeItem(const uint8_t* ci, InterpCode& out) {
     out.outsSize      = (fields >> 4) & 0xF;
     out.insnsCount    = insnsCountAndFlags >> 5;
 
+    const uint16_t* preheader = reinterpret_cast<const uint16_t*>(ci);
+    if (insnsCountAndFlags & (1u << 4)) {
+        --preheader;
+        out.insnsCount += static_cast<uint32_t>(*preheader);
+        --preheader;
+        out.insnsCount += static_cast<uint32_t>(*preheader) << 16;
+    }
+    if (insnsCountAndFlags & (1u << 0)) out.registersSize += *--preheader;
+    if (insnsCountAndFlags & (1u << 1)) out.insSize       += *--preheader;
+    if (insnsCountAndFlags & (1u << 2)) out.outsSize      += *--preheader;
+    // CompactDex stores (registers_size - ins_size) in fields[15:12].
+    out.registersSize += out.insSize;
+
     if (out.insnsCount == 0 || out.registersSize == 0) return false;
 
     out.insnsBuf.assign(out.insnsCount, 0);

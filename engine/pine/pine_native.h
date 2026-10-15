@@ -44,6 +44,13 @@ PINE_EXPORT void PineNative_SetObservedObjectCallback(PineObservedObjectCallback
 PINE_EXPORT void PineNative_NotifyObservedObject(JNIEnv* env, uint64_t raw, jobject obj);
 
 /**
+ * Shared Thread::managed_stack_ byte offset and pre-hook ManagedStack snapshot
+ * (saved by ScopedHookManagedStack before zeroing the live fragment).
+ */
+PINE_EXPORT size_t PineNative_GetManagedStackOffset(void);
+PINE_EXPORT bool PineNative_GetSavedHookManagedStack(uintptr_t out_saved[3]);
+
+/**
  * Initialize Pine Native.
  * Call this in JNI_OnLoad. Does NOT require loading any DEX or calling any Java code!
  */

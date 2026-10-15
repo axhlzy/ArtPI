@@ -23,6 +23,8 @@
 // pulls in the public ArtPI.h which we cannot include here - see below)
 extern "C" jobject PineNative_ToJObject(JNIEnv* env, void* art_obj);
 extern "C" void*    PineNative_ToArtObject(JNIEnv* env, jobject j_obj);
+extern "C" size_t   PineNative_GetManagedStackOffset(void);
+extern "C" bool     PineNative_GetSavedHookManagedStack(uintptr_t out_saved[3]);
 
 // CallFrame lives in the public header; we define the added member here.
 #include "ArtPI.h"
@@ -45,38 +47,28 @@ extern "C" void*    PineNative_ToArtObject(JNIEnv* env, jobject j_obj);
 // The real ArtMethod is left untouched (runMethodInternal still interprets it).
 // ManagedStack layout: {top_quick_frame_@0(bit0=tag), link_@8, top_shadow_frame_@0x10}.
 namespace {
-// Thread::managed_stack_ (tlsPtr_) byte offset. art::Thread is a pure C++ class
-// with no stable ABI, so the offset varies by version/arch. Verified 0xa8 on
-// Android 12/13 arm64; other versions use the known table below.
+// Shared Thread::managed_stack_ (tlsPtr_) byte offset (defined in pine_native.cpp).
 static size_t ManagedStackOffset() {
-#if defined(__aarch64__)
-    const int v = pine::Android::version;
-    if (v >= pine::Android::kS) return 0xa8;   // Android 12..15
-    if (v >= pine::Android::kQ) return 0xa0;   // Android 10..11
-    if (v >= pine::Android::kO) return 0x98;   // Android 8..9
-    return 0x90;                               // Android 7
-#else
-    return 0x58;                               // 32-bit baseline
-#endif
+    return PineNative_GetManagedStackOffset();
 }
 
 struct FakeNativeFrame {
-    unsigned long long buf[0x80];        // 0x400-byte scratch frame (zeroed)
+    uintptr_t buf[0x80];                 // scratch frame (zeroed)
     unsigned char mcopy[0x40];           // private copy of the ArtMethod
     unsigned char* thread = nullptr;
-    unsigned long long savedQuick = 0;
+    uintptr_t savedQuick = 0;
     bool active = false;
 
     void enter(JNIEnv* env, pine::art::ArtMethod* m) {
         thread = reinterpret_cast<unsigned char*>(pine::art::Thread::Current(env));
         if (thread == nullptr || m == nullptr) return;
-        for (auto& w : buf) w = 0ULL;
+        for (auto& w : buf) w = 0;
         std::memcpy(mcopy, m, sizeof(mcopy));
         *reinterpret_cast<uint32_t*>(mcopy + 4) |= 0x100u;   // AccessFlags::kNative
-        buf[0] = reinterpret_cast<unsigned long long>(mcopy);
-        auto* ms = reinterpret_cast<unsigned long long*>(thread + ManagedStackOffset());
+        buf[0] = reinterpret_cast<uintptr_t>(mcopy);
+        auto* ms = reinterpret_cast<uintptr_t*>(thread + ManagedStackOffset());
         savedQuick = ms[0];
-        ms[0] = reinterpret_cast<unsigned long long>(buf) | 1ULL;  // tagged native frame
+        ms[0] = reinterpret_cast<uintptr_t>(buf) | 1u;       // tagged native frame
         active = true;
         PI_LOGI("FAKEFRM enter target=%p copy=%p buf=%p old.quick=%p",
                 (void*)m, (void*)mcopy, (void*)buf, (void*)savedQuick);
@@ -84,30 +76,39 @@ struct FakeNativeFrame {
 
     void leave() {
         if (!active) return;
-        auto* ms = reinterpret_cast<unsigned long long*>(thread + ManagedStackOffset());
+        auto* ms = reinterpret_cast<uintptr_t*>(thread + ManagedStackOffset());
         ms[0] = savedQuick;
         active = false;
     }
 };
 
-// route-3: ManagedStack boundary (legal JNI-transition fragment).
-// Pine's trampoline left a BOGUS head fragment (top_quick_frame_ -> PineNativeContext,
-// which ART would read as an ArtMethod). We push an empty fragment that links to
-// what the bogus head linked to, i.e. we SKIP the bogus frame and expose the real
-// caller chain (the old head's link_ / shadow frame). While nmmvm runs, any JNI
-// call pushes a legal fragment on top of ours; WalkStack then walks that, hits our
-// empty fragment (top_quick_frame_==nullptr), and follows link_ to the real caller.
-// ManagedStack {top_quick_frame_@0, link_@8, top_shadow_frame_@0x10} @ thread+tlsPtr.
+// route-3: ManagedStack boundary for interpreter / breakpoint execution.
+// Note how this pairs with ScopedHookManagedStack (in pine_native.cpp):
+// - On the normal native hook path (callOriginal), ScopedHookManagedStack zeroes
+//   ms[0..2] because nterp field-resolution / exception-delivery chokes if
+//   top_quick_frame_ is pointed at a synthetic caller SP.
+// - Here inside nmmvm interpretation (never entering nterp on the current frame),
+//   we point top_quick_frame_ (ms[0]) at `callerFrameBase` (the hooked method's
+//   entry SP == caller's quick-frame base) so GC and WalkStack see the real
+//   compiled caller chain, while keeping link_ and top_shadow_frame_ cleared.
+// - Because ScopedHookManagedStack may have already zeroed ms[0..2] before
+//   entering the hook callback, we also capture the pre-hook snapshot via
+//   PineNative_GetSavedHookManagedStack() into `snapshot[0..2]` for `bt` fallback.
 struct ScopedManagedStackBoundary {
     unsigned char* thread = nullptr;
-    unsigned long long saved[3] = {0, 0, 0};   // saved old (bogus) head, for restore
+    uintptr_t saved[3] = {0, 0, 0};      // live ms[0..2] on entry, restored on leave()
+    uintptr_t snapshot[3] = {0, 0, 0};   // pre-hook ms[0..2] for getManagedStackSnapshot()
     bool active = false;
-    int depth = 0;                             // re-entrancy telemetry (LIFO)
+    int depth = 0;                       // re-entrancy telemetry (LIFO)
+    void* callerFrameBase = nullptr;     // hooked method's entry SP (caller frame base)
     inline static thread_local int s_depth = 0;
     inline static thread_local const ScopedManagedStackBoundary* s_current = nullptr;
     const ScopedManagedStackBoundary* prev = nullptr;
 
-    explicit ScopedManagedStackBoundary(JNIEnv* env) { enter(env); }
+    explicit ScopedManagedStackBoundary(JNIEnv* env, void* callerSp = nullptr) {
+        callerFrameBase = callerSp;
+        enter(env);
+    }
     ~ScopedManagedStackBoundary() { leave(); }
     ScopedManagedStackBoundary(const ScopedManagedStackBoundary&) = delete;
     ScopedManagedStackBoundary& operator=(const ScopedManagedStackBoundary&) = delete;
@@ -117,23 +118,29 @@ struct ScopedManagedStackBoundary {
         s_current = this;
         thread = reinterpret_cast<unsigned char*>(pine::art::Thread::Current(env));
         if (thread == nullptr) return;
-        auto* ms = reinterpret_cast<unsigned long long*>(thread + ManagedStackOffset());
+        auto* ms = reinterpret_cast<uintptr_t*>(thread + ManagedStackOffset());
         saved[0] = ms[0]; saved[1] = ms[1]; saved[2] = ms[2];
-        // New top fragment: empty quick, keep the real shadow chain, and link to
-        // the OLD head's link (skip the bogus Pine quick frame).
+        if (!PineNative_GetSavedHookManagedStack(snapshot)) {
+            snapshot[0] = saved[0]; snapshot[1] = saved[1]; snapshot[2] = saved[2];
+        }
+        // Keep the live ManagedStack fragment fully empty (do NOT point
+        // top_quick_frame_ at callerFrameBase): nterp field-resolution and
+        // exception-delivery inside JNI calls made by nmmvm choke if the top
+        // quick frame is a synthetic untagged pointer. `callerFrameBase` is
+        // kept in this struct for `bt` (getManagedStackSnapshot) instead.
         ms[0] = 0;            // top_quick_frame_  = nullptr
-        ms[2] = saved[2];     // top_shadow_frame_ = old shadow (usually nullptr)
-        ms[1] = saved[1];     // link_ = old head's link -> real caller fragments
+        ms[2] = 0;            // top_shadow_frame_ = nullptr (stale chain, was crashing)
+        ms[1] = 0;            // link_ = nullptr
         active = true;
         depth = ++s_depth;
         PI_LOGI("MSBOUND enter depth=%d old={quick=%p link=%p shadow=%p}",
-                depth, (void*)saved[0], (void*)saved[1], (void*)saved[2]);
+                depth, (void*)snapshot[0], (void*)snapshot[1], (void*)snapshot[2]);
     }
 
     void leave() {
         s_current = prev;
         if (!active || thread == nullptr) return;
-        auto* ms = reinterpret_cast<unsigned long long*>(thread + ManagedStackOffset());
+        auto* ms = reinterpret_cast<uintptr_t*>(thread + ManagedStackOffset());
         ms[0] = saved[0]; ms[1] = saved[1]; ms[2] = saved[2];
         active = false;
         --s_depth;
@@ -149,10 +156,11 @@ bool getManagedStackSnapshot(ManagedStackSnapshot& out) {
     }
     const auto* b = ScopedManagedStackBoundary::s_current;
     out.thread = b->thread;
-    out.topQuickFrame = b->saved[0];
-    out.link = b->saved[1];
-    out.topShadowFrame = b->saved[2];
+    out.topQuickFrame = b->snapshot[0];
+    out.link = b->snapshot[1];
+    out.topShadowFrame = b->snapshot[2];
     out.managedStackOffset = ManagedStackOffset();
+    out.callerFrameBase = b->callerFrameBase;
     return true;
 }
 
@@ -454,11 +462,13 @@ RunResult runMethodInternal(JNIEnv* env, ArtMethod* method, jobject thisObj,
         label = labelBuf;
     }
     bool forceLog = (opts != nullptr && opts->log_instructions);
-    TraceGuard traceGuard(env, dex.getDexFile(), ic.code.insns,
-                          ic.registersSize, &dex, label, forceLog);
-
-    jvalue rv = ::vmInterpret2(env, &ic.code, bridge->nativeResolver(),
-                               static_cast<VmFrameCtx*>(fctx));
+    jvalue rv{};
+    {
+        TraceGuard traceGuard(env, dex.getDexFile(), ic.code.insns,
+                              ic.registersSize, &dex, label, forceLog);
+        rv = ::vmInterpret2(env, &ic.code, bridge->nativeResolver(),
+                            static_cast<VmFrameCtx*>(fctx));
+    }
 
     bool hasExc = env->ExceptionCheck() != JNI_FALSE;
 
@@ -605,7 +615,8 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
 
     // route-3: cover the WHOLE hook body (arg formatting + nmmvm) with a legal
     // ManagedStack transition fragment, so any JNI call here walks safely.
-    ScopedManagedStackBoundary msbound(env);
+    ScopedManagedStackBoundary msbound(env,
+            ctx ? reinterpret_cast<void*>(ctx->sp) : nullptr);
 
     std::string shorty;
     if (!PI::Interp::shortyFromSignature(signature, shorty)) {
@@ -617,7 +628,7 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
     PI::Interp::Callbacks cbs;
     PI::Interp::Options opts;
     opts.step_in_enabled = true;      // 业务方法递归展开
-    opts.safe_handoff = false;        // default OFF (ManagedStack boundary handles the crash)
+    opts.safe_handoff = false;        // 系统类 invoke 仍走正常 JNI 调用（不整体交还），仅业务方法 StepIn
     opts.log_instructions = (preset == PI::Trace::TracePreset::INSTRUCTION_DIFF);
     if (preset == PI::Trace::TracePreset::FULL_STACK_NATIVE) {
         opts.step_in_enabled = true;
@@ -779,6 +790,7 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
                 res.status, getMethodToString().c_str());
         return ret;
     }
+    original_invoked = true;
     if (res.exceptionPending) return ret;
 
     if (res.isObject) {
@@ -814,7 +826,8 @@ jvalue CallFrame::invokeInterpreterInternal(const PI::Interp::Callbacks* cbs,
     if (env == nullptr || target_method == nullptr) return ret;
 
     // route-3: cover the whole hook body with a legal ManagedStack transition frame
-    ScopedManagedStackBoundary msbound(env);
+    ScopedManagedStackBoundary msbound(env,
+            ctx ? reinterpret_cast<void*>(ctx->sp) : nullptr);
 
     // 1. shorty from the method signature
     std::string shorty;
@@ -847,6 +860,7 @@ jvalue CallFrame::invokeInterpreterInternal(const PI::Interp::Callbacks* cbs,
     }
 
     // 4. propagate result (or leave a pending exception untouched)
+    original_invoked = true;
     if (res.exceptionPending) {
         // Java exception is already pending on env; returning from the hook
         // callback lets Pine propagate it naturally.

@@ -13,12 +13,14 @@
 #include "agent_java.h"
 #include "agent_net.h"
 #include "../../include/ArtPI.h"
+#include "dex/pi_smali.h"
 #include "native/hooker/pi_gum_hooker.h"
 #include "frida-gum.h"
 #include "art/art_method.h"
 
 #include <string>
 #include <vector>
+#include <set>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -40,6 +42,7 @@ struct ActiveTraceSession {
 };
 
 static std::vector<ActiveTraceSession> g_activeTraces;
+static size_t g_nextTraceId = 0;
 static std::mutex g_traceMutex;
 
 // ---------------------------------------------------------------------------
@@ -50,6 +53,7 @@ struct TraceOpt {
     bool excludeSystem = true;
     std::string includeNative;
     int maxDepth = 8;
+    bool dumpAfter = true;   // read register values AFTER the instruction (default)
     std::shared_ptr<JSValue> onEnter, onLeave, onInsn;
 };
 
@@ -82,6 +86,10 @@ static TraceOpt ParseTraceOpt(JSContext* ctx, JSValueConst opt) {
     if (JS_IsNumber(v)) JS_ToInt32(ctx, &o.maxDepth, v);
     JS_FreeValue(ctx, v);
 
+    v = JS_GetPropertyStr(ctx, opt, "dumpAfter");
+    if (!JS_IsUndefined(v)) o.dumpAfter = (JS_ToBool(ctx, v) != 0);
+    JS_FreeValue(ctx, v);
+
     v = JS_GetPropertyStr(ctx, opt, "onEnter");
     if (JS_IsFunction(ctx, v)) o.onEnter = GuardJsValue(v); else JS_FreeValue(ctx, v);
     v = JS_GetPropertyStr(ctx, opt, "onLeave");
@@ -108,6 +116,94 @@ static void WarmInterpClass(JNIEnv* env, const std::string& dotted) {
     for (char& c : slash) if (c == '.') c = '/';
     PI::Interp::RegisterClassRef(env, slash.c_str(), cls);
     env->DeleteLocalRef(cls);
+}
+
+// Warm every class referenced by a method's code (field/method/type indices),
+// so the interpreter resolves them from the cache without loadClass() on the
+// frameless path. loadClass() fails for split-APK / default-package obfuscated
+// classes (R8 emits bare "Lh84;" descriptors), which otherwise bails the run
+// at the first iget-object/check-cast and truncates the call tree.
+static void WarmMethodRefs(JNIEnv* env, ArtMethod* am) {
+    if (!env || !am || am->IsNative()) return;
+
+    const uint8_t* code_item = reinterpret_cast<const uint8_t*>(
+        reinterpret_cast<uintptr_t>(am->GetEntryPointFromJni()) & ~1ULL);
+    if (!code_item) return;
+
+    PI::DexResolver dex;
+    if (!dex.initFromMethod(am)) return;
+    bool compact = dex.isCompactDex();
+
+    uint32_t insns_size = 0;
+    const uint16_t* insns = nullptr;
+    if (compact) {
+        uint16_t insns_count_and_flags = *reinterpret_cast<const uint16_t*>(code_item + 2);
+        insns_size = insns_count_and_flags >> 5;
+        if (insns_count_and_flags & (1u << 4)) {
+            // kFlagPreHeaderInsnsSize: two 16-bit words precede code_item
+            const uint16_t* preheader = reinterpret_cast<const uint16_t*>(code_item);
+            --preheader;
+            insns_size += static_cast<uint32_t>(*preheader);
+            --preheader;
+            insns_size += static_cast<uint32_t>(*preheader) << 16;
+        }
+        insns = reinterpret_cast<const uint16_t*>(code_item + 4);
+    } else {
+        insns_size = *reinterpret_cast<const uint32_t*>(code_item + 12);
+        insns = reinterpret_cast<const uint16_t*>(code_item + 16);
+    }
+    if (!insns || insns_size == 0 || insns_size > 0x100000) return;
+
+    const uint8_t* sizes = PI::instructionSizeTable();
+    std::set<std::string> classes;
+
+    // Best-effort static pre-warm: scans standard Dalvik opcodes (does not
+    // decode quickened cdex opcodes such as iget-quick 0xe3).
+    for (uint32_t i = 0; i < insns_size;) {
+        const uint16_t* cur = insns + i;
+        uint16_t w0 = cur[0];
+        uint8_t op = static_cast<uint8_t>(w0 & 0xFF);
+
+        std::string desc;
+        if (i + 1 < insns_size) {
+            if (op == 0x1c || op == 0x1f || op == 0x20 || op == 0x22 ||
+                op == 0x23 || op == 0x24 || op == 0x25) {
+                // type reference: const-class/check-cast/instance-of/new-instance/
+                // new-array/filled-new-array (21c/22c/35c/3rc, index at insn[1])
+                desc = dex.resolveType(cur[1]);
+            } else if (op >= 0x52 && op <= 0x6d) {
+                // field reference: iget/iput/sget/sput (22c, index at insn[1])
+                PI::FieldRef fr = dex.resolveField(cur[1]);
+                if (fr.isValid()) desc = fr.class_descriptor;
+            } else if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
+                // method reference: invoke-* / invoke-*/range (35c/3rc, index at insn[1])
+                PI::MethodRef mr = dex.resolveMethod(cur[1]);
+                if (mr.isValid()) desc = mr.class_descriptor;
+            }
+        }
+
+        if (desc.size() > 2 && desc[0] == 'L' && desc.back() == ';') {
+            classes.insert(desc.substr(1, desc.size() - 2));    // slash name
+        }
+
+        uint32_t sz = 1;
+        if (w0 == 0x0100 && i + 1 < insns_size) sz = 4 + cur[1] * 2;
+        else if (w0 == 0x0200 && i + 1 < insns_size) sz = 2 + cur[1] * 4;
+        else if (w0 == 0x0300 && i + 3 < insns_size) sz = 4 + (cur[1] * (*reinterpret_cast<const uint32_t*>(cur + 2)) + 1) / 2;
+        else if (sizes != nullptr) sz = sizes[op];
+        if (sz == 0) sz = 1;
+        i += sz;
+    }
+
+    for (const std::string& slash : classes) {
+        std::string dotted = slash;
+        for (char& c : dotted) if (c == '/') c = '.';
+        jclass cls = artpi::agent::FindClassWithFallback(env, dotted);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!cls) continue;
+        PI::Interp::RegisterClassRef(env, slash.c_str(), cls);
+        env->DeleteLocalRef(cls);
+    }
 }
 
 static bool IsSystemJavaName(const std::string& n) {
@@ -204,6 +300,7 @@ static JSValue JsTraceOptionConstructor(JSContext* ctx, JSValueConst new_target,
     JS_SetPropertyStr(ctx, obj, "includeNative", JS_NewString(ctx, ""));
     JS_SetPropertyStr(ctx, obj, "excludeSystem", JS_NewBool(ctx, true));
     JS_SetPropertyStr(ctx, obj, "maxDepth", JS_NewInt32(ctx, 8));
+    JS_SetPropertyStr(ctx, obj, "dumpAfter", JS_NewBool(ctx, true));
     JS_SetPropertyStr(ctx, obj, "onEnter", JS_NULL);
     JS_SetPropertyStr(ctx, obj, "onLeave", JS_NULL);
     JS_SetPropertyStr(ctx, obj, "onInsn", JS_NULL);
@@ -259,7 +356,7 @@ static JSValue JsTraceHandleToString(JSContext* ctx, JSValueConst this_val, int 
     JSValue tV = JS_GetPropertyStr(ctx, this_val, "target");
     const char* t = JS_IsString(tV) ? JS_ToCString(ctx, tV) : nullptr;
     char buf[640];
-    snprintf(buf, sizeof(buf), "[Trace %s (id=%d) — .stop() or untrace()]", t ? t : "?", (int) id);
+    snprintf(buf, sizeof(buf), "[Trace %s (id=%d)]", t ? t : "?", (int) id);
     if (t) JS_FreeCString(ctx, t);
     JS_FreeValue(ctx, tV);
     return JS_NewString(ctx, buf);
@@ -277,7 +374,7 @@ static JSValue CreateTraceHandle(JSContext* ctx, size_t traceId, const std::stri
 static size_t RegisterSession(const std::string& desc, PI::HookHandle jh,
                               PI::Native::NativeHookHandle nh) {
     std::lock_guard<std::mutex> lk(g_traceMutex);
-    size_t id = g_activeTraces.size();
+    size_t id = g_nextTraceId++;
     ActiveTraceSession session;
     session.id = id;
     session.is_active = true;
@@ -292,22 +389,28 @@ static size_t RegisterSession(const std::string& desc, PI::HookHandle jh,
 // .trace() calls must not stack multiple hooks on one ArtMethod (that corrupts
 // the trampoline and crashes the target process).
 static void StopExistingTrace(const std::string& desc, ArtMethod* am) {
-    std::lock_guard<std::mutex> lk(g_traceMutex);
-    for (auto& s : g_activeTraces) {
-        if (!s.is_active) continue;
-        bool same = (!desc.empty() && s.tag == desc);
-        if (!same && am && s.java_handle.isHooked() &&
-            reinterpret_cast<void*>(s.java_handle.getArtMethod()) == reinterpret_cast<void*>(am)) {
-            same = true;
+    if (am) {
+        // Java-method target: release any existing hook/trace/breakpoint on the
+        // same ArtMethod so the new trace installs cleanly (last-one-wins).
+        int rel = AgentReleaseMethodInstrumentation(reinterpret_cast<void*>(am));
+        if (rel) {
+            BroadcastLog("console", std::string("[trace] replaced existing ") +
+                                        FormatReleasedInstrumentation(rel) + " on " + desc);
         }
-        if (same) {
-            s.is_active = false;
-            if (s.java_handle.isHooked()) s.java_handle.unhook();
-            if (s.native_handle.isValid()) s.native_handle.unhook();
+        return;
+    }
+    // Native target: stop + erase any active trace with the same tag/desc.
+    std::lock_guard<std::mutex> lk(g_traceMutex);
+    for (auto it = g_activeTraces.begin(); it != g_activeTraces.end();) {
+        if (it->is_active && !desc.empty() && it->tag == desc) {
+            it->is_active = false;
+            if (it->java_handle.isHooked()) it->java_handle.unhook();
+            if (it->native_handle.isValid()) it->native_handle.unhook();
+            it = g_activeTraces.erase(it);
+        } else {
+            ++it;
         }
     }
-    // Also drop a plain `jhook` on the same method (avoid hook+trace stacking).
-    if (am) JavaUnhookMethod(reinterpret_cast<void*>(am));
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +427,7 @@ static JSValue JsTraceJava(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
     std::string desc = m.toString();
     std::string clsName = m.getDeclaringClassName();
     WarmInterpClass(GetEnv(), clsName);   // so INSN_STEP can resolve same-class calls
+    WarmMethodRefs(GetEnv(), m.getArtMethod());   // resolve the method's own referenced classes
     bool sysCls = IsSystemJavaName(clsName);
 
     StopExistingTrace(desc, reinterpret_cast<ArtMethod*>(ptr));
@@ -523,24 +627,35 @@ static JSValue JsTraceUnified(JSContext* ctx, JSValueConst /*this_val*/, int arg
         return JsTraceNative(ctx, JS_UNDEFINED, argc, argv);
     }
 
-    // Java method: interpret with FULL_STACK_NATIVE so JNI calls are stepped
-    // into via QBDI and the engine emits unified "PI_CallTree" lines.
+    // Java method: interpret the body. Honor `mode`:
+    //   CALL_TREE (default)        -> METHOD_ONLY (call tree, no per-insn log)
+    //   INSN_STEP / INSTRUCTION_DIFF -> INSTRUCTION_DIFF (call tree + per-insn)
+    //   FULL_STACK_NATIVE          -> cross-JNI native step-in (QBDI)
     TraceOpt opt = ParseTraceOpt(ctx, argc >= 2 ? argv[1] : JS_UNDEFINED);
     std::string desc = m.toString();
     WarmInterpClass(GetEnv(), m.getDeclaringClassName());   // resolve same-class calls on hook path
+    WarmMethodRefs(GetEnv(), art);   // resolve the method's own referenced classes
     auto cbEnter = opt.onEnter, cbLeave = opt.onLeave, cbLine = opt.onInsn;
+
+    PI::Trace::TracePreset preset = PI::Trace::TracePreset::METHOD_ONLY;
+    if (opt.mode == "INSN_STEP" || opt.mode == "INSTRUCTION_DIFF") {
+        preset = PI::Trace::TracePreset::INSTRUCTION_DIFF;
+    } else if (opt.mode == "FULL_STACK_NATIVE") {
+        preset = PI::Trace::TracePreset::FULL_STACK_NATIVE;
+    }
 
     StopExistingTrace(desc, art);
 
-    PI::HookHandle hh = m.hook([desc, cbEnter, cbLeave, cbLine](JNIEnv*, PI::CallFrame& frame) {
+    PI::HookHandle hh = m.hook([desc, cbEnter, cbLeave, cbLine, preset, dumpAfter = opt.dumpAfter](JNIEnv*, PI::CallFrame& frame) {
         JSContext* jsctx = g_ctx;
         if (jsctx && cbEnter) {
             JSValue ev = MakeJavaEvent(jsctx, frame, desc, false);
             CallJsCb1(jsctx, cbEnter, ev);
             JS_FreeValue(jsctx, ev);
         }
+        PI::Interp::SetDumpRegsAfter(dumpAfter);
         InstallUnifiedSink(jsctx, cbLine);
-        frame.invokeTrace<void>(PI::Trace::TracePreset::FULL_STACK_NATIVE);
+        frame.invokeTrace<void>(preset);
         PI::Logger::setLogSink(nullptr);
         if (jsctx && cbLeave) {
             JSValue ev = MakeJavaEvent(jsctx, frame, desc, true);
@@ -568,7 +683,28 @@ size_t TraceStopAll() {
             n++;
         }
     }
+    g_activeTraces.clear();
+    g_nextTraceId = 0;
     return n;
+}
+
+bool TraceStopByArtMethod(void* artMethod) {
+    std::lock_guard<std::mutex> lk(g_traceMutex);
+    bool done = false;
+    for (auto it = g_activeTraces.begin(); it != g_activeTraces.end();) {
+        bool match = artMethod && it->is_active && it->java_handle.isHooked() &&
+                     reinterpret_cast<void*>(it->java_handle.getArtMethod()) == artMethod;
+        if (match) {
+            it->is_active = false;
+            if (it->java_handle.isHooked()) it->java_handle.unhook();
+            if (it->native_handle.isValid()) it->native_handle.unhook();
+            it = g_activeTraces.erase(it);
+            done = true;
+        } else {
+            ++it;
+        }
+    }
+    return done;
 }
 
 void RegisterTraceApis(JSContext* ctx, JSValue global, JSValue trace) {

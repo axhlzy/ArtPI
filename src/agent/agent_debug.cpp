@@ -320,6 +320,168 @@ static std::string CaptureNativeStack() {
     return std::string(buf, st.len);
 }
 
+// ---------------------------------------------------------------------------
+// Native ART quick-frame caller walk (route-3 boundary safe).
+//
+// When Pine hooks method M the trampoline stores the caller's SP in
+// PineNativeContext::sp (== M's entry SP == caller K's frame base). ART keeps
+// each quick frame's own ArtMethod* at its frame base (sp), and stepping to the
+// caller means sp += frame_size(method). The frame size is decoded from the
+// method's OatQuickMethodHeader CodeInfo. This walks memory only, never calling
+// into the VM, so it is safe on the hook path (unlike StackVisitor::WalkStack,
+// which FATAL-aborts on Pine's clobbered frame).
+// ---------------------------------------------------------------------------
+static constexpr uint32_t kCodeInfoVarintBits = 4;
+static constexpr uint32_t kCodeInfoVarintMax = 11;
+static constexpr uint32_t kArm64StackAlignment = 16;
+
+static bool SafeReadU16(const void* src, uint16_t& out) {
+    return SafeRead(src, &out, sizeof(out));
+}
+static bool SafeReadU32(const void* src, uint32_t& out) {
+    return SafeRead(src, &out, sizeof(out));
+}
+static bool SafeReadPtr(const void* src, void*& out) {
+    return SafeRead(src, &out, sizeof(out));
+}
+
+// Minimal port of art::BitMemoryReader::ReadInterleavedVarints (LSB-first bit
+// order; values 0..11 inline, larger values carry their byte length).
+static void DecodeCodeInfoHeader(const uint8_t* ci, uint32_t* out, size_t n) {
+    size_t bit = 0;
+    auto readBits = [&](size_t count) -> uint32_t {
+        uint32_t v = 0;
+        for (size_t i = 0; i < count; i++) {
+            size_t bp = bit + i;
+            uint32_t b = (ci[bp >> 3] >> (bp & 7)) & 1u;
+            v |= b << i;
+        }
+        bit += count;
+        return v;
+    };
+    uint64_t packed = 0;
+    for (size_t i = 0; i < n; i++) {
+        packed |= static_cast<uint64_t>(readBits(kCodeInfoVarintBits)) << (i * kCodeInfoVarintBits);
+    }
+    for (size_t i = 0; i < n; i++) {
+        out[i] = static_cast<uint32_t>((packed >> (i * kCodeInfoVarintBits)) & 0xF);
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (out[i] > kCodeInfoVarintMax) {
+            out[i] = readBits((out[i] - kCodeInfoVarintMax) * 8);
+        }
+    }
+}
+
+// Frame size (bytes) of an ArtMethod's quick frame, or 0 if unavailable.
+static uint32_t ArtMethodFrameSize(void* methodPtr) {
+    auto* am = reinterpret_cast<pine::art::ArtMethod*>(methodPtr);
+    if (am == nullptr) return 0;
+
+    if (am->IsCompiled()) {
+        const int sdk = pine::Android::version;
+        if (sdk < pine::Android::kR) return 0;
+        void* entry = am->GetEntryPointFromCompiledCode();
+        uintptr_t e = reinterpret_cast<uintptr_t>(entry);
+        if (e < 0x10000) return 0;
+        uint32_t code_info_offset = 0;
+        if (sdk >= pine::Android::kS) {
+            // Android 12+ (S+): PACKED(4) uint32_t data_ at e - 4.
+            uint32_t data = 0;
+            if (!SafeReadU32(reinterpret_cast<const void*>(e - 4), data)) return 0;
+            if ((data & 0x40000000u) == 0) return 0;             // not optimized (no CodeInfo)
+            code_info_offset = data & 0x3FFFFFFFu;
+        } else {
+            // Android 11 (R): vmap_table_offset_ at e - 8, code_size_ at e - 4.
+            uint32_t vmap_off = 0, code_sz = 0;
+            if (!SafeReadU32(reinterpret_cast<const void*>(e - 8), vmap_off) ||
+                !SafeReadU32(reinterpret_cast<const void*>(e - 4), code_sz)) return 0;
+            if ((code_sz & 0x7FFFFFFFu) == 0 || vmap_off == 0) return 0;
+            code_info_offset = vmap_off;
+        }
+        if (code_info_offset == 0 || code_info_offset > 0x100000u) return 0;
+        uint8_t ci[64];
+        if (!SafeRead(reinterpret_cast<const void*>(e - code_info_offset), ci, sizeof(ci))) return 0;
+        const size_t num_headers = (sdk >= pine::Android::kS) ? 7u : 6u;
+        const size_t frame_idx   = (sdk >= pine::Android::kS) ? 2u : 1u;
+        uint32_t hdr[7] = {0};
+        DecodeCodeInfoHeader(ci, hdr, num_headers);
+        uint32_t frame = hdr[frame_idx] * kArm64StackAlignment;  // packed_frame_size_ * alignment
+        if (frame < kArm64StackAlignment || frame > 0x40000u || (frame & 0xFu) != 0) return 0;
+        return frame;
+    }
+
+    // Not quick-compiled -> nterp (its frame is still a quick frame). Mirror
+    // art::NterpGetFrameSize(arm64): entry(160) + 8*num_regs + 8 + 8 +
+    // 4*out_regs + 8, rounded up to 16. For the switch interpreter there is no
+    // quick frame at all, so the walk simply stops on the next invalid read.
+    if (am->IsNative()) return 0;
+    void* dp = am->GetEntryPointFromJni();                       // data_ == CodeItem* (& ~1)
+    const uint8_t* ci = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(dp) & ~1ULL);
+    if (reinterpret_cast<uintptr_t>(ci) < 0x10000) return 0;
+
+    PI::DexResolver dex;
+    bool compact = dex.initFromMethod(am) && dex.isCompactDex();
+    uint16_t num_regs = 0, out_regs = 0;
+    if (compact) {
+        uint16_t fields = 0, flags = 0;
+        if (!SafeReadU16(ci + 0, fields) || !SafeReadU16(ci + 2, flags)) return 0;
+        num_regs = (fields >> 12) & 0xFu;
+        uint16_t ins_regs = (fields >> 8) & 0xFu;
+        out_regs = (fields >> 4) & 0xFu;
+        const uint16_t* preheader = reinterpret_cast<const uint16_t*>(ci);
+        if (flags & (1u << 4)) preheader -= 2; // kFlagPreHeaderInsnsSize
+        if (flags & (1u << 0)) {
+            uint16_t ext = 0;
+            if (!SafeReadU16(--preheader, ext)) return 0;
+            num_regs += ext;
+        }
+        if (flags & (1u << 1)) {
+            uint16_t ext = 0;
+            if (!SafeReadU16(--preheader, ext)) return 0;
+            ins_regs += ext;
+        }
+        if (flags & (1u << 2)) {
+            uint16_t ext = 0;
+            if (!SafeReadU16(--preheader, ext)) return 0;
+            out_regs += ext;
+        }
+        // CompactDex stores (registers_size - ins_size) in fields[15:12].
+        num_regs += ins_regs;
+    } else {
+        if (!SafeReadU16(ci + 0, num_regs) || !SafeReadU16(ci + 4, out_regs)) return 0;
+    }
+    size_t frame = 160 + 8 * num_regs + 8 + 8 + 4 * out_regs + 8;
+    frame = (frame + 15u) & ~15u;
+    if (frame < 160 || frame > 0x40000u) return 0;
+    return static_cast<uint32_t>(frame);
+}
+
+// Walk the compiled/nterp quick-frame chain upward from `frameBase` (caller K's
+// frame base). Appends one "Class.method(sig)" line per caller.
+static void CaptureCallersViaNativeFrames(void* frameBase, std::vector<std::string>& out) {
+    uintptr_t sp = reinterpret_cast<uintptr_t>(frameBase);
+    if (sp < 0x1000) return;
+    for (int i = 0; i < 128; i++) {
+        void* m = nullptr;
+        if (!SafeReadPtr(reinterpret_cast<const void*>(sp), m)) break;
+        if (!IsValidArtMethod(m)) break;
+        // Frames here are genuine quick frames (method pointer at frame base),
+        // so resolving their names via ART is safe.
+        std::string sig = PI::getPrettyMethodSignature(reinterpret_cast<ArtMethod*>(m));
+        if (sig.empty()) {
+            char b[32];
+            snprintf(b, sizeof(b), "%p", m);
+            sig = b;
+        }
+        out.push_back(std::move(sig));
+        uint32_t f = ArtMethodFrameSize(m);
+        if (f == 0) break;
+        sp += f;
+        if ((sp & 0xFu) != 0) break;
+    }
+}
+
 static std::string CaptureJavaStack(ArtMethod* curMethod, const PI::Interp::InsnEvent& ev) {
     std::vector<JavaCallFrameInfo> frames;
 
@@ -339,9 +501,19 @@ static std::string CaptureJavaStack(ArtMethod* curMethod, const PI::Interp::Insn
         }
     }
 
-    // 3. ART caller frames (outside nmmvm) unwound from ShadowFrame link and ManagedStack
+    // #00 + interpreter frames are known-valid ArtMethods; name them directly.
+    const size_t trustedCount = frames.size();
+
+    // 3. ART caller frames (outside nmmvm). With the route-3 boundary active we
+    //    walk the compiled quick-frame chain natively from the caller's frame
+    //    base; otherwise fall back to the manual ShadowFrame / fragment walk.
+    std::vector<std::string> callerLines;
     PI::Interp::ManagedStackSnapshot snap{};
     if (PI::Interp::getManagedStackSnapshot(snap)) {
+        if (snap.callerFrameBase != nullptr) {
+            CaptureCallersViaNativeFrames(snap.callerFrameBase, callerLines);
+        }
+        if (callerLines.empty()) {
         // Walk top_shadow_frame_
         void* sf = reinterpret_cast<void*>(snap.topShadowFrame);
         int sfCount = 0;
@@ -395,9 +567,10 @@ static std::string CaptureJavaStack(ArtMethod* curMethod, const PI::Interp::Insn
             ms = frag.link;
             msCount++;
         }
+        }
     }
 
-    if (frames.empty()) {
+    if (frames.empty() && callerLines.empty()) {
         return CaptureNativeStack();
     }
 
@@ -406,13 +579,14 @@ static std::string CaptureJavaStack(ArtMethod* curMethod, const PI::Interp::Insn
         char buf[512];
         void* m = frames[i].artMethod;
         uint32_t pc = frames[i].dexPc;
-        // Frame #00 is the breakpoint target (always a valid ArtMethod) -> name it
-        // directly. Walked caller frames may be garbage (Pine synthetic frames), so
-        // resolve those defensively to avoid PrettyMethod() FATAL-aborts.
-        std::string sig = (i == 0)
+        // Frames up to trustedCount (#00 + interpreter frames) are valid
+        // ArtMethods -> name them directly. Walked caller frames may be garbage
+        // (Pine synthetic frames), so resolve those defensively.
+        bool knownValid = i < trustedCount;
+        std::string sig = knownValid
             ? PI::getPrettyMethodSignature(reinterpret_cast<ArtMethod*>(m))
             : SafePrettyMethod(m);
-        bool trusted = i == 0 || (!sig.empty() && sig[0] != '0' &&
+        bool trusted = knownValid || (!sig.empty() && sig[0] != '0' &&
                        sig.find("(heap?)") == std::string::npos &&
                        sig.find("invalid)") == std::string::npos);
         int line = trusted ? ResolveLineNumber(m, pc) : -1;
@@ -426,6 +600,12 @@ static std::string CaptureJavaStack(ArtMethod* curMethod, const PI::Interp::Insn
                      i, sig.c_str(), pc);
         }
         ss << buf;
+    }
+    // Native quick-frame caller chain (Class.method(sig) lines).
+    for (size_t k = 0; k < callerLines.size(); k++) {
+        char hdr[24];
+        snprintf(hdr, sizeof(hdr), "  #%02zu ", frames.size() + k);
+        ss << hdr << callerLines[k] << "\n";
     }
     return ss.str();
 }
@@ -500,6 +680,7 @@ struct BreakpointSession {
 };
 
 static std::vector<BreakpointSession> g_activeBreakpoints;
+static size_t g_nextBpId = 0;
 static std::mutex g_bpMutex;
 
 static void OnBreakpointHit(const std::string& location) {
@@ -516,6 +697,7 @@ static void OnBreakpointHit(const std::string& location) {
     });
 
     g_isThreadPaused = false;
+    g_debugCv.notify_all();
 }
 
 static std::string FormatNativeStepView(ArtMethod* method, void* fn, uintptr_t pc,
@@ -826,6 +1008,16 @@ JSValue JsBreakJava(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValue
     }
     if (!m.isValid()) return JS_NewString(ctx, "[!] Cannot resolve ArtMethod");
 
+    // last-one-wins: drop any existing hook/trace/breakpoint on this ArtMethod
+    // before arming a new breakpoint (a method carries only one trampoline).
+    {
+        int rel = AgentReleaseMethodInstrumentation(reinterpret_cast<void*>(m.getArtMethod()));
+        if (rel) {
+            BroadcastLog("console", std::string("[break] replaced existing ") +
+                                        FormatReleasedInstrumentation(rel) + " on " + m.toString());
+        }
+    }
+
     std::string loc = m.toString();
     if (loc.empty()) loc = "ArtMethod";
     ArtMethod* art = m.getArtMethod();
@@ -890,7 +1082,7 @@ JSValue JsBreakJava(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValue
     BroadcastLog("debug", std::string("[Breakpoint] Armed (smali-step) at ") + loc + " — waiting for next call...");
 
     std::lock_guard<std::mutex> lk(g_bpMutex);
-    size_t id = g_activeBreakpoints.size();
+    size_t id = g_nextBpId++;
     BreakpointSession bp;
     bp.id = id;
     bp.location = loc;
@@ -936,7 +1128,7 @@ JSValue JsBreakNative(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVal
     }
 
     std::lock_guard<std::mutex> lk(g_bpMutex);
-    size_t id = g_activeBreakpoints.size();
+    size_t id = g_nextBpId++;
     BreakpointSession bp;
     bp.id = id;
     bp.location = loc;
@@ -976,6 +1168,13 @@ JSValue JsNext(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueC
 JSValue JsReturn(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
     std::lock_guard<std::mutex> lk(g_debugMutex);
     if (!g_isThreadPaused) return JS_NewString(ctx, "[*] No thread paused at breakpoint");
+    // At the top-level smali frame (depth 0), "finish frame" has nothing to
+    // unwind to, so it is equivalent to "continue to completion".
+    if (g_pausedRegs.depth <= 0) {
+        g_pendingCommand = DebugStepCommand::CONTINUE;
+        g_debugCv.notify_all();
+        return JS_NewString(ctx, "Continuing execution...");
+    }
     g_pendingCommand = DebugStepCommand::FINISH;
     g_debugCv.notify_all();
     return JS_NewString(ctx, "Finishing frame...");
@@ -1501,7 +1700,38 @@ size_t DebugDetachAll() {
         n++;
     }
     g_activeBreakpoints.clear();
+    g_nextBpId = 0;
     return n;
+}
+
+bool BreakpointClearByArtMethod(void* artMethod) {
+    std::lock_guard<std::mutex> lk(g_bpMutex);
+    bool done = false;
+    for (auto it = g_activeBreakpoints.begin(); it != g_activeBreakpoints.end();) {
+        bool match = artMethod && it->is_active && it->java_handle.isHooked() &&
+                     reinterpret_cast<void*>(it->java_handle.getArtMethod()) == artMethod;
+        if (match) {
+            // If a thread is currently paused at this breakpoint, resume it and
+            // wait for it to leave the pause window before tearing down the trampoline.
+            {
+                std::unique_lock<std::mutex> dlk(g_debugMutex);
+                if (g_isThreadPaused && g_pausedLocation == it->location) {
+                    g_pendingCommand = DebugStepCommand::CONTINUE;
+                    g_debugCv.notify_all();
+                    g_debugCv.wait_for(dlk, std::chrono::milliseconds(200),
+                                       []() { return !g_isThreadPaused; });
+                }
+            }
+            it->is_active = false;
+            if (it->java_handle.isHooked()) it->java_handle.unhook();
+            if (it->native_handle.isValid()) it->native_handle.unhook();
+            it = g_activeBreakpoints.erase(it);
+            done = true;
+        } else {
+            ++it;
+        }
+    }
+    return done;
 }
 
 JSValue JsDebugUnhookAll(JSContext* ctx, JSValueConst, int /*argc*/, JSValueConst* /*argv*/) {
@@ -1580,6 +1810,23 @@ void RegisterDebugApis(JSContext* ctx, JSValue global, JSValue debug) {    // De
 )JS";
     JSValue r = JS_Eval(ctx, kRegsProxy, strlen(kRegsProxy), "<debug_regs>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeValue(ctx, r);
+}
+
+// Capture the Java caller chain from a hooked method's entry SP
+// (PineNativeContext::sp) using the native quick-frame walk. Exposed to the
+// hook callback as `ctx.stack` so a plain hook can print the stack at entry
+// without pausing the thread (and without ART's StackVisitor, which aborts on
+// the trampoline's bogus frame).
+std::string CaptureCallerStackFromSp(void* callerSp) {
+    std::vector<std::string> lines;
+    CaptureCallersViaNativeFrames(callerSp, lines);
+    std::ostringstream ss;
+    for (size_t i = 0; i < lines.size(); i++) {
+        char hdr[16];
+        snprintf(hdr, sizeof(hdr), "  #%02zu ", i);
+        ss << hdr << lines[i] << "\n";
+    }
+    return ss.str();
 }
 
 }} // namespace artpi::agent

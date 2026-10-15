@@ -3,6 +3,9 @@
 //
 #include "agent_common.h"
 #include "agent_net.h"
+#include "agent_java.h"
+#include "agent_trace.h"
+#include "agent_debug.h"
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -404,6 +407,23 @@ void InstallConsole(JSContext* ctx) {
     JS_SetPropertyStr(ctx, console, "error", JS_NewCFunction(ctx, JsConsoleLog, "error", 1));
     JS_SetPropertyStr(ctx, global, "console", console);
     JS_FreeValue(ctx, global);
+}
+
+int AgentReleaseMethodInstrumentation(void* artMethod) {
+    if (!artMethod) return 0;
+    int released = 0;
+    if (JavaUnhookMethod(artMethod)) released |= 1;
+    if (TraceStopByArtMethod(artMethod)) released |= 2;
+    if (BreakpointClearByArtMethod(artMethod)) released |= 4;
+    return released;
+}
+
+std::string FormatReleasedInstrumentation(int mask) {
+    std::string what;
+    if (mask & 1) what += "hook";
+    if (mask & 2) what += (what.empty() ? "trace" : ", trace");
+    if (mask & 4) what += (what.empty() ? "breakpoint" : ", breakpoint");
+    return what;
 }
 
 }} // namespace artpi::agent

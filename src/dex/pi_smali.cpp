@@ -283,6 +283,17 @@ std::string dumpSmali(ArtMethod* method, int max_instructions, int highlight_pc)
         ins_size = (fields >> 8) & 0xF;
         outs_size = (fields >> 4) & 0xF;
         insns_count = insns_count_and_flags >> 5;
+        const uint16_t* preheader = reinterpret_cast<const uint16_t*>(code_item);
+        if (insns_count_and_flags & (1u << 4)) {
+            --preheader;
+            insns_count += static_cast<uint32_t>(*preheader);
+            --preheader;
+            insns_count += static_cast<uint32_t>(*preheader) << 16;
+        }
+        if (insns_count_and_flags & (1u << 0)) registers_size += *--preheader;
+        if (insns_count_and_flags & (1u << 1)) ins_size       += *--preheader;
+        if (insns_count_and_flags & (1u << 2)) outs_size      += *--preheader;
+        registers_size += ins_size;
         insns = reinterpret_cast<const uint16_t*>(code_item + 4);
     } else {
         // StandardDex layout
