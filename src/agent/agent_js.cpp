@@ -4,6 +4,7 @@
 #include "agent_js.h"
 #include "agent_common.h"
 #include "agent_java.h"
+#include "agent_java_hook.h"
 #include "agent_native.h"
 #include "agent_memory.h"
 #include "agent_trace.h"
@@ -201,8 +202,132 @@ static const std::map<std::string, std::string> kApiDocs = {
 
     {"untrace", "Usage: untrace([id])\n  - Stops all active traces, or one by id. (handle.stop() also works.)"},
     {"D", "Usage: D()\n  - Detach everything: all Java hooks + native hooks + traces. (alias: detach)"},
-    {"detach", "Alias for D(): detach all Java hooks + native hooks + traces."}
+    {"detach", "Alias for D(): detach all Java hooks + native hooks + traces."},
+    {"L", "Usage: L()  (alias: list, hooks)\n  - Lists all active instrumentations: Hardware BP/WP slots, Gum fallbacks, Native hooks, Java hooks, Traces, Debug breakpoints."},
+    {"list", "Alias for L()"},
+    {"hooks", "Alias for L()"}
 };
+
+static JSValue JsListAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
+    auto hwStatus = HwHookGetSlotStatus();
+    auto hwHooks = HwHookListAll();
+    auto natHooks = NativeHookListAll();
+    auto javaHooks = JavaHookListAll();
+    auto traces = TraceListAll();
+    auto debugBps = DebugBpListAll();
+
+    std::ostringstream ss;
+    ss << "====================== ArtPI Active Instrumentations ======================\n";
+
+    // 1. Hardware Breakpoint & Watchpoint Slots
+    ss << "[Hardware Registers]\n";
+    ss << "  BP Slots: ";
+    for (int i = 0; i < 4; ++i) {
+        ss << "[" << i << ": " << (hwStatus.bp_slots[i] ? "OCCUPIED" : "free") << "] ";
+    }
+    ss << "\n  WP Slots: ";
+    for (int i = 0; i < 4; ++i) {
+        ss << "[" << i << ": " << (hwStatus.wp_slots[i] ? "OCCUPIED" : "free") << "] ";
+    }
+    ss << "\n\n";
+
+    // 2. Hardware Hooks & Watchpoints
+    std::vector<HwHookInfo> pureHw;
+    std::vector<HwHookInfo> fallbackHw;
+    for (const auto& h : hwHooks) {
+        if (h.type == "GUM_INLINE_FALLBACK") {
+            fallbackHw.push_back(h);
+        } else {
+            pureHw.push_back(h);
+        }
+    }
+
+    ss << "[Hardware Hooks / Watchpoints] (" << pureHw.size() << " active)\n";
+    if (pureHw.empty()) {
+        ss << "  (none)\n";
+    } else {
+        for (const auto& h : pureHw) {
+            char abuf[32];
+            snprintf(abuf, sizeof(abuf), "0x%lx", (unsigned long)h.address);
+            ss << "  #" << h.id << " [" << h.type;
+            if (h.slot >= 0) ss << " slot " << h.slot;
+            ss << "] " << abuf;
+            if (!h.tag.empty()) ss << " | tag: " << h.tag;
+            if (h.type == "WATCHPOINT") {
+                ss << " | " << h.condition << " (size: " << h.size << ")";
+            }
+            if (h.threads > 0) ss << " (threads: " << h.threads << ")";
+            ss << "\n";
+        }
+    }
+    ss << "\n";
+
+    // 3. Gum Inline Fallbacks (Hardware overflow / unsupported fallback)
+    if (!fallbackHw.empty()) {
+        ss << "[Gum Inline Fallbacks] (" << fallbackHw.size() << " active)\n";
+        for (const auto& h : fallbackHw) {
+            char abuf[32];
+            snprintf(abuf, sizeof(abuf), "0x%lx", (unsigned long)h.address);
+            ss << "  #" << h.id << " [INLINE FALLBACK] " << abuf << " | tag: " << h.tag << "\n";
+        }
+        ss << "\n";
+    }
+
+    // 4. Native Inline Hooks (Frida-Gum)
+    ss << "[Native Inline Hooks] (" << natHooks.size() << " active)\n";
+    if (natHooks.empty()) {
+        ss << "  (none)\n";
+    } else {
+        for (const auto& h : natHooks) {
+            char abuf[32];
+            snprintf(abuf, sizeof(abuf), "0x%lx", (unsigned long)h.address);
+            ss << "  #" << h.id << " " << abuf << " | " << h.target << "\n";
+        }
+    }
+    ss << "\n";
+
+    // 5. Java Method Hooks (Pine / ART)
+    ss << "[Java Method Hooks] (" << javaHooks.size() << " active)\n";
+    if (javaHooks.empty()) {
+        ss << "  (none)\n";
+    } else {
+        for (const auto& h : javaHooks) {
+            char abuf[32];
+            snprintf(abuf, sizeof(abuf), "0x%lx", (unsigned long)h.artMethod);
+            ss << "  #" << h.id << " " << h.className << "." << h.methodName << h.sig
+               << " (ArtMethod: " << abuf << ")\n";
+        }
+    }
+    ss << "\n";
+
+    // 6. Trace Sessions
+    ss << "[Trace Sessions] (" << traces.size() << " active)\n";
+    if (traces.empty()) {
+        ss << "  (none)\n";
+    } else {
+        for (const auto& t : traces) {
+            ss << "  #" << t.id << " " << t.target << " [mode: " << t.mode << "]\n";
+        }
+    }
+    ss << "\n";
+
+    // 7. Debug Breakpoints
+    ss << "[Debug Breakpoints] (" << debugBps.size() << " active)\n";
+    if (debugBps.empty()) {
+        ss << "  (none)\n";
+    } else {
+        for (const auto& b : debugBps) {
+            char abuf[32];
+            snprintf(abuf, sizeof(abuf), "0x%lx", (unsigned long)b.address);
+            ss << "  #" << b.id << " " << b.target;
+            if (b.address) ss << " (" << abuf << ")";
+            ss << "\n";
+        }
+    }
+
+    ss << "===========================================================================";
+    return JS_NewString(ctx, ss.str().c_str());
+}
 
 static JSValue JsDetachAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
     size_t d = DebugDetachAll();
@@ -253,6 +378,9 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     // 5. One-shot detach: Java hooks + native hooks + all traces
     JS_SetPropertyStr(ctx, global, "D", JS_NewCFunction(ctx, JsDetachAll, "D", 0));
     JS_SetPropertyStr(ctx, global, "detach", JS_NewCFunction(ctx, JsDetachAll, "detach", 0));
+    JS_SetPropertyStr(ctx, global, "L", JS_NewCFunction(ctx, JsListAll, "L", 0));
+    JS_SetPropertyStr(ctx, global, "list", JS_NewCFunction(ctx, JsListAll, "list", 0));
+    JS_SetPropertyStr(ctx, global, "hooks", JS_NewCFunction(ctx, JsListAll, "hooks", 0));
 
     // 6. Install console.log redirector
     InstallConsole(ctx);

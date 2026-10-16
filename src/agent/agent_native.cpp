@@ -28,7 +28,13 @@
 
 namespace artpi { namespace agent {
 
-static std::vector<PI::Native::NativeHookHandle> g_activeNativeHooks;
+struct NativeHookRecord {
+    size_t id;
+    uintptr_t address;
+    std::string target;
+    PI::Native::NativeHookHandle handle;
+};
+static std::vector<NativeHookRecord> g_activeNativeHooks;
 static std::mutex g_nativeHooksMutex;
 
 struct ModuleMatchCtx {
@@ -911,9 +917,18 @@ static JSValue JsNativeHook(JSContext* ctx, JSValueConst /*this_val*/, int argc,
     }
 
     std::lock_guard<std::mutex> lk(g_nativeHooksMutex);
-    g_activeNativeHooks.push_back(std::move(handle));
+    size_t id = g_activeNativeHooks.size();
+    std::string desc;
+    if (!modName.empty() && !symName.empty()) {
+        desc = modName + "!" + symName;
+    } else {
+        char abuf[32];
+        snprintf(abuf, sizeof(abuf), "0x%lx", (unsigned long)reinterpret_cast<uintptr_t>(targetAddr));
+        desc = abuf;
+    }
+    g_activeNativeHooks.push_back({ id, reinterpret_cast<uintptr_t>(targetAddr), desc, std::move(handle) });
     char buf[64];
-    snprintf(buf, sizeof(buf), "Native hook installed (id: %zu)", g_activeNativeHooks.size() - 1);
+    snprintf(buf, sizeof(buf), "Native hook installed (id: %zu)", id);
     return JS_NewString(ctx, buf);
 }
 
@@ -928,10 +943,21 @@ size_t NativeUnhookAllCount() {
     std::lock_guard<std::mutex> lk(g_nativeHooksMutex);
     size_t n = 0;
     for (auto& h : g_activeNativeHooks) {
-        if (h.isValid()) { h.unhook(); n++; }
+        if (h.handle.isValid()) { h.handle.unhook(); n++; }
     }
     g_activeNativeHooks.clear();
     return n;
+}
+
+std::vector<NativeHookInfo> NativeHookListAll() {
+    std::lock_guard<std::mutex> lk(g_nativeHooksMutex);
+    std::vector<NativeHookInfo> res;
+    for (const auto& h : g_activeNativeHooks) {
+        if (h.handle.isValid()) {
+            res.push_back({ h.id, h.address, h.target });
+        }
+    }
+    return res;
 }
 
 // ===========================================================================

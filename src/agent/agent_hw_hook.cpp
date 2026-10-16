@@ -5,6 +5,9 @@
 #include "agent_common.h"
 #include "agent_net.h"
 #include "native/hooker/pi_hw_hook.h"
+#include "native/hooker/pi_gum_hooker.h"
+#include "frida-gum.h"
+#include <unistd.h>
 #include "xdl.h"
 
 #include <string>
@@ -21,9 +24,37 @@
 
 namespace artpi { namespace agent {
 
+using namespace PI::Native;
+
 namespace {
 
-using namespace PI::Native;
+struct FallbackHookRecord {
+    uint32_t id;
+    uintptr_t address;
+    std::string tag;
+    PI::Native::NativeHookHandle handle;
+};
+static std::vector<FallbackHookRecord> g_fallbackHooks;
+static std::mutex g_fallbackMutex;
+static uint32_t g_nextFallbackId = 10000;
+static bool g_dlopenMonitorActive = false;
+
+static bool DetachSessionOrFallback(uint32_t id) {
+    if (id < 10000) {
+        return HwHookManager::instance().detach(id);
+    }
+    std::lock_guard<std::mutex> lk(g_fallbackMutex);
+    for (auto it = g_fallbackHooks.begin(); it != g_fallbackHooks.end(); ++it) {
+        if (it->id == id) {
+            if (it->handle.isValid()) it->handle.unhook();
+            g_fallbackHooks.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+
 
 // Helper to resolve address from various input forms:
 // 1. (int/bigint/ptr)
@@ -211,7 +242,7 @@ static JSValue JsHwHandleDetach(JSContext* ctx, JSValueConst this_val, int /*arg
     JSValue idVal = JS_GetPropertyStr(ctx, this_val, "id");
     int32_t id = 0;
     if (JS_ToInt32(ctx, &id, idVal) == 0 && id > 0) {
-        bool ok = HwHookManager::instance().detach(static_cast<uint32_t>(id));
+        bool ok = DetachSessionOrFallback(static_cast<uint32_t>(id));
         JS_FreeValue(ctx, idVal);
         return JS_NewBool(ctx, ok);
     }
@@ -232,6 +263,8 @@ static JSValue CreateHandleObject(JSContext* ctx, uint32_t id, int slot, HwHookT
 }
 
 // HWBreakpoint.attach(target, [options | cb])
+static uint32_t ArmBreakpointOrFallback(uintptr_t target, const std::string& tag, const HwHookCallback& cb);
+
 static JSValue JsHwBreakpointAttach(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "Usage: HWBreakpoint.attach(addressOrSymbol, { onEnter, [slot, threadId, once] })");
@@ -283,6 +316,11 @@ static JSValue JsHwBreakpointAttach(JSContext* ctx, JSValueConst /*this_val*/, i
         return JS_ThrowTypeError(ctx, "[!] onEnter callback function is required");
     }
 
+    std::string tag;
+    char tbuf[32];
+    snprintf(tbuf, sizeof(tbuf), "0x%lx", (unsigned long)target);
+    tag = tbuf;
+
     auto cbGuard = std::shared_ptr<JSValue>(new JSValue(jsCb), [](JSValue* p) {
         if (p) {
             if (g_ctx && !JS_IsUndefined(*p)) JS_FreeValue(g_ctx, *p);
@@ -296,6 +334,7 @@ static JSValue JsHwBreakpointAttach(JSContext* ctx, JSValueConst /*this_val*/, i
     cfg.slot = slot;
     cfg.thread_id = threadId;
     cfg.once = once;
+    cfg.tag = tag;
 
     cfg.on_hit = [cbGuard](HwCpuContext& hwctx) {
         JSContext* jsctx = g_ctx;
@@ -325,13 +364,17 @@ static JSValue JsHwBreakpointAttach(JSContext* ctx, JSValueConst /*this_val*/, i
     };
 
     uint32_t id = HwHookManager::instance().attach(cfg);
-    if (id == 0) {
-        return JS_ThrowInternalError(ctx, "[!] Failed to attach hardware breakpoint (slots exhausted or restricted)");
-    }
-
     int assignedSlot = -1;
-    for (const auto& s : HwHookManager::instance().listSessions()) {
-        if (s.id == id) { assignedSlot = s.assigned_slot; break; }
+    if (id == 0) {
+        id = ArmBreakpointOrFallback(target, tag, cfg.on_hit);
+        if (id == 0) {
+            return JS_ThrowInternalError(ctx, "[!] Failed to attach hardware breakpoint or fallback inline hook");
+        }
+        assignedSlot = -1;
+    } else {
+        for (const auto& s : HwHookManager::instance().listSessions()) {
+            if (s.id == id) { assignedSlot = s.assigned_slot; break; }
+        }
     }
 
     return CreateHandleObject(ctx, id, assignedSlot, HwHookType::BREAKPOINT, target);
@@ -349,7 +392,7 @@ static JSValue JsHwBreakpointDetach(JSContext* ctx, JSValueConst /*this_val*/, i
         JS_ToInt32(ctx, &id, argv[0]);
     }
     if (id <= 0) return JS_FALSE;
-    bool ok = HwHookManager::instance().detach(static_cast<uint32_t>(id));
+    bool ok = DetachSessionOrFallback(static_cast<uint32_t>(id));
     return JS_NewBool(ctx, ok);
 }
 
@@ -504,22 +547,88 @@ static JSValue JsHwWatchpointAttach(JSContext* ctx, JSValueConst /*this_val*/, i
     return CreateHandleObject(ctx, id, assignedSlot, HwHookType::WATCHPOINT, target);
 }
 
-static uintptr_t ResolveDlopenAddress() {
+static uintptr_t ResolveDlopenExtAddress() {
     uintptr_t addr = 0;
     void* handle = xdl_open("libdl.so", XDL_DEFAULT);
     if (handle) {
         addr = reinterpret_cast<uintptr_t>(xdl_sym(handle, "android_dlopen_ext", nullptr));
-        if (!addr) {
-            addr = reinterpret_cast<uintptr_t>(xdl_sym(handle, "dlopen", nullptr));
-        }
         xdl_close(handle);
     }
     if (!addr) {
         void* p = dlsym(RTLD_DEFAULT, "android_dlopen_ext");
-        if (!p) p = dlsym(RTLD_DEFAULT, "dlopen");
         addr = reinterpret_cast<uintptr_t>(p);
     }
     return addr;
+}
+
+static uintptr_t ResolveDlopenAddress() {
+    uintptr_t addr = 0;
+    void* handle = xdl_open("libdl.so", XDL_DEFAULT);
+    if (handle) {
+        addr = reinterpret_cast<uintptr_t>(xdl_sym(handle, "dlopen", nullptr));
+        xdl_close(handle);
+    }
+    if (!addr) {
+        void* p = dlsym(RTLD_DEFAULT, "dlopen");
+        addr = reinterpret_cast<uintptr_t>(p);
+    }
+    return addr;
+}
+
+static uint32_t ArmBreakpointOrFallback(uintptr_t target, const std::string& tag, const HwHookCallback& cb) {
+    HwHookConfig cfg;
+    cfg.type = HwHookType::BREAKPOINT;
+    cfg.address = target;
+    cfg.slot = -1;
+    cfg.thread_id = 0;
+    cfg.once = false;
+    cfg.tag = tag;
+    cfg.on_hit = cb;
+
+    uint32_t id = HwHookManager::instance().attach(cfg);
+    if (id > 0) {
+        HW_LOGI("[HWBreakpoint] Armed hardware breakpoint on %s at 0x%lx (id #%u)", tag.c_str(), (unsigned long)target, id);
+        return id;
+    }
+
+    HW_LOGW("[HWBreakpoint] Hardware breakpoint unavailable for %s (0x%lx), falling back to Gum inline hook...",
+            tag.c_str(), (unsigned long)target);
+    BroadcastLog("console", std::string("[i] Hardware breakpoint unavailable for ") + tag + ", auto-falling back to Gum native inline hook...");
+
+    if (!gum_memory_is_readable(reinterpret_cast<const void*>(target), 4)) {
+        HW_LOGW("[HWBreakpoint] Target address 0x%lx is not mapped in memory, cannot apply Gum inline hook fallback",
+                (unsigned long)target);
+        BroadcastLog("console", "[!] Target address is not mapped in memory, cannot apply Gum inline hook fallback");
+        return 0;
+    }
+
+    auto onEnter = [cb](GumInvocationContext* ictx) {
+        GumCpuContext* cpu = ictx ? ictx->cpu_context : nullptr;
+        HwCpuContext hwctx{};
+        hwctx.thread_id = static_cast<pid_t>(gettid());
+        hwctx.slot = -1;
+        hwctx.raw_gum_context = cpu;
+#if defined(__aarch64__)
+        if (cpu) {
+            hwctx.pc = cpu->pc;
+            hwctx.sp = cpu->sp;
+            hwctx.lr = cpu->lr;
+            hwctx.fp = cpu->fp;
+            std::memcpy(hwctx.x, cpu->x, sizeof(hwctx.x));
+        }
+#endif
+        cb(hwctx);
+    };
+
+    PI::Native::NativeHookHandle handle = PI::Native::GumHooker::hook(reinterpret_cast<void*>(target), onEnter, nullptr);
+    if (handle.isValid()) {
+        std::lock_guard<std::mutex> lk(g_fallbackMutex);
+        uint32_t fid = g_nextFallbackId++;
+        g_fallbackHooks.push_back({ fid, target, tag + " (Gum Inline Fallback)", std::move(handle) });
+        HW_LOGI("[HWBreakpoint] Armed Gum inline hook fallback for %s at 0x%lx (id #%u)", tag.c_str(), (unsigned long)target, fid);
+        return fid;
+    }
+    return 0;
 }
 
 static std::string ExtractSoName(uint64_t addr) {
@@ -535,6 +644,18 @@ static std::string ExtractSoName(uint64_t addr) {
 }
 
 static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (g_dlopenMonitorActive) {
+        uint32_t activeId = 1;
+        int activeSlot = 0;
+        for (const auto& s : HwHookManager::instance().listSessions()) {
+            if (s.config.tag.find("dlopen") != std::string::npos) {
+                activeId = s.id;
+                activeSlot = s.assigned_slot;
+                break;
+            }
+        }
+        return CreateHandleObject(ctx, activeId, activeSlot, HwHookType::BREAKPOINT, ResolveDlopenAddress());
+    }
     std::string stopLib;
     bool libLog = true;
     JSValue jsCbLoading = JS_UNDEFINED;
@@ -564,9 +685,10 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
         }
     }
 
-    uintptr_t target = ResolveDlopenAddress();
-    if (!target) {
-        return JS_ThrowInternalError(ctx, "[!] Failed to resolve android_dlopen_ext/dlopen address");
+    uintptr_t targetExt = ResolveDlopenExtAddress();
+    uintptr_t targetDl = ResolveDlopenAddress();
+    if (!targetExt && !targetDl) {
+        return JS_ThrowInternalError(ctx, "[!] Failed to resolve android_dlopen_ext / dlopen address");
     }
 
     auto cbLoadingGuard = std::shared_ptr<JSValue>(new JSValue(jsCbLoading), [](JSValue* p) {
@@ -582,19 +704,12 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
         }
     });
 
-    HwHookConfig cfg;
-    cfg.type = HwHookType::BREAKPOINT;
-    cfg.address = target;
-    cfg.slot = -1;
-    cfg.thread_id = 0;
-    cfg.once = false;
-
-    cfg.on_hit = [stopLib, libLog, cbLoadingGuard, cbLoadedGuard](HwCpuContext& hwctx) {
+    auto hitCb = [stopLib, libLog, cbLoadingGuard, cbLoadedGuard](HwCpuContext& hwctx) {
         std::string soPath = ExtractSoName(hwctx.x[0]);
 
         if (libLog) {
             char logBuf[512];
-            snprintf(logBuf, sizeof(logBuf), "[dlopen] Loading SO: %s (caller=0x%" PRIx64 ")",
+            snprintf(logBuf, sizeof(logBuf), "Loading SO: %s (caller=0x%" PRIx64 ")",
                      soPath.c_str(), hwctx.lr);
             HW_LOGI("%s", logBuf);
             BroadcastLog("dlopen", logBuf);
@@ -626,7 +741,7 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
                 retCfg.on_hit = [soPath, cbLoadedGuard](HwCpuContext& retCtx) {
                     uint64_t handle = retCtx.x[0];
                     char logBuf[512];
-                    snprintf(logBuf, sizeof(logBuf), "[dlopen] Loaded SO: %s -> handle=0x%" PRIx64,
+                    snprintf(logBuf, sizeof(logBuf), "Loaded SO: %s -> handle=0x%" PRIx64,
                              soPath.c_str(), handle);
                     HW_LOGI("%s", logBuf);
                     BroadcastLog("dlopen", logBuf);
@@ -661,17 +776,26 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
         }
     };
 
-    uint32_t id = HwHookManager::instance().attach(cfg);
-    if (id == 0) {
-        return JS_ThrowInternalError(ctx, "[!] Failed to attach hardware breakpoint on dlopen");
+    uint32_t id1 = 0, id2 = 0;
+    if (targetExt) {
+        id1 = ArmBreakpointOrFallback(targetExt, "android_dlopen_ext", hitCb);
+    }
+    if (targetDl && targetDl != targetExt) {
+        id2 = ArmBreakpointOrFallback(targetDl, "dlopen", hitCb);
     }
 
+    if (id1 == 0 && id2 == 0) {
+        return JS_ThrowInternalError(ctx, "[!] Failed to attach hardware breakpoint or fallback on dlopen");
+    }
+
+    uint32_t primaryId = id1 ? id1 : id2;
+    uintptr_t primaryAddr = id1 ? targetExt : targetDl;
     int assignedSlot = -1;
     for (const auto& s : HwHookManager::instance().listSessions()) {
-        if (s.id == id) { assignedSlot = s.assigned_slot; break; }
+        if (s.id == primaryId) { assignedSlot = s.assigned_slot; break; }
     }
 
-    return CreateHandleObject(ctx, id, assignedSlot, HwHookType::BREAKPOINT, target);
+    return CreateHandleObject(ctx, primaryId, assignedSlot, HwHookType::BREAKPOINT, primaryAddr);
 }
 
 } // namespace
@@ -711,29 +835,83 @@ void RegisterHwHookApis(JSContext* ctx, JSValue global) {
 }
 
 size_t HwHookDetachAll() {
-    return HwHookManager::instance().detachAll();
+    size_t count = HwHookManager::instance().detachAll();
+    {
+        std::lock_guard<std::mutex> lk(g_fallbackMutex);
+        for (auto& f : g_fallbackHooks) {
+            if (f.handle.isValid()) {
+                f.handle.unhook();
+                count++;
+            }
+        }
+        g_fallbackHooks.clear();
+    }
+    return count;
+}
+
+std::vector<HwHookInfo> HwHookListAll() {
+    std::vector<HwHookInfo> res;
+    for (const auto& s : HwHookManager::instance().listSessions()) {
+        std::string typeStr = (s.config.type == HwHookType::BREAKPOINT) ? "BREAKPOINT" : "WATCHPOINT";
+        std::string condStr = "";
+        if (s.config.type == HwHookType::WATCHPOINT) {
+            int cond = static_cast<int>(s.config.condition);
+            if ((cond & 3) == 3) condStr = "rw";
+            else if (cond & 1) condStr = "r";
+            else if (cond & 2) condStr = "w";
+        }
+        res.push_back({
+            s.id,
+            typeStr,
+            s.assigned_slot,
+            s.config.address,
+            s.config.tag,
+            s.armed_threads.size(),
+            s.config.size,
+            condStr
+        });
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_fallbackMutex);
+        for (const auto& f : g_fallbackHooks) {
+            if (f.handle.isValid()) {
+                res.push_back({
+                    f.id,
+                    "GUM_INLINE_FALLBACK",
+                    -1,
+                    f.address,
+                    f.tag,
+                    0,
+                    0,
+                    ""
+                });
+            }
+        }
+    }
+    return res;
+}
+
+HwSlotStatus HwHookGetSlotStatus() {
+    HwSlotStatus st{};
+    HwHookManager::instance().getSlotStatus(st.bp_slots, st.wp_slots);
+    return st;
 }
 
 bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog) {
-    uintptr_t target = ResolveDlopenAddress();
-    if (!target) {
-        HW_LOGE("SetupDlopenHwMonitor: failed to resolve dlopen address");
+    if (g_dlopenMonitorActive) return true;
+    uintptr_t targetExt = ResolveDlopenExtAddress();
+    uintptr_t targetDl = ResolveDlopenAddress();
+    if (!targetExt && !targetDl) {
+        HW_LOGE("SetupDlopenHwMonitor: failed to resolve dlopen / android_dlopen_ext address");
         return false;
     }
 
-    HwHookConfig cfg;
-    cfg.type = HwHookType::BREAKPOINT;
-    cfg.address = target;
-    cfg.slot = -1;
-    cfg.thread_id = 0;
-    cfg.once = false;
-
-    cfg.on_hit = [stopLib, libLog](HwCpuContext& hwctx) {
+    auto hitCb = [stopLib, libLog](HwCpuContext& hwctx) {
         std::string soPath = ExtractSoName(hwctx.x[0]);
 
         if (libLog) {
             char logBuf[512];
-            snprintf(logBuf, sizeof(logBuf), "[dlopen] Loading SO: %s (caller=0x%" PRIx64 ")",
+            snprintf(logBuf, sizeof(logBuf), "Loading SO: %s (caller=0x%" PRIx64 ")",
                      soPath.c_str(), hwctx.lr);
             HW_LOGI("%s", logBuf);
             BroadcastLog("dlopen", logBuf);
@@ -750,13 +928,25 @@ bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog) {
         }
     };
 
-    uint32_t id = HwHookManager::instance().attach(cfg);
-    if (id > 0) {
-        HW_LOGI("SetupDlopenHwMonitor: armed dlopen hardware breakpoint at 0x%lx (stopLib='%s', libLog=%d)",
-                (unsigned long)target, stopLib.c_str(), libLog ? 1 : 0);
-        return true;
+    bool ok = false;
+    if (targetExt) {
+        uint32_t id1 = ArmBreakpointOrFallback(targetExt, "android_dlopen_ext", hitCb);
+        if (id1 > 0) {
+            HW_LOGI("SetupDlopenHwMonitor: armed android_dlopen_ext hook (id #%u, stopLib='%s', libLog=%d)",
+                    id1, stopLib.c_str(), libLog ? 1 : 0);
+            ok = true;
+        }
     }
-    return false;
+    if (targetDl && targetDl != targetExt) {
+        uint32_t id2 = ArmBreakpointOrFallback(targetDl, "dlopen", hitCb);
+        if (id2 > 0) {
+            HW_LOGI("SetupDlopenHwMonitor: armed dlopen hook (id #%u, stopLib='%s', libLog=%d)",
+                    id2, stopLib.c_str(), libLog ? 1 : 0);
+            ok = true;
+        }
+    }
+    if (ok) g_dlopenMonitorActive = true;
+    return ok;
 }
 
 }} // namespace artpi::agent

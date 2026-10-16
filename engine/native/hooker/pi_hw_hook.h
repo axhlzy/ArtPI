@@ -114,6 +114,7 @@ public:
     // Query active sessions
     std::vector<HwHookSession> listSessions() const;
     bool isSessionActive(uint32_t id) const;
+    void getSlotStatus(bool out_bp[4], bool out_wp[4]) const;
 
     // Internal exception dispatcher called by GumExceptor
     static int HandleException(void* details, void* user_data);

@@ -124,9 +124,9 @@ namespace {
             printf("[*] Target main thread (PID %d) is PAUSED. Set your hooks, then type 'resume' to continue!\n",
                    opt.pid);
         } else if (!opt.stopLib.empty()) {
-            std::string res, err;
-            artpi::injector::EvalScript(ep, "Process.resume()", res, err);
             printf("[*] App running. Will PAUSE automatically when '%s' is loaded via dlopen...\n", opt.stopLib.c_str());
+        } else if (opt.libLog) {
+            printf("[*] App running. Monitoring dynamic libraries loaded via dlopen...\n");
         }
         printf("[*] Attaching directly to interactive REPL session...\n");
         artpi::injector::RunInteractiveRepl(ep);
@@ -426,6 +426,22 @@ int main(int argc, char **argv) {
                 printf("[+] pre-deployed payload -> %s (%zu bytes)\n",
                        preDeployedSoPath.c_str(), preExtractedPayload.size());
             }
+            if (opt.libLog || !opt.stopLib.empty()) {
+                std::string cfgPath = dataDir + "/artpi_boot.cfg";
+                int fd = open(cfgPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+                if (fd >= 0) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\n", opt.libLog ? 1 : 0, opt.stopLib.c_str());
+                    write(fd, buf, strlen(buf));
+                    close(fd);
+                    struct stat dirSt{};
+                    if (stat(dataDir.c_str(), &dirSt) == 0) {
+                        chmod(cfgPath.c_str(), 0666);
+                        chown(cfgPath.c_str(), dirSt.st_uid, dirSt.st_gid);
+                        ApplySelinux(dataDir, cfgPath);
+                    }
+                }
+            }
         }
 
         pid_t spawnedPid = -1;
@@ -551,8 +567,9 @@ int main(int argc, char **argv) {
         printf("[*] injecting libartpi_agent.so via /proc/%d/mem (no-ptrace) ...\n", opt.pid);
         injOk = InjectLibraryNoPtrace(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err);
     } else {
-        printf("[*] injecting libartpi_agent.so via ptrace (SEIZE) into pid %d ...\n", opt.pid);
-        injOk = InjectLibrary(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err, opt.pauseMainThread);
+        bool injectPause = opt.pauseMainThread;
+        printf("[*] injecting libartpi_agent.so via ptrace (SEIZE) into pid %d (gate_pause=%d) ...\n", opt.pid, injectPause ? 1 : 0);
+        injOk = InjectLibrary(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err, injectPause);
         if (!injOk && err.find("PTRACE_") != std::string::npos) {
             printf("[!] ptrace attach failed (%s), falling back to --no-ptrace (/proc/mem) mode...\n", err.c_str());
             err.clear();

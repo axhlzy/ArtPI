@@ -688,6 +688,18 @@ size_t TraceStopAll() {
     return n;
 }
 
+std::vector<TraceInfo> TraceListAll() {
+    std::lock_guard<std::mutex> lk(g_traceMutex);
+    std::vector<TraceInfo> res;
+    for (const auto& s : g_activeTraces) {
+        if (s.is_active) {
+            std::string mode = s.java_handle.isHooked() ? "Java" : (s.native_handle.isValid() ? "Native" : "Unified");
+            res.push_back({ static_cast<int>(s.id), s.tag, mode });
+        }
+    }
+    return res;
+}
+
 bool TraceStopByArtMethod(void* artMethod) {
     std::lock_guard<std::mutex> lk(g_traceMutex);
     bool done = false;

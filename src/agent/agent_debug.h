@@ -4,6 +4,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 extern "C" {
 #include "../../engine/qjs/quickjs/quickjs.h"
@@ -11,8 +12,17 @@ extern "C" {
 
 namespace artpi { namespace agent {
 
+struct DebugBpInfo {
+    int id;
+    std::string target;
+    uintptr_t address;
+};
+
 void RegisterDebugApis(JSContext* ctx, JSValue global, JSValue debug);
 size_t DebugDetachAll();
+
+// Query all active debug breakpoints
+std::vector<DebugBpInfo> DebugBpListAll();
 
 // Clear + erase any active Java breakpoint whose target is `artMethod`. Returns
 // true if one was removed. (Used by the last-one-wins instrumentation coordinator.)

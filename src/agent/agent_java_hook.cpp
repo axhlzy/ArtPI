@@ -26,7 +26,15 @@ extern "C" {
 
 namespace artpi { namespace agent {
 
-static std::vector<PI::HookHandle> g_activeHooks;
+struct JavaHookRecord {
+    int id;
+    PI::HookHandle handle;
+    std::string className;
+    std::string methodName;
+    std::string sig;
+    uintptr_t artMethod;
+};
+static std::vector<JavaHookRecord> g_activeHooks;
 static std::mutex g_hooksMutex;
 
 static thread_local int t_hookCallDepth = 0;
@@ -472,8 +480,9 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
     }
 
     std::lock_guard<std::mutex> lk(g_hooksMutex);
-    g_activeHooks.push_back(handle);
-    return static_cast<int>(g_activeHooks.size() - 1);
+    int newId = static_cast<int>(g_activeHooks.size());
+    g_activeHooks.push_back({ newId, handle, m.getDeclaringClassName(), m.getName(), m.getSignature(), reinterpret_cast<uintptr_t>(m.getArtMethod()) });
+    return newId;
 }
 
 static JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -793,11 +802,13 @@ static JSValue JsJavaUnhook(JSContext* ctx, JSValueConst /*this_val*/, int argc,
     JS_ToInt32(ctx, &id, argv[0]);
 
     std::lock_guard<std::mutex> lk(g_hooksMutex);
-    if (id >= 0 && id < static_cast<int>(g_activeHooks.size())) {
-        g_activeHooks[id].unhook();
-        return JS_NewString(ctx, "Unhooked successfully");
+    for (auto& h : g_activeHooks) {
+        if (h.id == id && h.handle.isHooked()) {
+            h.handle.unhook();
+            return JS_NewString(ctx, "Unhooked successfully");
+        }
     }
-    return JS_NewString(ctx, "[!] Invalid hook id");
+    return JS_NewString(ctx, "[!] Invalid or already unhooked hook id");
 }
 
 static JSValue JsJavaUnhookAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
@@ -811,8 +822,8 @@ size_t JavaUnhookAllCount() {
     std::lock_guard<std::mutex> lk(g_hooksMutex);
     size_t count = 0;
     for (auto& h : g_activeHooks) {
-        if (h.isHooked()) {
-            h.unhook();
+        if (h.handle.isHooked()) {
+            h.handle.unhook();
             count++;
         }
     }
@@ -824,13 +835,23 @@ bool JavaUnhookMethod(void* artMethod) {
     std::lock_guard<std::mutex> lk(g_hooksMutex);
     bool done = false;
     for (auto& h : g_activeHooks) {
-        if (h.isHooked() && reinterpret_cast<void*>(h.getArtMethod()) == artMethod) {
-            h.unhook();
-            h = PI::HookHandle();
+        if (h.handle.isHooked() && reinterpret_cast<void*>(h.handle.getArtMethod()) == artMethod) {
+            h.handle.unhook();
             done = true;
         }
     }
     return done;
+}
+
+std::vector<JavaHookInfo> JavaHookListAll() {
+    std::lock_guard<std::mutex> lk(g_hooksMutex);
+    std::vector<JavaHookInfo> res;
+    for (const auto& h : g_activeHooks) {
+        if (h.handle.isHooked()) {
+            res.push_back({ h.id, h.className, h.methodName, h.sig, h.artMethod });
+        }
+    }
+    return res;
 }
 
 void RegisterJavaHookApis(JSContext* ctx, JSValue global, JSValue java) {

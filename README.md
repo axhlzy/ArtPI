@@ -409,7 +409,8 @@ dynamic.register("mydomain", rootObj);// 注册自定义域
 | `bt` | 打印当前断点处真实的 Java 调用栈（包含完整类名、方法名、DEX PC 与**源码行号**） |
 | `regs` / `dumpRegs()` | 打印当前断点处的全部寄存器（Java 模式显示 `v0..vN`，Native 模式显示 `x0..x30, fp, lr, sp`） |
 | `getreg(n)` / `setreg(n, val)` | 读取或篡改寄存器值（支持整型、浮点、字符串及 Java 对象包装） |
-| `D()` / `detach()` | **一键解挂**：撤销全部 Java/Native Hook、Trace，唤醒所有挂起线程并清除断点 |
+| `L()` / `list()` / `hooks()` | **全景仪表盘**：直观展示当前物理硬件断点/观察点槽位占用状态、Gum 回退断点、原生 Native Hook、Java Hook、Trace 及调试断点 |
+| `D()` / `detach()` | **一键解挂**：撤销全部硬件断点/观察点（释放全部物理寄存器槽位）、Java/Native Hook、Trace，唤醒所有挂起线程并清除断点 |
 
 **`.trace([opt])` 配置参数（`opt` 对象或 `new TraceOption()`）**：
 
@@ -583,6 +584,19 @@ console.log(JSON.stringify(HW.list()));
 bp.detach();
 HW.detachAll();
 ```
+
+#### 4. 自动降级回退机制（Auto-Fallback to Frida-Gum）
+
+当发生以下情况时，ArtPI 会**自动无缝降级**为 Frida-Gum 原生 Inline Hook，调用端无需任何冗余容错代码：
+1. **硬件断点槽位耗尽**：ARM64 架构下 4 个硬件断点槽位（Slot 0..3）均已被占用时，新下发的断点自动转为 Gum Inline Hook。
+2. **设备/内核不支持硬件断点**：在模拟器、云手机或部分内核未开放硬件调试寄存器访问的特殊机型上，自动平滑退回到 Gum Inline Hook。
+3. **全景状态可观测**：通过回退机制生成的 Hook 会分配统一的会话标识并在 `L()` 仪表盘的 `[Gum Inline Fallbacks]` 分区中高亮展示，同样可通过返回句柄的 `handle.detach()` 或全局 `D()` 一键解挂。
+
+#### 5. CLI 早期启动动态库监控与断点（`-S` 与 `-L` / `--stop-lib`）
+
+使用 `-S` 参数以孵化（Spawn）模式启动目标 App 时，配合 `-L` 或 `--stop-lib <name>`：
+- **零延迟拦截**：在 Zygote specialize 完成瞬间立即在 `android_dlopen_ext` 与 `dlopen` 双入口装载硬件断点，确保从第 1 毫秒起捕获 App 加载的每一个 SO 库（例如 Unity 引擎的 `libmain.so`、`libunity.so`、`libil2cpp.so`）。
+- **条件挂起**：若传入 `--stop-lib libil2cpp.so`，当该库被加载时，主线程将在 dlopen 入口被自动挂起（进入 futex wait），便于在 REPL 中布控早期初始化函数，输入 `resume` 即可继续执行。
 
 ---
 

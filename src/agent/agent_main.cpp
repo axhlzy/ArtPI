@@ -5,6 +5,7 @@
 #include "agent_net.h"
 #include "agent_js.h"
 #include "agent_common.h"
+#include "agent_hw_hook.h"
 #include "../../include/ArtPI.h"
 
 #include <pthread.h>
@@ -217,13 +218,51 @@ artpi::msgpack::Value HandleClientCommand(const artpi::msgpack::Value& req) {
 void* AgentThreadEntry(void*) {
     AG_LOGI("AgentThreadEntry: start (tid=%d)", gettid());
 
-    // 1. Initialize QuickJS Runtime & Bindings immediately (without blocking on JNI/ART locks).
-    //    JavaVM / PI::init / ClassLoader are lazily initialized on the first GetEnv() call.
-    AG_LOGI("AgentThreadEntry: InitJs ...");
-    bool jsOk = artpi::agent::InitJs(nullptr);
-    AG_LOGI("AgentThreadEntry: InitJs -> %d", jsOk ? 1 : 0);
+    // 0. Auto-arm boot dlopen monitor if requested before any app libraries load
+    {
+        char cmdline[256] = {0};
+        int fdCmd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+        if (fdCmd >= 0) {
+            read(fdCmd, cmdline, sizeof(cmdline) - 1);
+            close(fdCmd);
+        }
+        std::string pkg(cmdline);
+        std::vector<std::string> tryPaths;
+        if (!pkg.empty()) {
+            tryPaths.push_back("/data/data/" + pkg + "/artpi_boot.cfg");
+            tryPaths.push_back("/data/user/0/" + pkg + "/artpi_boot.cfg");
+        }
+        tryPaths.push_back("/data/local/tmp/artpi_boot.cfg");
 
-    // 2. Start Agent NetServer (MessagePack over TCP / AF_UNIX) immediately
+        for (const auto& path : tryPaths) {
+            int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                char buf[512] = {0};
+                ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                close(fd);
+                unlink(path.c_str());
+                if (n > 0) {
+                    std::string c(buf);
+                    bool libLog = (c.find("libLog=1") != std::string::npos);
+                    std::string stopLib;
+                    size_t p = c.find("stopLib=");
+                    if (p != std::string::npos) {
+                        size_t end = c.find('\n', p);
+                        stopLib = c.substr(p + 8, (end == std::string::npos) ? std::string::npos : (end - (p + 8)));
+                    }
+                    if (libLog || !stopLib.empty()) {
+                        AG_LOGI("AgentThreadEntry: Early boot dlopen monitor armed from %s (stopLib='%s', libLog=%d)",
+                                path.c_str(), stopLib.c_str(), libLog ? 1 : 0);
+                        artpi::agent::SetupDlopenHwMonitor(stopLib, libLog);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // 1. Start Agent NetServer (MessagePack over TCP / AF_UNIX) immediately
+    //    so the injector can discover and connect to endpoint without any delay!
     AG_LOGI("AgentThreadEntry: StartServer ...");
     bool srvOk = artpi::agent::StartServer(HandleClientCommand);
     for (int i = 0; i < 60; ++i) {
@@ -234,6 +273,11 @@ void* AgentThreadEntry(void*) {
     const char* unixName = artpi::agent::GetUnixSocketName();
     AG_LOGI("AgentThreadEntry: StartServer -> %d, tcp_port=%d, unix=%s",
             srvOk ? 1 : 0, artpi::agent::GetServerPort(), unixName ? unixName : "(none)");
+
+    // 2. Initialize QuickJS Runtime & Bindings
+    AG_LOGI("AgentThreadEntry: InitJs ...");
+    bool jsOk = artpi::agent::InitJs(nullptr);
+    AG_LOGI("AgentThreadEntry: InitJs -> %d", jsOk ? 1 : 0);
 
     return nullptr;
 }

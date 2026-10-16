@@ -189,6 +189,16 @@ uint32_t HwHookManager::attach(const HwHookConfig& config) {
 
     std::lock_guard<std::mutex> lk(mutex_);
 
+    for (auto& s : sessions_) {
+        if (s->active && s->config.address == config.address && s->config.type == config.type) {
+            HW_LOGW("attach: session #%u already active on addr=0x%lx, reusing slot %d",
+                    s->id, (unsigned long)config.address, s->assigned_slot);
+            s->config.on_hit = config.on_hit;
+            if (!config.tag.empty()) s->config.tag = config.tag;
+            return s->id;
+        }
+    }
+
     int slot = allocateSlot(config.type, config.slot);
     if (slot < 0) {
         HW_LOGE("attach failed: no free hardware debug slot (type=%d, requested=%d)",
@@ -303,6 +313,14 @@ bool HwHookManager::isSessionActive(uint32_t id) const {
         if (s->id == id && s->active) return true;
     }
     return false;
+}
+
+void HwHookManager::getSlotStatus(bool out_bp[4], bool out_wp[4]) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (int i = 0; i < 4; i++) {
+        if (out_bp) out_bp[i] = bp_slots_[i];
+        if (out_wp) out_wp[i] = wp_slots_[i];
+    }
 }
 
 int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {

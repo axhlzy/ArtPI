@@ -22,8 +22,17 @@ struct LoadedModuleInfo {
 
 void RegisterNativeApis(JSContext* ctx, JSValue global, JSValue native);
 
+struct NativeHookInfo {
+    size_t id;
+    uintptr_t address;
+    std::string target;
+};
+
 // Unhook every active native hook; returns the number removed. (Used by `D()`.)
 size_t NativeUnhookAllCount();
+
+// Query all active native inline hooks
+std::vector<NativeHookInfo> NativeHookListAll();
 
 // Module & Symbol enumeration across all Android namespaces & /proc/self/maps
 std::vector<LoadedModuleInfo> EnumerateAllLoadedModules();

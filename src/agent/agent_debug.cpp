@@ -1704,6 +1704,23 @@ size_t DebugDetachAll() {
     return n;
 }
 
+std::vector<DebugBpInfo> DebugBpListAll() {
+    std::lock_guard<std::mutex> lk(g_bpMutex);
+    std::vector<DebugBpInfo> res;
+    for (const auto& bp : g_activeBreakpoints) {
+        if (bp.is_active) {
+            uintptr_t addr = 0;
+            if (bp.java_handle.isHooked()) {
+                addr = reinterpret_cast<uintptr_t>(bp.java_handle.getArtMethod());
+            } else if (bp.location.rfind("0x", 0) == 0) {
+                addr = std::strtoull(bp.location.c_str(), nullptr, 16);
+            }
+            res.push_back({ static_cast<int>(bp.id), bp.location, addr });
+        }
+    }
+    return res;
+}
+
 bool BreakpointClearByArtMethod(void* artMethod) {
     std::lock_guard<std::mutex> lk(g_bpMutex);
     bool done = false;
