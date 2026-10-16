@@ -27,6 +27,8 @@ set(INJECTOR_SOURCES
 
 add_executable(artpi-cli ${INJECTOR_SOURCES})
 
+target_link_libraries(artpi-cli PRIVATE dl)
+
 target_include_directories(artpi-cli PRIVATE
     .
     ../../engine/mpack

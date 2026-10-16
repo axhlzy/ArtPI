@@ -39,4 +39,15 @@ pid_t FindPidByPackageName(const std::string& pkgName);
 // Resolve the foreground (top-resumed Activity) app's PID, package name, and activity component.
 bool FindTopActivityApp(pid_t& outPid, std::string& outPkg, std::string& outActivity);
 
+// Return TracerPid from /proc/<pid>/status (0 if not traced, >0 if traced by another process).
+pid_t GetTracerPid(pid_t pid);
+
+// True once /proc/<pid>/attr/current has left the "zygote" SELinux domain.
+bool IsAppSpecialized(pid_t pid);
+
+// Force-stop pkgName, launch its main Activity, catch the new process at birth
+// (via LOG_ID_EVENTS am_proc_start + /proc fast poll), and wait until specialized.
+bool SpawnAndWatchPackage(const std::string& pkgName, pid_t& outPid, std::string& err);
+
+
 

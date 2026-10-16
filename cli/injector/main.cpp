@@ -29,6 +29,8 @@ namespace {
         std::string libPath;
         std::string evalScript;
         bool topActivity = false;
+        bool spawnMode = false;
+        bool noPtrace = false;
         bool serverMode = false;
     };
 
@@ -41,7 +43,9 @@ namespace {
             "options:\n"
             "  -P, --pid <pid>      Target process PID\n"
             "  -k, --pkg <name>     Target package name (e.g. com.example.app)\n"
+            "  -S, --spawn [<pkg>]  Force-stop, launch app, and inject at startup specialization\n"
             "  -t, --top            Attach to the foreground (top Activity) app\n"
+            "  --no-ptrace          Inject via /proc/<pid>/mem without ptrace (auto-enabled if TracerPid != 0)\n"
             "  -e, --eval <script>  Evaluate a JavaScript expression and exit\n"
             "  -f, --file <path>    Execute a JavaScript file and exit\n"
             "  --lib <path>         Use external libartpi_agent.so instead of embedded payload\n"
@@ -155,11 +159,10 @@ namespace {
         }
 
         struct stat procSt{};
-        if (stat(("/proc/" + std::to_string(pid)).c_str(), &procSt) != 0) {
-            err = "cannot stat /proc/" + std::to_string(pid) + ": " + strerror(errno);
-            return false;
+        unsigned long userId = 0;
+        if (pid > 0 && stat(("/proc/" + std::to_string(pid)).c_str(), &procSt) == 0) {
+            userId = (unsigned long) procSt.st_uid / 100000UL;
         }
-        unsigned long userId = (unsigned long) procSt.st_uid / 100000UL;
         std::string dir = "/data/user/" + std::to_string(userId) + "/" + pkg;
 
         struct stat dirSt{};
@@ -279,7 +282,14 @@ int main(int argc, char **argv) {
         if (a == "-h" || a == "--help") { Usage(argv[0]); return 0; }
         else if (a == "-P" || a == "--pid") opt.pid = atoi(needValue("-P/--pid"));
         else if (a == "-k" || a == "--pkg") opt.pkgName = needValue("-k/--pkg");
+        else if (a == "-S" || a == "--spawn") {
+            opt.spawnMode = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                opt.pkgName = argv[++i];
+            }
+        }
         else if (a == "-t" || a == "--top") opt.topActivity = true;
+        else if (a == "--no-ptrace") opt.noPtrace = true;
         else if (a == "-e" || a == "--eval") opt.evalScript = needValue("-e/--eval");
         else if (a == "-f" || a == "--file") {
             const char* path = needValue("-f/--file");
@@ -298,6 +308,11 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "unknown option: %s (try --help)\n", a.c_str()); return 2; }
     }
 
+    if (getuid() != 0) {
+        fprintf(stderr, "[!] must run as root (su -c '%s ...')\n", argv[0]);
+        return 1;
+    }
+
     if (opt.topActivity && opt.pid <= 0 && opt.pkgName.empty()) {
         pid_t topPid = -1;
         std::string topPkg, topAct;
@@ -312,13 +327,47 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (opt.pid <= 0 && !opt.pkgName.empty()) {
+    std::vector<uint8_t> preExtractedPayload;
+    std::string preDeployedSoPath;
+
+    if (opt.spawnMode) {
+        if (opt.pkgName.empty()) {
+            fprintf(stderr, "[!] -S/--spawn requires a package name (-S <pkg> or -k <pkg>)\n");
+            return 1;
+        }
+        // Pre-extract and pre-deploy libartpi_agent.so BEFORE spawning the app
+        // so that zero time is wasted on XZ decompression/disk I/O after process birth!
+        std::string preErr;
+        bool ok = opt.libPath.empty() ? ExtractEmbeddedPayload(preExtractedPayload, preErr, "PPAYLOAD")
+                                      : ReadFileAll(opt.libPath, preExtractedPayload, preErr);
+        if (!ok) {
+            fprintf(stderr, "[!] payload extraction failed: %s\n", preErr.c_str());
+            return 1;
+        }
+        std::string dataDir, dataErr;
+        if (ResolveAppDataDir(0, opt.pkgName, dataDir, dataErr)) {
+            if (DeployPayload(dataDir, dataDir, preExtractedPayload, preDeployedSoPath, preErr)) {
+                printf("[+] pre-deployed payload -> %s (%zu bytes)\n",
+                       preDeployedSoPath.c_str(), preExtractedPayload.size());
+            }
+        }
+
+        pid_t spawnedPid = -1;
+        std::string spawnErr;
+        if (!SpawnAndWatchPackage(opt.pkgName, spawnedPid, spawnErr)) {
+            fprintf(stderr, "[!] spawn failed: %s\n", spawnErr.c_str());
+            return 1;
+        }
+        opt.pid = spawnedPid;
+        printf("[+] caught spawned package '%s' right after zygote specialize -> PID %d\n",
+               opt.pkgName.c_str(), opt.pid);
+    } else if (opt.pid <= 0 && !opt.pkgName.empty()) {
         pid_t resolved = FindPidByPackageName(opt.pkgName);
         if (resolved > 0) {
             opt.pid = resolved;
             printf("[*] resolved package '%s' -> PID %d\n", opt.pkgName.c_str(), opt.pid);
         } else {
-            fprintf(stderr, "[!] cannot find running process for package '%s'\n", opt.pkgName.c_str());
+            fprintf(stderr, "[!] cannot find running process for package '%s' (use -S to spawn it)\n", opt.pkgName.c_str());
             return 1;
         }
     }
@@ -328,17 +377,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (getuid() != 0) {
-        fprintf(stderr, "[!] must run as root (su -c '%s ...')\n", argv[0]);
-        return 1;
-    }
-
     // 1. Check if an agent is already running for this target (AF_UNIX preferred,
     //    then TCP 20700..20800). If found, attach directly without re-injecting!
     int alivePid = 0;
     std::string alivePkg;
     artpi::injector::AgentEndpoint ep;
-    if (artpi::injector::DiscoverAgent(opt.pid, opt.pkgName, 20700, 20800, ep, alivePid, alivePkg)) {
+    if (!opt.spawnMode && artpi::injector::DiscoverAgent(opt.pid, opt.pkgName, 20700, 20800, ep, alivePid, alivePkg)) {
         printf("[*] Found active ArtPI Agent at %s (PID: %d, Package: %s)\n",
                artpi::injector::DescribeEndpoint(ep).c_str(), alivePid, alivePkg.c_str());
         HandleConnectedSession(ep, opt);
@@ -362,55 +406,72 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    std::vector<uint8_t> payload;
+    std::vector<uint8_t> payload = std::move(preExtractedPayload);
     std::string err;
-    bool ok = opt.libPath.empty() ? ExtractEmbeddedPayload(payload, err, "PPAYLOAD")
-                                  : ReadFileAll(opt.libPath, payload, err);
-    if (!ok) {
-        fprintf(stderr, "[!] payload extraction failed: %s\n", err.c_str());
-        return 1;
-    }
-    printf("[*] payload ready (%zu bytes)\n", payload.size());
-
-    // apkPath is only used to pick the linker-namespace caller (base.apk mapping).
-    std::string libDir, apkPath;
-    if (!FindAppLibDir(opt.pid, opt.pkgName, libDir, apkPath)) {
-        fprintf(stderr, "[!] cannot find app apk mapping for pid %d\n", opt.pid);
-        return 1;
-    }
-
-    // Deploy the agent into the app's PRIVATE DATA DIR rather than the apk's
-    // lib/ directory. Apps installed incrementally (Google Play incremental
-    // install -> incremental-fs) expose /data/app/<pkg> as a read-only mount, so
-    // writing libartpi_agent.so there fails with EACCES even as root. The data
-    // dir is writable, owned by the app uid, and lies within the app linker
-    // namespace's permitted paths, so dlopen of the absolute path still resolves
-    // inside the app's namespace (caller = base.apk mapping).
-    std::string deployedSoPath;
-    bool deployed = false;
-    std::string dataDir;
-    std::string dataErr;
-    if (ResolveAppDataDir(opt.pid, opt.pkgName, dataDir, dataErr)) {
-        if (DeployPayload(dataDir, dataDir, payload, deployedSoPath, err)) {
-            deployed = true;
-        } else {
-            fprintf(stderr, "[i] deploy to app data dir failed (%s), falling back to lib dir\n", err.c_str());
+    if (payload.empty() && preDeployedSoPath.empty()) {
+        bool ok = opt.libPath.empty() ? ExtractEmbeddedPayload(payload, err, "PPAYLOAD")
+                                      : ReadFileAll(opt.libPath, payload, err);
+        if (!ok) {
+            fprintf(stderr, "[!] payload extraction failed: %s\n", err.c_str());
+            return 1;
         }
-    } else {
-        fprintf(stderr, "[i] %s, falling back to lib dir\n", dataErr.c_str());
+        printf("[*] payload ready (%zu bytes)\n", payload.size());
     }
-    if (!deployed && !DeployPayload(libDir, apkPath, payload, deployedSoPath, err)) {
-        fprintf(stderr, "[!] deploy failed: %s\n", err.c_str());
-        return 1;
-    }
-    printf("[+] deployed payload -> %s\n", deployedSoPath.c_str());
 
-    printf("[*] injecting libartpi_agent.so via ptrace into pid %d ...\n", opt.pid);
+    // apkPath is used to pick the linker-namespace caller (base.apk mapping) when available.
+    std::string libDir, apkPath;
+    FindAppLibDir(opt.pid, opt.pkgName, libDir, apkPath);
+
+    std::string deployedSoPath = preDeployedSoPath;
+    bool deployed = !deployedSoPath.empty();
+    if (!deployed) {
+        std::string dataDir;
+        std::string dataErr;
+        if (ResolveAppDataDir(opt.pid, opt.pkgName, dataDir, dataErr)) {
+            if (DeployPayload(dataDir, dataDir, payload, deployedSoPath, err)) {
+                deployed = true;
+            } else {
+                fprintf(stderr, "[i] deploy to app data dir failed (%s), falling back to lib dir\n", err.c_str());
+            }
+        } else {
+            fprintf(stderr, "[i] %s, falling back to lib dir\n", dataErr.c_str());
+        }
+        if (!deployed) {
+            if (libDir.empty() || !DeployPayload(libDir, apkPath, payload, deployedSoPath, err)) {
+                fprintf(stderr, "[!] deploy failed: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        printf("[+] deployed payload -> %s\n", deployedSoPath.c_str());
+    }
+
     size_t lastSlash = apkPath.rfind('/');
     std::string apkPrefix = (lastSlash != std::string::npos) ? apkPath.substr(0, lastSlash + 1) : "";
 
+    pid_t tracerPid = GetTracerPid(opt.pid);
+    bool useNoPtrace = opt.noPtrace;
+    if (!useNoPtrace && tracerPid > 0) {
+        printf("[!] Target PID %d is already traced (TracerPid=%d), auto-switching to --no-ptrace (/proc/mem) mode...\n",
+               opt.pid, (int) tracerPid);
+        useNoPtrace = true;
+    }
+
     err.clear();
-    if (!InjectLibrary(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err)) {
+    bool injOk = false;
+    if (useNoPtrace) {
+        printf("[*] injecting libartpi_agent.so via /proc/%d/mem (no-ptrace) ...\n", opt.pid);
+        injOk = InjectLibraryNoPtrace(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err);
+    } else {
+        printf("[*] injecting libartpi_agent.so via ptrace (SEIZE) into pid %d ...\n", opt.pid);
+        injOk = InjectLibrary(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err);
+        if (!injOk && err.find("PTRACE_") != std::string::npos) {
+            printf("[!] ptrace attach failed (%s), falling back to --no-ptrace (/proc/mem) mode...\n", err.c_str());
+            err.clear();
+            injOk = InjectLibraryNoPtrace(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err);
+        }
+    }
+
+    if (!injOk) {
         fprintf(stderr, "[!] inject failed: %s\n", err.c_str());
         return 1;
     }
@@ -420,8 +481,8 @@ int main(int argc, char **argv) {
     // Connect to newly spawned Agent (AF_UNIX preferred, then TCP scan)
     printf("[*] waiting for agent endpoint...\n");
     bool found = false;
-    for (int retry = 0; retry < 40; retry++) {
-        usleep(150 * 1000);
+    for (int retry = 0; retry < 150; retry++) {
+        usleep(30 * 1000);
         if (artpi::injector::DiscoverAgent(opt.pid, opt.pkgName, 20700, 20800, ep, alivePid, alivePkg)) {
             found = true;
             break;

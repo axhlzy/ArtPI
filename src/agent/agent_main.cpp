@@ -79,11 +79,13 @@ artpi::msgpack::Value HandleClientCommand(const artpi::msgpack::Value& req) {
 
 void* AgentThreadEntry(void*) {
     AG_LOGI("AgentThreadEntry: start (tid=%d)", gettid());
-    // 1. Wait a moment for caller dlopen completion
-    usleep(200 * 1000);
-
-    // 2. Resolve JavaVM & JNIEnv
-    JavaVM* vm = FindJavaVM();
+    // 1. Resolve JavaVM & JNIEnv (poll briefly in case of very early spawn injection)
+    JavaVM* vm = nullptr;
+    for (int i = 0; i < 50; ++i) {
+        vm = FindJavaVM();
+        if (vm) break;
+        usleep(10 * 1000);
+    }
     AG_LOGI("AgentThreadEntry: FindJavaVM -> %p", (void*) vm);
     JNIEnv* env = nullptr;
     if (vm) {
@@ -103,10 +105,14 @@ void* AgentThreadEntry(void*) {
     bool jsOk = artpi::agent::InitJs(env);
     AG_LOGI("AgentThreadEntry: InitJs -> %d", jsOk ? 1 : 0);
 
-    // 5. Start Agent NetServer (MessagePack over TCP)
+    // 5. Start Agent NetServer (MessagePack over TCP / AF_UNIX)
     AG_LOGI("AgentThreadEntry: StartServer ...");
     bool srvOk = artpi::agent::StartServer(HandleClientCommand);
-    usleep(300 * 1000);   // let ServerWorker bind before reporting
+    for (int i = 0; i < 60; ++i) {
+        const char* u = artpi::agent::GetUnixSocketName();
+        if (artpi::agent::GetServerPort() > 0 || (u && *u)) break;
+        usleep(5 * 1000);
+    }
     const char* unixName = artpi::agent::GetUnixSocketName();
     AG_LOGI("AgentThreadEntry: StartServer -> %d, tcp_port=%d, unix=%s",
             srvOk ? 1 : 0, artpi::agent::GetServerPort(), unixName ? unixName : "(none)");
