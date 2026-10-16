@@ -9,6 +9,7 @@
 #include <link.h>
 #include <dlfcn.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <iomanip>

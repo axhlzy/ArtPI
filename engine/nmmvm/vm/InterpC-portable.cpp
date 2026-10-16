@@ -2,6 +2,7 @@
 // Created by mao on 20-7-28.
 //
 
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <jni.h>

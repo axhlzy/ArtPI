@@ -6,6 +6,8 @@
 #define PINE_EXTRAS_H
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include "arch/arch.h"
 #include "utils/macros.h"
 

@@ -22,6 +22,8 @@
 #include <unwind.h>
 #include <dlfcn.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 using namespace pine;
 
@@ -210,6 +212,12 @@ bool PineNative_HookReplace(JNIEnv* env, jclass clazz, const char* methodName, c
 
 jobject PineNative_ToJObject(JNIEnv* env, void* art_obj) {
     if (!env || !art_obj) return nullptr;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(art_obj);
+    // ART mirror::Object* lives in the 32-bit compressed heap (< 4GB, 8-byte aligned).
+    // Reject non-heap pointers (e.g. stray ArtMethod* or uninitialized high bits).
+    if (addr < 0x10000ULL || addr >= 0x100000000ULL || (addr & 0x7ULL) != 0) {
+        return nullptr;
+    }
     art::Thread* thread = art::Thread::Current(env);
     if (!thread) {
         LOGE("PineNative_ToJObject: Failed to get current art::Thread");
@@ -355,13 +363,19 @@ ArgProxy::operator bool() const {
 }
 
 ArgProxy::operator double() const {
-    if (index_ >= 0 && index_ < 8) return frame_->ctx->d[index_];
-    return 0.0;
+    if (index_ < 0) return 0.0;
+    uint64_t raw = frame_->getArgRaw(index_);
+    double dv = 0.0;
+    std::memcpy(&dv, &raw, sizeof(dv));
+    return dv;
 }
 
 ArgProxy::operator float() const {
-    if (index_ >= 0 && index_ < 8) return static_cast<float>(frame_->ctx->d[index_]);
-    return 0.0f;
+    if (index_ < 0) return 0.0f;
+    uint64_t raw = frame_->getArgRaw(index_);
+    double dv = 0.0;
+    std::memcpy(&dv, &raw, sizeof(dv));
+    return static_cast<float>(dv);
 }
 
 ArgProxy::operator void*() const {
@@ -394,12 +408,21 @@ ArgProxy& ArgProxy::operator=(bool val) {
 }
 
 ArgProxy& ArgProxy::operator=(double val) {
-    if (index_ >= 0 && index_ < 8) frame_->ctx->d[index_] = val;
+    if (index_ >= 0) {
+        uint64_t raw = 0;
+        std::memcpy(&raw, &val, sizeof(raw));
+        frame_->setArgRaw(index_, raw);
+    }
     return *this;
 }
 
 ArgProxy& ArgProxy::operator=(float val) {
-    if (index_ >= 0 && index_ < 8) frame_->ctx->d[index_] = static_cast<double>(val);
+    if (index_ >= 0) {
+        double dv = static_cast<double>(val);
+        uint64_t raw = 0;
+        std::memcpy(&raw, &dv, sizeof(raw));
+        frame_->setArgRaw(index_, raw);
+    }
     return *this;
 }
 
@@ -510,19 +533,80 @@ jobject CallFrame::getThisObject() const {
     return PineNative_ToJObject(env, reinterpret_cast<void*>(ctx->r[1]));
 }
 
+namespace {
+struct ArtArgSlot {
+    enum Kind { kGpReg, kFpReg, kStack } kind;
+    size_t reg_idx;       // x1..x7 or d0..d7
+    size_t stack_offset;  // byte offset from entry SP (sp + 8 + vreg * 4)
+    char type_ch;         // first char of JNI type descriptor
+    bool is_wide;         // 'J' or 'D' (8 bytes on stack, 2 vregs)
+};
+
+// Compute ART ARM64 Quick/Nterp ABI location for parameter `index`:
+// - [sp + 0] is reserved for the callee ArtMethod* header (8 bytes). Reading
+//   `((uint64_t*)sp)[0]` for stack-spilled arguments (e.g. the 7th parameter of
+//   an instance method) mistakenly picks up a stale ArtMethod* on the stack and
+//   causes SIGSEGV in `nterp1_op_invoke_interface` when forwarded via JNI.
+// - [sp + 8] onwards holds Dalvik vreg out-slots (4 bytes per vreg; 'J'/'D'
+//   span 2 vregs = 8 bytes). For instance methods, `this` occupies the first
+//   4-byte vreg slot at [sp + 8], so argument 0 starts at [sp + 12].
+// - Floating-point args ('F'/'D') allocate d0..d7 independently of GP regs.
+// - Non-FP args allocate x1..x7 (x1 = `this` for instance methods, so args start at x2).
+// - Once a register file is exhausted, the argument is read from/written to its
+//   stack slot at [sp + stack_offset] (32-bit compressed reference for 'L'/'[').
+ArtArgSlot ComputeArtArgSlot(const CallFrame& frame, int index) {
+    size_t gp_idx = frame.is_static ? 1 : 2;
+    size_t fp_idx = 0;
+    size_t stack_off = 8 + (frame.is_static ? 0 : 4);
+    for (int i = 0; i <= index; ++i) {
+        char t = (i < static_cast<int>(frame.arg_types.size()) && !frame.arg_types[i].empty())
+                     ? frame.arg_types[i][0]
+                     : 'I';
+        bool wide = (t == 'J' || t == 'D');
+        bool fp = (t == 'F' || t == 'D');
+        ArtArgSlot slot{};
+        slot.type_ch = t;
+        slot.is_wide = wide;
+        slot.stack_offset = stack_off;
+        if (fp) {
+            if (fp_idx < 8) {
+                slot.kind = ArtArgSlot::kFpReg;
+                slot.reg_idx = fp_idx++;
+            } else {
+                slot.kind = ArtArgSlot::kStack;
+                slot.reg_idx = 0;
+            }
+        } else {
+            if (gp_idx <= 7) {
+                slot.kind = ArtArgSlot::kGpReg;
+                slot.reg_idx = gp_idx++;
+            } else {
+                slot.kind = ArtArgSlot::kStack;
+                slot.reg_idx = 0;
+            }
+        }
+        stack_off += wide ? 8 : 4;
+        if (i == index) return slot;
+    }
+    return {ArtArgSlot::kStack, 0, 8, 'I', false};
+}
+} // namespace
+
 jobject CallFrame::getArg(int index) const {
     if (!env || index < 0 || index >= arg_count) return nullptr;
     if (!isArgObject(index)) return nullptr;
-    size_t reg_idx = is_static ? (1 + index) : (2 + index);
-    void* art_obj = nullptr;
-    if (reg_idx <= 7) {
-        art_obj = reinterpret_cast<void*>(ctx->r[reg_idx]);
+    ArtArgSlot slot = ComputeArtArgSlot(*this, index);
+    uintptr_t raw_obj = 0;
+    if (slot.kind == ArtArgSlot::kGpReg) {
+        raw_obj = static_cast<uintptr_t>(ctx->r[slot.reg_idx] & 0xFFFFFFFFULL);
     } else {
-        size_t stack_idx = reg_idx - 8;
-        uint64_t* sp_ptr = reinterpret_cast<uint64_t*>(ctx->sp);
-        art_obj = reinterpret_cast<void*>(sp_ptr[stack_idx]);
+        // Object references on the ART stack are 32-bit compressed references (vreg = 4B).
+        const uint8_t* sp_bytes = reinterpret_cast<const uint8_t*>(ctx->sp);
+        uint32_t cref = 0;
+        std::memcpy(&cref, sp_bytes + slot.stack_offset, sizeof(uint32_t));
+        raw_obj = static_cast<uintptr_t>(cref);
     }
-    return PineNative_ToJObject(env, art_obj);
+    return PineNative_ToJObject(env, reinterpret_cast<void*>(raw_obj));
 }
 
 void CallFrame::setArg(int index, jobject arg) {
@@ -533,49 +617,53 @@ void CallFrame::setArg(int index, jobject arg) {
 
 uint64_t CallFrame::getArgRaw(int index) const {
     if (index < 0 || index >= arg_count) return 0;
-    // Floating point args are passed in the d register file (d0..d7), indexed by
-    // argument position (same convention as ArgProxy).
-    if (index < static_cast<int>(arg_types.size())) {
-        char t = arg_types[index].empty() ? 'I' : arg_types[index][0];
-        if (t == 'F' || t == 'D') {
-            if (index < 8) {
-                uint64_t raw;
-                double dv = ctx->d[index];
-                std::memcpy(&raw, &dv, sizeof(raw));
-                return raw;
-            }
-        }
+    ArtArgSlot slot = ComputeArtArgSlot(*this, index);
+    if (slot.kind == ArtArgSlot::kFpReg) {
+        uint64_t raw = 0;
+        double dv = ctx->d[slot.reg_idx];
+        std::memcpy(&raw, &dv, sizeof(raw));
+        return raw;
     }
-    size_t reg_idx = is_static ? (1 + index) : (2 + index);
-    if (reg_idx <= 7) {
-        return ctx->r[reg_idx];
+    if (slot.kind == ArtArgSlot::kGpReg) {
+        if (slot.type_ch == 'L' || slot.type_ch == '[') {
+            return ctx->r[slot.reg_idx] & 0xFFFFFFFFULL;
+        }
+        return ctx->r[slot.reg_idx];
+    }
+    const uint8_t* sp_bytes = reinterpret_cast<const uint8_t*>(ctx->sp);
+    if (slot.is_wide) {
+        uint64_t val = 0;
+        std::memcpy(&val, sp_bytes + slot.stack_offset, sizeof(uint64_t));
+        return val;
     } else {
-        size_t stack_idx = reg_idx - 8;
-        uint64_t* sp_ptr = reinterpret_cast<uint64_t*>(ctx->sp);
-        return sp_ptr[stack_idx];
+        uint32_t val32 = 0;
+        std::memcpy(&val32, sp_bytes + slot.stack_offset, sizeof(uint32_t));
+        if (slot.type_ch == 'I') return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(val32)));
+        if (slot.type_ch == 'S') return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(val32)));
+        if (slot.type_ch == 'B') return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(val32)));
+        return static_cast<uint64_t>(val32);
     }
 }
 
 void CallFrame::setArgRaw(int index, uint64_t val) {
     if (index < 0 || index >= arg_count) return;
-    if (index < static_cast<int>(arg_types.size())) {
-        char t = arg_types[index].empty() ? 'I' : arg_types[index][0];
-        if (t == 'F' || t == 'D') {
-            if (index < 8) {
-                double dv;
-                std::memcpy(&dv, &val, sizeof(dv));
-                ctx->d[index] = dv;
-                return;
-            }
-        }
+    ArtArgSlot slot = ComputeArtArgSlot(*this, index);
+    uint8_t* sp_bytes = reinterpret_cast<uint8_t*>(ctx->sp);
+    if (slot.kind == ArtArgSlot::kFpReg) {
+        double dv;
+        std::memcpy(&dv, &val, sizeof(dv));
+        ctx->d[slot.reg_idx] = dv;
+        return;
     }
-    size_t reg_idx = is_static ? (1 + index) : (2 + index);
-    if (reg_idx <= 7) {
-        ctx->r[reg_idx] = val;
+    if (slot.kind == ArtArgSlot::kGpReg) {
+        ctx->r[slot.reg_idx] = val;
+    }
+    // Always mirror into stack slot as well so both nterp and quick code see updated value
+    if (slot.is_wide) {
+        std::memcpy(sp_bytes + slot.stack_offset, &val, sizeof(uint64_t));
     } else {
-        size_t stack_idx = reg_idx - 8;
-        uint64_t* sp_ptr = reinterpret_cast<uint64_t*>(ctx->sp);
-        sp_ptr[stack_idx] = val;
+        uint32_t val32 = static_cast<uint32_t>(val);
+        std::memcpy(sp_bytes + slot.stack_offset, &val32, sizeof(uint32_t));
     }
 }
 
@@ -731,7 +819,9 @@ std::string CallFrame::getArgString(int index) const {
             return std::string(1, c);
         }
         if (type == "D" || type == "F") {
-            double dv = (index < 8) ? ctx->d[index] : 0.0;
+            uint64_t raw = getArgRaw(index);
+            double dv = 0.0;
+            std::memcpy(&dv, &raw, sizeof(dv));
             char buf[48];
             snprintf(buf, sizeof(buf), "%g", dv);
             return std::string(buf);
@@ -851,8 +941,18 @@ jobject CallFrame::invokeOriginalInternal() {
                 if (t == 'I' || t == 'S' || t == 'B' || t == 'C') jargs[i].i = static_cast<jint>(getArgRaw(i));
                 else if (t == 'Z') jargs[i].z = static_cast<jboolean>(getArgRaw(i));
                 else if (t == 'J') jargs[i].j = static_cast<jlong>(getArgRaw(i));
-                else if (t == 'F') jargs[i].f = static_cast<jfloat>(ctx->d[i]);
-                else if (t == 'D') jargs[i].d = ctx->d[i];
+                else if (t == 'F') {
+                    uint64_t raw = getArgRaw(i);
+                    double dv = 0.0;
+                    std::memcpy(&dv, &raw, sizeof(dv));
+                    jargs[i].f = static_cast<jfloat>(dv);
+                }
+                else if (t == 'D') {
+                    uint64_t raw = getArgRaw(i);
+                    double dv = 0.0;
+                    std::memcpy(&dv, &raw, sizeof(dv));
+                    jargs[i].d = dv;
+                }
                 else jargs[i].j = static_cast<jlong>(getArgRaw(i));
             } else {
                 jargs[i].j = static_cast<jlong>(getArgRaw(i));

@@ -514,77 +514,30 @@ bool init(JNIEnv* env) {
 // ===========================================================================
 namespace {
 
-// ARM64 AAPCS mapping: x0 = ArtMethod*, x1 = this (instance) / arg0 (static);
-// d0-d7 are allocated INDEPENDENTLY for float/double; spill goes to the stack.
-struct ArgLoc {
-    enum Kind { XReg, DReg, Stack } kind;
-    int slot;
-};
-
-std::vector<ArgLoc> mapCallFrameArgs(const pine_native::CallFrame& frame) {
-    std::vector<ArgLoc> locs;
-    int xr = frame.is_static ? 1 : 2;
-    int dr = 0;
-    int st = 0;
-    for (const auto& t : frame.arg_types) {
-        char c = t.empty() ? 'I' : t[0];
-        if (c == 'F' || c == 'D') {
-            if (dr < 8) locs.push_back({ArgLoc::DReg, dr++});
-            else        locs.push_back({ArgLoc::Stack, st++});
-        } else {
-            if (xr <= 7) locs.push_back({ArgLoc::XReg, xr++});
-            else         locs.push_back({ArgLoc::Stack, st++});
-        }
-    }
-    return locs;
-}
-
-uint64_t readArgRaw(const pine_native::CallFrame& f, const ArgLoc& l) {
-    switch (l.kind) {
-        case ArgLoc::XReg:
-            return f.ctx->r[l.slot];
-        case ArgLoc::DReg: {
-            double d = f.ctx->d[l.slot];
-            uint64_t u;
-            std::memcpy(&u, &d, 8);
-            return u;
-        }
-        case ArgLoc::Stack:
-        default: {
-            // The public ArtPI.h PineNativeContext lacks the trailing `sp`
-            // field; the dispatcher-provided object is the full layout
-            // (r[31], d[32], sp) - probe it with a prefix-compatible mirror.
-            struct CtxWithSp { uint64_t r[31]; double d[32]; uint64_t sp; };
-            const auto* full = reinterpret_cast<const CtxWithSp*>(f.ctx);
-            return reinterpret_cast<const uint64_t*>(full->sp)[l.slot];
-        }
-    }
-}
-
-// one jvalue per parameter, locations resolved through AAPCS
+// One jvalue per parameter, resolved through CallFrame::getArg / getArgRaw so
+// stack-spilled args (sp + 8 + vreg * 4, 32-bit compressed refs) and independent
+// FP registers (d0..d7) follow the exact ART ARM64 Quick/Nterp ABI layout.
 std::vector<jvalue> collectCallFrameArgs(const pine_native::CallFrame& frame) {
-    std::vector<ArgLoc> locs = mapCallFrameArgs(frame);
     std::vector<jvalue> out(static_cast<size_t>(frame.arg_count));
-    for (int i = 0; i < frame.arg_count && i < static_cast<int>(locs.size()); i++) {
+    for (int i = 0; i < frame.arg_count && i < static_cast<int>(frame.arg_types.size()); i++) {
         jvalue jv{};
         jv.j = 0;
         const std::string& t = frame.arg_types[static_cast<size_t>(i)];
         char c = t.empty() ? 'I' : t[0];
         if (c == 'L' || c == '[') {
-            // object args live as raw ART pointers in the context
-            jv.l = PineNative_ToJObject(frame.env,
-                                        reinterpret_cast<void*>(readArgRaw(frame, locs[static_cast<size_t>(i)])));
+            jv.l = frame.getArg(i);
         } else {
-            uint64_t raw = readArgRaw(frame, locs[static_cast<size_t>(i)]);
+            uint64_t raw = frame.getArgRaw(i);
             switch (c) {
                 case 'D': std::memcpy(&jv.d, &raw, 8); break;
                 case 'F': {
-                    uint32_t bits = static_cast<uint32_t>(raw & 0xffffffffu);
-                    std::memcpy(&jv.f, &bits, 4);
+                    double dv = 0.0;
+                    std::memcpy(&dv, &raw, 8);
+                    jv.f = static_cast<jfloat>(dv);
                     break;
                 }
                 case 'J': jv.j = static_cast<jlong>(raw); break;
-                case 'Z': jv.z = static_cast<jboolean>(raw); break;
+                case 'Z': jv.z = static_cast<jboolean>(raw ? JNI_TRUE : JNI_FALSE); break;
                 case 'C': jv.c = static_cast<jchar>(raw); break;
                 case 'B': jv.b = static_cast<jbyte>(raw); break;
                 case 'S': jv.s = static_cast<jshort>(raw); break;
