@@ -21,6 +21,12 @@ set(AGENT_SOURCES
     agent_net.cpp
     agent_common.cpp
     agent_java.cpp
+    agent_java_ref.cpp
+    agent_java_resolve.cpp
+    agent_java_decompile.cpp
+    agent_java_hook.cpp
+    agent_java_choose.cpp
+    agent_java_ui.cpp
     agent_native.cpp
     agent_memory.cpp
     agent_trace.cpp

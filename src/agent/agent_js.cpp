@@ -112,12 +112,20 @@ static const std::map<std::string, std::string> kApiDocs = {
      "Usage:\n"
      "  findAndHook(keyword [, onEnter, onLeave, maxHooks])\n"
      "  findAndHook(classPattern, methodPattern [, onEnter, onLeave, maxHooks])\n"
-     "  - Fast in-memory DEX search + batch ART method hook (case-insensitive substring/wildcard, '|' supported).\n"
+     "  - Fast in-memory DEX search + batch ART method hook (default maxHooks=50, '|' supported).\n"
+     "  - Use findAndHookAll(...) to hook all matching methods without any limit.\n"
      "  - Examples:\n"
      "      findAndHook(\"md5\")\n"
-     "      findAndHook(\"*encrypt*\", \"encrypt|decrypt\")\n"
-     "      findAndHook(\"com.cmccit.netmodule.CommonHttp\", \"encrypt|Header\")"},
+     "      findAndHook(\"md5\", 300)\n"
+     "      findAndHookAll(\"md5\")\n"
+     "      findAndHook(\"*encrypt*\", \"encrypt|decrypt\")"},
     {"findandhook", "Alias for findAndHook(...)"},
+    {"findAndHookAll",
+     "Usage:\n"
+     "  findAndHookAll(keyword [, onEnter, onLeave])\n"
+     "  findAndHookAll(classPattern, methodPattern [, onEnter, onLeave])\n"
+     "  - Hooks ALL matching methods across the app without any maxHooks cap."},
+    {"findandhookall", "Alias for findAndHookAll(...)"},
     {"choose",
      "Usage: choose(className, [callbacks])\n"
      "  - Scans active heap memory for live instances of the specified class (like Frida's Java.choose).\n"

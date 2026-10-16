@@ -246,7 +246,10 @@ const std::vector<std::string> kCompletions = {
     "jhook(",
     "findAndHook(",
     "findandhook(",
+    "findAndHookAll(",
+    "findandhookall(",
     "Java.findAndHook(",
+    "Java.findAndHookAll(",
     "nhook(",
     "unhook(",
     "unhookall()",
@@ -518,7 +521,7 @@ static std::vector<std::string> GetCandidatesForToken(const std::string& token) 
 
             // Java-domain top-level helpers (implemented directly on the java
             // root proxy, not real classes).
-            for (const char* special : {"dumpAllDex", "dumpalldex", "dumpDex", "findAndHook", "findandhook"}) {
+            for (const char* special : {"dumpAllDex", "dumpalldex", "dumpDex", "findAndHook", "findandhook", "findAndHookAll", "findandhookall"}) {
                 std::string cand = std::string("dynamic.java.") + special;
                 if (StartsWithIgnoreCase(cand, token)) results.push_back(cand);
             }

@@ -279,8 +279,13 @@ const char* kDynamicBootstrapJs = R"JS(
         //   cls.hookall(onEnter [, onLeave])
         //   cls.hookall("encrypt|Header" [, onEnter, onLeave])
         function hookAllMethods(arg0, arg1, arg2) {
-            if (typeof arg0 === 'string' && typeof Java.findAndHook === 'function') {
-                return Java.findAndHook(className, arg0, arg1, arg2);
+            if (typeof arg0 === 'string') {
+                if (typeof Java.findAndHookAll === 'function') {
+                    return Java.findAndHookAll(className, arg0, arg1, arg2);
+                }
+                if (typeof Java.findAndHook === 'function') {
+                    return Java.findAndHook(className, arg0, arg1, arg2);
+                }
             }
             let entries = listMethodEntries();
             let n = 0, skipped = 0;
@@ -543,6 +548,14 @@ const char* kDynamicBootstrapJs = R"JS(
             findandhook: function(...args) {
                 if (typeof Java.findAndHook !== 'function') throw new Error("Java.findAndHook is unavailable");
                 return Java.findAndHook(...args);
+            },
+            findAndHookAll: function(...args) {
+                if (typeof Java.findAndHookAll !== 'function') throw new Error("Java.findAndHookAll is unavailable");
+                return Java.findAndHookAll(...args);
+            },
+            findandhookall: function(...args) {
+                if (typeof Java.findAndHookAll !== 'function') throw new Error("Java.findAndHookAll is unavailable");
+                return Java.findAndHookAll(...args);
             },
             dumpAllDex: function(dir) {
                 if (typeof Java.dumpAllDex !== 'function') throw new Error("Java.dumpAllDex is unavailable");
