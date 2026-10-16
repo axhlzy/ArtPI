@@ -103,9 +103,10 @@ set(ARTPI_SOURCES
         ${XZ_EMBEDDED_SOURCE}
         ${XDL_SOURCES}
 
-        # NATIVE: Native Hook 抽象层 + 动态注册嗅探器 (engine/native)
+        # NATIVE: Native Hook 抽象层 + 动态注册嗅探器 + 硬件断点 (engine/native)
         engine/native/hooker/pi_gum_hooker.cpp
         engine/native/hooker/pi_jni_sniffer.cpp
+        engine/native/hooker/pi_hw_hook.cpp
 
         # NATIVE: QBDI 机器码 DBI 执行器
         engine/native/qbdi/pi_qbdi_engine.cpp

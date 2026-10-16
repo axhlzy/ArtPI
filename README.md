@@ -32,6 +32,7 @@
 | **动态对象反射链** | `artobject(addr)` 持久化提升全局引用，支持链式属性读写、方法调用与 REPL Tab 实时补全 |
 | **界面自动化 (`UI.*`)** | `UI.dump` 打印 View 层级树，`UI.find` 附带祖先链与最近点击目标，`UI.click` / `swipe` / `setText` 免 ADB 直接操作界面 |
 | **ptrace 链式内嵌注入** | 单个 `artpi-cli` 二进制**联合内嵌 Agent SO 与 JADX CLI Jar**，自动解压部署，支持 `-P <pid>` / `-k <pkg>` / `-f <file>` |
+| **硬件断点/观察点** | 类似 `Interceptor.attach` 伪 Hook 语法（`HWBreakpoint.attach` / `HWWatchpoint.attach`），ARM64 物理调试寄存器驱动，零内存修改、无检测特征、支持跨线程布控与硬件单步连续触发 |
 | **内置 QuickJS REPL** | 注入后直接进入交互终端，支持可注册代理域 `dynamic.java` / `dynamic.native`（`unity` / `objc` 按运行时条件挂载），免重编动态分析 |
 
 ---
@@ -477,6 +478,80 @@ r[0].clickTarget.click();                    // 直接点击该节点
 ```
 
 > `[CLICKABLE]` 表示 `View.isClickable()==true`；`[Click: 类名 @0x...]` 表示该节点实际挂有 `mOnClickListener`。匹配节点自身无监听时，`clickTarget` 会自动上溯到最近的有监听祖先。
+
+---
+
+### 6.7 硬件断点与硬件观察点 (`HWBreakpoint` / `HWWatchpoint`) — 零内存修改伪 Hook
+
+基于 ARM64 物理硬件调试寄存器与 Frida-Gum `GumExceptor` 异常捕获机制，ArtPI 封装了类似 `Interceptor.attach` 的**伪 Hook** 语法。**完全无需修改目标指令内存**（代码段保持只读、零内存补丁、无 `BRK` 特征），并内置**硬件单步跳过（Step-Over）状态机**，断点触发后自动步过原指令并重新装载，避免传统硬件断点导致的死循环卡死。
+
+#### 1. 核心 API
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `HWBreakpoint.attach` | `(target, options)` | 在指定目标函数或地址装载硬件断点（执行断点） |
+| `HWWatchpoint.attach` | `(target, options)` | 在指定内存地址装载硬件观察点（数据访问/写入断点） |
+| `HWBreakpoint.list()` / `HWWatchpoint.list()` | `()` | 查看当前所有活跃的硬件断点/观察点会话 |
+| `HWBreakpoint.detach(id)` / `HWWatchpoint.detach(id)` | `(id)` | 根据会话 ID 卸载指定断点/观察点 |
+| `HWBreakpoint.detachAll()` / `HWWatchpoint.detachAll()` | `()` | 卸载全部硬件断点/观察点并释放物理寄存器槽位 |
+| 快捷全局别名 | `hwhook()` / `hwwatch()` / `hwunhook()` / `hwunhookall()` | 全局快捷别名函数 |
+
+**目标参数 `target` 支持的格式**：
+- 模块与符号字符串：`"libnative.so!exported_func"` 或 `("libnative.so", "exported_func")`
+- 十六进制字符串：`"0x70123456"`
+- 数值或指针：`BigInt` / `Number`
+
+**配置参数 `options`**：
+- `onEnter` / `onHit`: 回调函数 `function(ctx) { ... }`
+- `slot`: 指定物理槽位（`0` ~ `3`，ARM64 硬件支持 4 个硬件断点与 4 个硬件观察点槽位；默认 `-1` 自动分配）
+- `threadId`: 指定布控线程 ID（默认 `0` 自动枚举并布控目标进程内所有活跃线程）
+- `once`: 是否为单次断点（`true` 触发一次后自动卸载；默认 `false` 持续监听）
+- (Watchpoint 特有) `size`: 监视内存范围（`1`, `2`, `4`, `8` 字节，默认 `4`）
+- (Watchpoint 特有) `conditions`: 触发条件（`'r'` 读、`'w'` 写、`'rw'` 读写，默认 `'w'`）
+
+#### 2. 回调上下文 `ctx` 属性与方法
+
+当硬件断点命中时，回调函数接收的 `ctx` 暴露完整的 ARM64 寄存器现场与辅助工具方法：
+
+| 属性 / 方法 | 类型 | 说明 |
+|---|---|---|
+| `ctx.pc` | `BigInt` | 当前命中时刻的程序计数器 PC 地址 |
+| `ctx.sp` | `BigInt` | 栈指针 SP |
+| `ctx.lr` | `BigInt` | 返回地址寄存器 LR（调用者地址） |
+| `ctx.fp` | `BigInt` | 帧指针 FP |
+| `ctx.threadId` | `number` | 触发该断点的线程 ID |
+| `ctx.slot` | `number` | 命中的物理调试寄存器槽位编号 |
+| `ctx.args` | `Array<BigInt>` | 参数寄存器快捷数组（`args[0]` ~ `args[7]`，对应 `x0` ~ `x7`） |
+| `ctx.x0` ~ `ctx.x28` | `BigInt` | 各 ARM64 通用寄存器值 |
+| `ctx.setArg(index, val)` | `function` | 动态篡改第 `index` 个参数（修改 `x0` ~ `x7`） |
+| `ctx.setRet(val)` | `function` | 动态篡改返回值（修改 `x0`） |
+| `ctx.readCString(addr)` | `function` | 读取以 `\0` 结尾的 C 字符串 |
+| `ctx.readU32(addr)` / `readU64(addr)` | `function` | 读取 32 位 / 64 位无符号整数 |
+| `ctx.memory.address` | `BigInt` | （仅 Watchpoint）引发断点的被访问内存地址 |
+| `ctx.memory.operation` | `string` | （仅 Watchpoint）引发断点的操作类型（`"read"` 或 `"write"`） |
+
+#### 3. 示例：拦截 JNI 原生函数
+
+```javascript
+// 对 liboattest.so 中的 stringFromJNI 装载硬件执行断点
+var bp = HWBreakpoint.attach("liboattest.so!Java_com_axhlzy_oattest_MainActivity_stringFromJNI", {
+    onEnter: function(ctx) {
+        console.log("[+] [HWBreakpoint HIT!] stringFromJNI entered!");
+        console.log("[+] PC: 0x" + ctx.pc.toString(16));
+        console.log("[+] LR: 0x" + ctx.lr.toString(16));
+        console.log("[+] JNIEnv (x0): 0x" + ctx.x0.toString(16));
+        console.log("[+] jobject (x1): 0x" + ctx.x1.toString(16));
+    }
+});
+
+// 查看所有活跃硬件断点
+console.log(JSON.stringify(HWBreakpoint.list()));
+
+// 卸载断点
+bp.detach();
+// 或一键卸载全部硬件断点
+HWBreakpoint.detachAll();
+```
 
 ---
 

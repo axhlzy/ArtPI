@@ -382,6 +382,7 @@ void BroadcastEvent(const std::string& channel, const msgpack::Value& data) {
 }
 
 void BroadcastLog(const char* channel, const std::string& text) {
+    NET_LOGI("[%s] %s", channel ? channel : "log", text.c_str());
     // Mirror every log/event line into a small ring buffer so embedders/tests can
     // read back what the agent emitted (see artpi_agent_take_log).
     {

@@ -32,6 +32,7 @@ Target Platform: **Android 7.0 ~ 15 (arm64-v8a)**, root privileges required for 
 | **Dynamic Reflective Proxies** | `artobject(addr)` wraps live heap instances into global references with chainable member calls, property access, and interactive REPL Tab completions |
 | **UI Automation (`UI.*`)** | `UI.dump` prints the view hierarchy, `UI.find` returns the ancestor chain and nearest click target, and `UI.click` / `swipe` / `setText` drive the UI directly without ADB |
 | **Self-Contained Multi-Payload Packing** | A single `artpi-cli` binary encapsulates the injector ELF, XZ-compressed `libartpi_agent.so`, and deflated `jadxcli.jar` (~10MB total), auto-extracting upon launch |
+| **Hardware Breakpoint / Watchpoint** | `Interceptor.attach`-like pseudo-hook API (`HWBreakpoint.attach` / `HWWatchpoint.attach`), powered by ARM64 debug registers with zero code patching, zero stealth footprint, cross-thread arming, and seamless step-over state machine |
 | **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with registrable proxy domains (`dynamic.java.*`, `dynamic.native.*`; `unity` / `objc` mounted by runtime), eliminating script compilation overhead |
 
 ---
@@ -417,6 +418,75 @@ Sample output:
 ```
 
 > `[CLICKABLE]` means `View.isClickable()==true`; `[Click: <class> @0x...]` means the node actually has an `mOnClickListener`. When the matched node has no listener, `clickTarget` walks up to the nearest ancestor that does.
+
+---
+
+### 6.7 Hardware Breakpoints & Watchpoints (`HWBreakpoint` / `HWWatchpoint`) — Zero-Patching Pseudo-Hook
+
+Leveraging ARM64 physical hardware debug registers and Frida-Gum's `GumExceptor` engine, ArtPI provides an `Interceptor.attach`-like **pseudo-hook** syntax. **Zero code patching** is required (the `.text` section remains strictly read-only, leaving no memory patch signatures or `BRK` opcodes). An automatic **hardware single-step (Step-Over) state machine** handles step-over and re-arming upon each hit, completely eliminating infinite break loops.
+
+#### 1. Core APIs
+
+| API | Signature | Description |
+|---|---|---|
+| `HWBreakpoint.attach` | `(target, options)` | Arm a hardware breakpoint (execution breakpoint) at the given symbol or address |
+| `HWWatchpoint.attach` | `(target, options)` | Arm a hardware watchpoint (data read/write breakpoint) on a memory address range |
+| `HWBreakpoint.list()` / `HWWatchpoint.list()` | `()` | List all active hardware breakpoint/watchpoint sessions |
+| `HWBreakpoint.detach(id)` / `HWWatchpoint.detach(id)` | `(id)` | Detach and free debug registers for a specific session ID |
+| `HWBreakpoint.detachAll()` / `HWWatchpoint.detachAll()` | `()` | Detach all hardware sessions and release all physical register slots |
+| Global Aliases | `hwhook()` / `hwwatch()` / `hwunhook()` / `hwunhookall()` | Global convenience shortcuts |
+
+**Target (`target`) Resolution**:
+- Symbol string: `"libnative.so!exported_func"` or `("libnative.so", "exported_func")`
+- Hex string: `"0x70123456"`
+- Integer / Pointer: `BigInt` / `Number`
+
+**Options (`options`)**:
+- `onEnter` / `onHit`: Callback function `function(ctx) { ... }`
+- `slot`: Specific debug register slot (`0` ~ `3`, default `-1` for automatic allocation)
+- `threadId`: Target thread TID (`0` for all existing threads in target process)
+- `once`: Single-shot trigger (`true` disarms after first hit; default `false` for continuous interception)
+- (Watchpoint) `size`: Watch byte size (`1`, `2`, `4`, `8`, default `4`)
+- (Watchpoint) `conditions`: Access condition (`'r'` read, `'w'` write, `'rw'` read/write, default `'w'`)
+
+#### 2. Callback Context (`ctx`)
+
+When a hardware breakpoint triggers, `ctx` delivers complete ARM64 execution context:
+
+| Property / Method | Type | Description |
+|---|---|---|
+| `ctx.pc` | `BigInt` | Program counter (fault address) |
+| `ctx.sp` | `BigInt` | Stack pointer SP |
+| `ctx.lr` | `BigInt` | Link register LR (caller return address) |
+| `ctx.fp` | `BigInt` | Frame pointer FP |
+| `ctx.threadId` | `number` | Thread ID where the breakpoint hit |
+| `ctx.slot` | `number` | Physical debug register slot index |
+| `ctx.args` | `Array<BigInt>` | Fast argument array (`args[0]` ~ `args[7]`, corresponding to `x0` ~ `x7`) |
+| `ctx.x0` ~ `ctx.x28` | `BigInt` | General-purpose ARM64 register values |
+| `ctx.setArg(index, val)` | `function` | Modify the i-th argument register (`x0` ~ `x7`) |
+| `ctx.setRet(val)` | `function` | Modify return value register (`x0`) |
+| `ctx.readCString(addr)` | `function` | Read null-terminated C string from memory |
+| `ctx.readU32(addr)` / `readU64(addr)` | `function` | Read 32-bit / 64-bit unsigned integer from memory |
+| `ctx.memory.address` | `BigInt` | (Watchpoint only) Memory address accessed |
+| `ctx.memory.operation` | `string` | (Watchpoint only) Operation type (`"read"` or `"write"`) |
+
+#### 3. Example
+
+```javascript
+// Attach hardware execution breakpoint to JNI native method
+var bp = HWBreakpoint.attach("liboattest.so!Java_com_axhlzy_oattest_MainActivity_stringFromJNI", {
+    onEnter: function(ctx) {
+        console.log("[+] [HWBreakpoint HIT!] stringFromJNI entered!");
+        console.log("[+] PC: 0x" + ctx.pc.toString(16));
+        console.log("[+] LR: 0x" + ctx.lr.toString(16));
+        console.log("[+] JNIEnv (x0): 0x" + ctx.x0.toString(16));
+        console.log("[+] jobject (x1): 0x" + ctx.x1.toString(16));
+    }
+});
+
+// Detach breakpoint
+bp.detach();
+```
 
 ---
 

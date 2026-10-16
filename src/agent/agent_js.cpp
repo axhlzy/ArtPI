@@ -8,6 +8,7 @@
 #include "agent_memory.h"
 #include "agent_trace.h"
 #include "agent_debug.h"
+#include "agent_hw_hook.h"
 #include "agent_dynamic.h"
 #include "agent_net.h"
 #include "sandbox/pi_interp_tracer.h"
@@ -208,10 +209,12 @@ static JSValue JsDetachAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc
     size_t j = JavaUnhookAllCount();
     size_t n = NativeUnhookAllCount();
     size_t t = TraceStopAll();
+    size_t hw = HwHookDetachAll();
     std::string msg = "Detached: " + std::to_string(j) + " java hook(s), "
                     + std::to_string(n) + " native hook(s), "
                     + std::to_string(t) + " trace(s), "
-                    + std::to_string(d) + " debug breakpoint(s)";
+                    + std::to_string(d) + " debug breakpoint(s), "
+                    + std::to_string(hw) + " hardware hook(s)";
     return JS_NewString(ctx, msg.c_str());
 }
 
@@ -231,6 +234,7 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     RegisterMemoryApis(ctx, global, memory);
     RegisterTraceApis(ctx, global, trace);
     RegisterDebugApis(ctx, global, debug);
+    RegisterHwHookApis(ctx, global);
 
     // 3. Mount domain namespaces on global
     JS_SetPropertyStr(ctx, global, "Java", java);

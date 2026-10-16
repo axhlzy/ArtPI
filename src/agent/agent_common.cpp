@@ -409,7 +409,7 @@ int64_t ParsePtr(JSContext* ctx, JSValueConst val) {
 }
 
 JSValue NewBigIntOrInt(JSContext* ctx, uint64_t val) {
-    return JS_NewBigInt64(ctx, static_cast<int64_t>(val));
+    return JS_NewBigUint64(ctx, val);
 }
 
 static JSValue JsConsoleLog(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
