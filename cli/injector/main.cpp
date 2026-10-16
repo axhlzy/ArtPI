@@ -28,6 +28,7 @@ namespace {
         std::string pkgName;
         std::string libPath;
         std::string evalScript;
+        bool topActivity = false;
         bool serverMode = false;
     };
 
@@ -40,6 +41,7 @@ namespace {
             "options:\n"
             "  -P, --pid <pid>      Target process PID\n"
             "  -k, --pkg <name>     Target package name (e.g. com.example.app)\n"
+            "  -t, --top            Attach to the foreground (top Activity) app\n"
             "  -e, --eval <script>  Evaluate a JavaScript expression and exit\n"
             "  -f, --file <path>    Execute a JavaScript file and exit\n"
             "  --lib <path>         Use external libartpi_agent.so instead of embedded payload\n"
@@ -277,6 +279,7 @@ int main(int argc, char **argv) {
         if (a == "-h" || a == "--help") { Usage(argv[0]); return 0; }
         else if (a == "-P" || a == "--pid") opt.pid = atoi(needValue("-P/--pid"));
         else if (a == "-k" || a == "--pkg") opt.pkgName = needValue("-k/--pkg");
+        else if (a == "-t" || a == "--top") opt.topActivity = true;
         else if (a == "-e" || a == "--eval") opt.evalScript = needValue("-e/--eval");
         else if (a == "-f" || a == "--file") {
             const char* path = needValue("-f/--file");
@@ -293,6 +296,20 @@ int main(int argc, char **argv) {
         else if (a == "--lib") opt.libPath = needValue("--lib");
         else if (a == "--server") opt.serverMode = true;
         else { fprintf(stderr, "unknown option: %s (try --help)\n", a.c_str()); return 2; }
+    }
+
+    if (opt.topActivity && opt.pid <= 0 && opt.pkgName.empty()) {
+        pid_t topPid = -1;
+        std::string topPkg, topAct;
+        if (FindTopActivityApp(topPid, topPkg, topAct)) {
+            opt.pid = topPid;
+            opt.pkgName = topPkg;
+            printf("[*] resolved top activity '%s' -> package '%s' (PID %d)\n",
+                   topAct.c_str(), opt.pkgName.c_str(), opt.pid);
+        } else {
+            fprintf(stderr, "[!] cannot resolve foreground top activity app\n");
+            return 1;
+        }
     }
 
     if (opt.pid <= 0 && !opt.pkgName.empty()) {

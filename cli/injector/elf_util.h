@@ -36,3 +36,7 @@ uint64_t ElfSymbolOffset(const char *elfPath, std::initializer_list<const char *
 // Find process PID by Android package name (inspects /proc/<pid>/cmdline)
 pid_t FindPidByPackageName(const std::string& pkgName);
 
+// Resolve the foreground (top-resumed Activity) app's PID, package name, and activity component.
+bool FindTopActivityApp(pid_t& outPid, std::string& outPkg, std::string& outActivity);
+
+

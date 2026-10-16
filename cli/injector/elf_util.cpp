@@ -149,3 +149,79 @@ pid_t FindPidByPackageName(const std::string& pkgName) {
     return -1;
 }
 
+bool FindTopActivityApp(pid_t& outPid, std::string& outPkg, std::string& outActivity) {
+    outPid = -1;
+    outPkg.clear();
+    outActivity.clear();
+
+    // 1. Fast path: `dumpsys activity top` prints activities from bottom to top;
+    //    the last `  ACTIVITY <pkg>/<cls> <hash> pid=<pid>` line is the foreground top activity.
+    if (FILE* fp = popen("dumpsys activity top 2>/dev/null", "r")) {
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            const char* p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncmp(p, "ACTIVITY ", 9) != 0) continue;
+            p += 9;
+            while (*p == ' ') p++;
+            const char* compEnd = p;
+            while (*compEnd && *compEnd != ' ' && *compEnd != '\t' && *compEnd != '\r' && *compEnd != '\n') {
+                compEnd++;
+            }
+            std::string comp(p, static_cast<size_t>(compEnd - p));
+            size_t slash = comp.find('/');
+            if (slash == std::string::npos || slash == 0) continue;
+
+            const char* pidPos = strstr(compEnd, "pid=");
+            pid_t parsedPid = -1;
+            if (pidPos) {
+                long v = strtol(pidPos + 4, nullptr, 10);
+                if (v > 0) parsedPid = static_cast<pid_t>(v);
+            }
+            outPkg = comp.substr(0, slash);
+            outActivity = comp;
+            outPid = parsedPid;
+        }
+        pclose(fp);
+    }
+
+    if (outPid <= 0 && !outPkg.empty()) {
+        outPid = FindPidByPackageName(outPkg);
+    }
+    if (outPid > 0 && !outPkg.empty()) {
+        return true;
+    }
+
+    // 2. Fallback: parse topResumedActivity / mResumedActivity from `dumpsys activity activities`
+    if (FILE* fp = popen("dumpsys activity activities 2>/dev/null", "r")) {
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            if (!strstr(line, "ResumedActivity")) continue;
+            const char* slash = strchr(line, '/');
+            if (!slash) continue;
+            const char* pkgStart = slash;
+            while (pkgStart > line && (isalnum(static_cast<unsigned char>(pkgStart[-1])) ||
+                                       pkgStart[-1] == '.' || pkgStart[-1] == '_')) {
+                pkgStart--;
+            }
+            const char* actEnd = slash + 1;
+            while (*actEnd && !isspace(static_cast<unsigned char>(*actEnd)) && *actEnd != '}') {
+                actEnd++;
+            }
+            if (pkgStart < slash && actEnd > slash + 1) {
+                outPkg.assign(pkgStart, static_cast<size_t>(slash - pkgStart));
+                outActivity.assign(pkgStart, static_cast<size_t>(actEnd - pkgStart));
+                outPid = FindPidByPackageName(outPkg);
+                if (outPid > 0) {
+                    pclose(fp);
+                    return true;
+                }
+            }
+        }
+        pclose(fp);
+    }
+
+    return outPid > 0 && !outPkg.empty();
+}
+
+
