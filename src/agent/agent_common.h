@@ -63,5 +63,6 @@ std::string FormatReleasedInstrumentation(int mask);
 bool ArtPIIsProcessPaused();
 uint64_t ArtPIGetGatePc();
 bool ArtPIResumeProcess();
+void ArtPIPauseCurrentThread(uint64_t pc);
 
 }} // namespace artpi::agent

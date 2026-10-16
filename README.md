@@ -32,7 +32,7 @@
 | **动态对象反射链** | `artobject(addr)` 持久化提升全局引用，支持链式属性读写、方法调用与 REPL Tab 实时补全 |
 | **界面自动化 (`UI.*`)** | `UI.dump` 打印 View 层级树，`UI.find` 附带祖先链与最近点击目标，`UI.click` / `swipe` / `setText` 免 ADB 直接操作界面 |
 | **ptrace 链式内嵌注入** | 单个 `artpi-cli` 二进制**联合内嵌 Agent SO 与 JADX CLI Jar**，自动解压部署，支持 `-P <pid>` / `-k <pkg>` / `-f <file>` |
-| **硬件断点/观察点** | 类似 `Interceptor.attach` 伪 Hook 语法（`HWBreakpoint.attach` / `HWWatchpoint.attach`），ARM64 物理调试寄存器驱动，零内存修改、无检测特征、支持跨线程布控与硬件单步连续触发 |
+| **硬件断点/观察点** | 现代统一 API（`HW.attach` 代码断点 / `HW.watch` 数据断点 / `HW.watchDlopen` 动态库监控），ARM64 物理调试寄存器驱动，零内存修改、无检测特征、跨线程布控与硬件单步连续触发 |
 | **内置 QuickJS REPL** | 注入后直接进入交互终端，支持可注册代理域 `dynamic.java` / `dynamic.native`（`unity` / `objc` 按运行时条件挂载），免重编动态分析 |
 
 ---
@@ -158,6 +158,12 @@ adb shell su -c "/data/local/tmp/artpi-cli -k com.example.app -f /data/local/tmp
 
 # 4. 或者在命令行直接对表达式求值
 adb shell su -c "/data/local/tmp/artpi-cli -k com.example.app -e 'findclass(\"*Activity\");'"
+
+# 5. Spawn 启动并在早期监控动态库加载（硬件断点零内存补丁，实时记录所有 dlopen）
+adb shell su -c "/data/local/tmp/artpi-cli -S com.example.app --lib-log"
+
+# 6. Spawn 启动并在目标 SO 库加载时自动挂起主线程（便于下断点分析，在 REPL 中输入 resume 继续运行）
+adb shell su -c "/data/local/tmp/artpi-cli -S com.example.app --stop-lib libnative.so"
 ```
 
 > **连接复用**：`artpi-cli` 自动扫描 `20700..20800` 端口并对已注入 Agent 探活复用；若应用未被注入，会自动提取 payload 完成远程 ptrace 注入。若应用未声明 `INTERNET` 权限，自动降级为抽象 UNIX Domain Socket（`@artpi_agent_<pid>`）。
@@ -481,20 +487,22 @@ r[0].clickTarget.click();                    // 直接点击该节点
 
 ---
 
-### 6.7 硬件断点与硬件观察点 (`HWBreakpoint` / `HWWatchpoint`) — 零内存修改伪 Hook
+### 6.7 硬件断点与硬件观察点 (`HW`) — 零内存修改伪 Hook 与 dlopen 监控
 
-基于 ARM64 物理硬件调试寄存器与 Frida-Gum `GumExceptor` 异常捕获机制，ArtPI 封装了类似 `Interceptor.attach` 的**伪 Hook** 语法。**完全无需修改目标指令内存**（代码段保持只读、零内存补丁、无 `BRK` 特征），并内置**硬件单步跳过（Step-Over）状态机**，断点触发后自动步过原指令并重新装载，避免传统硬件断点导致的死循环卡死。
+基于 ARM64 物理硬件调试寄存器与 Frida-Gum `GumExceptor` 异常捕获机制，ArtPI 封装了现代统一的硬件断点高层 API。**完全无需修改目标指令内存**（代码段保持只读、零内存补丁、无 `BRK` 特征），并内置**硬件单步跳过（Step-Over）状态机**，断点触发后自动步过原指令并重新装载，避免传统硬件断点导致的死循环卡死。
 
-#### 1. 核心 API
+#### 1. 核心 API (`HW`)
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `HWBreakpoint.attach` | `(target, options)` | 在指定目标函数或地址装载硬件断点（执行断点） |
-| `HWWatchpoint.attach` | `(target, options)` | 在指定内存地址装载硬件观察点（数据访问/写入断点） |
-| `HWBreakpoint.list()` / `HWWatchpoint.list()` | `()` | 查看当前所有活跃的硬件断点/观察点会话 |
-| `HWBreakpoint.detach(id)` / `HWWatchpoint.detach(id)` | `(id)` | 根据会话 ID 卸载指定断点/观察点 |
-| `HWBreakpoint.detachAll()` / `HWWatchpoint.detachAll()` | `()` | 卸载全部硬件断点/观察点并释放物理寄存器槽位 |
+| `HW.attach` | `(target, options \| cb)` | 在指定目标函数或地址装载**硬件执行断点**（伪 Hook / 代码执行拦截） |
+| `HW.watch` | `(addr, options \| cb)` | 在指定内存地址装载**硬件观察点**（数据读写监控） |
+| `HW.watchDlopen` | `(options)` | 硬件断点级 `dlopen` 监控，记录动态库加载并支持指定 SO 命中时自动挂起主线程 |
+| `HW.list()` | `()` | 查看当前所有活跃的硬件断点/观察点会话 |
+| `HW.detach(id)` | `(id)` | 根据会话 ID 卸载指定断点/观察点 |
+| `HW.detachAll()` | `()` | 卸载全部硬件断点/观察点并释放物理寄存器槽位 |
 | 快捷全局别名 | `hwhook()` / `hwwatch()` / `hwunhook()` / `hwunhookall()` | 全局快捷别名函数 |
+| 兼容命名空间 | `HWBreakpoint.attach` / `HWWatchpoint.attach` | 向后兼容旧版 API |
 
 **目标参数 `target` 支持的格式**：
 - 模块与符号字符串：`"libnative.so!exported_func"` 或 `("libnative.so", "exported_func")`
@@ -502,12 +510,16 @@ r[0].clickTarget.click();                    // 直接点击该节点
 - 数值或指针：`BigInt` / `Number`
 
 **配置参数 `options`**：
-- `onEnter` / `onHit`: 回调函数 `function(ctx) { ... }`
+- `onEnter` / `onHit`: 回调函数 `function(ctx) { ... }`（若第二个参数直接传回调函数，等价于 `{ onEnter: cb }`）
 - `slot`: 指定物理槽位（`0` ~ `3`，ARM64 硬件支持 4 个硬件断点与 4 个硬件观察点槽位；默认 `-1` 自动分配）
 - `threadId`: 指定布控线程 ID（默认 `0` 自动枚举并布控目标进程内所有活跃线程）
 - `once`: 是否为单次断点（`true` 触发一次后自动卸载；默认 `false` 持续监听）
-- (Watchpoint 特有) `size`: 监视内存范围（`1`, `2`, `4`, `8` 字节，默认 `4`）
-- (Watchpoint 特有) `conditions`: 触发条件（`'r'` 读、`'w'` 写、`'rw'` 读写，默认 `'w'`）
+- (`HW.watch` 特有) `size`: 监视内存范围（`1`, `2`, `4`, `8` 字节，默认 `4`）
+- (`HW.watch` 特有) `conditions`: 触发条件（`'r'` 读、`'w'` 写、`'rw'` 读写，默认 `'w'`）
+- (`HW.watchDlopen` 特有) `stopLib`: 匹配目标 SO 库名时自动挂起主线程（通过 futex 暂停，在 REPL 输入 `resume` 继续）
+- (`HW.watchDlopen` 特有) `libLog`: 是否打印所有 SO 加载日志（默认 `true`）
+- (`HW.watchDlopen` 特有) `onLoading(path, caller)`: SO 开始加载时触发的回调
+- (`HW.watchDlopen` 特有) `onLoaded(path, handle)`: SO 加载完成后触发的回调（在返回地址自动下一次性硬件断点获取 handle）
 
 #### 2. 回调上下文 `ctx` 属性与方法
 
@@ -530,27 +542,46 @@ r[0].clickTarget.click();                    // 直接点击该节点
 | `ctx.memory.address` | `BigInt` | （仅 Watchpoint）引发断点的被访问内存地址 |
 | `ctx.memory.operation` | `string` | （仅 Watchpoint）引发断点的操作类型（`"read"` 或 `"write"`） |
 
-#### 3. 示例：拦截 JNI 原生函数
+#### 3. 示例代码
 
 ```javascript
-// 对 liboattest.so 中的 stringFromJNI 装载硬件执行断点
-var bp = HWBreakpoint.attach("liboattest.so!Java_com_axhlzy_oattest_MainActivity_stringFromJNI", {
+// 1. 代码执行拦截（伪 Hook / 指令断点）
+var bp = HW.attach("liboattest.so!Java_com_axhlzy_oattest_MainActivity_stringFromJNI", {
     onEnter: function(ctx) {
-        console.log("[+] [HWBreakpoint HIT!] stringFromJNI entered!");
-        console.log("[+] PC: 0x" + ctx.pc.toString(16));
-        console.log("[+] LR: 0x" + ctx.lr.toString(16));
-        console.log("[+] JNIEnv (x0): 0x" + ctx.x0.toString(16));
-        console.log("[+] jobject (x1): 0x" + ctx.x1.toString(16));
+        console.log("[+] [HW HIT] stringFromJNI entered!");
+        console.log("[+] PC: 0x" + ctx.pc.toString(16) + ", LR: 0x" + ctx.lr.toString(16));
+        console.log("[+] JNIEnv (x0): 0x" + ctx.args[0].toString(16));
+        console.log("[+] jobject (x1): 0x" + ctx.args[1].toString(16));
     }
 });
 
-// 查看所有活跃硬件断点
-console.log(JSON.stringify(HWBreakpoint.list()));
+// 2. 内存数据读写监控（硬件观察点）
+var wp = HW.watch("0x7012345000", {
+    size: 4,
+    conditions: "rw",
+    onHit: function(ctx) {
+        console.log("[+] [Watchpoint HIT] Addr: 0x" + ctx.memory.address.toString(16) +
+                    ", op: " + ctx.memory.operation + ", PC: 0x" + ctx.pc.toString(16));
+    }
+});
 
-// 卸载断点
+// 3. 动态库加载监控与拦截 (dlopen)
+HW.watchDlopen({
+    stopLib: "liboattest.so", // 命中目标库时挂起主线程
+    onLoading: function(name, caller) {
+        console.log("[dlopen] Loading SO: " + name + " (caller=0x" + caller.toString(16) + ")");
+    },
+    onLoaded: function(name, handle) {
+        console.log("[dlopen] Loaded SO: " + name + " handle=0x" + handle.toString(16));
+    }
+});
+
+// 查看所有活跃硬件断点/观察点
+console.log(JSON.stringify(HW.list()));
+
+// 卸载指定断点或全部断点
 bp.detach();
-// 或一键卸载全部硬件断点
-HWBreakpoint.detachAll();
+HW.detachAll();
 ```
 
 ---

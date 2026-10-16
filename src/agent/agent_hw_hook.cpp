@@ -16,6 +16,8 @@
 #include <android/log.h>
 
 #define HW_LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "PI_HwHook", __VA_ARGS__)
+#define HW_LOGW(...) __android_log_print(ANDROID_LOG_WARN,  "PI_HwHook", __VA_ARGS__)
+#define HW_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PI_HwHook", __VA_ARGS__)
 
 namespace artpi { namespace agent {
 
@@ -502,10 +504,190 @@ static JSValue JsHwWatchpointAttach(JSContext* ctx, JSValueConst /*this_val*/, i
     return CreateHandleObject(ctx, id, assignedSlot, HwHookType::WATCHPOINT, target);
 }
 
+static uintptr_t ResolveDlopenAddress() {
+    uintptr_t addr = 0;
+    void* handle = xdl_open("libdl.so", XDL_DEFAULT);
+    if (handle) {
+        addr = reinterpret_cast<uintptr_t>(xdl_sym(handle, "android_dlopen_ext", nullptr));
+        if (!addr) {
+            addr = reinterpret_cast<uintptr_t>(xdl_sym(handle, "dlopen", nullptr));
+        }
+        xdl_close(handle);
+    }
+    if (!addr) {
+        void* p = dlsym(RTLD_DEFAULT, "android_dlopen_ext");
+        if (!p) p = dlsym(RTLD_DEFAULT, "dlopen");
+        addr = reinterpret_cast<uintptr_t>(p);
+    }
+    return addr;
+}
+
+static std::string ExtractSoName(uint64_t addr) {
+    if (addr < 0x1000) return "(null/main)";
+    char buf[512] = {0};
+    const char* str = reinterpret_cast<const char*>(addr);
+    for (size_t i = 0; i < sizeof(buf) - 1; i++) {
+        char c = str[i];
+        if (c == '\0') break;
+        buf[i] = c;
+    }
+    return buf;
+}
+
+static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    std::string stopLib;
+    bool libLog = true;
+    JSValue jsCbLoading = JS_UNDEFINED;
+    JSValue jsCbLoaded = JS_UNDEFINED;
+
+    if (argc >= 1) {
+        if (JS_IsString(argv[0])) {
+            const char* s = JS_ToCString(ctx, argv[0]);
+            if (s) { stopLib = s; JS_FreeCString(ctx, s); }
+        } else if (JS_IsObject(argv[0])) {
+            JSValue sVal = JS_GetPropertyStr(ctx, argv[0], "stopLib");
+            if (JS_IsString(sVal)) {
+                const char* s = JS_ToCString(ctx, sVal);
+                if (s) { stopLib = s; JS_FreeCString(ctx, s); }
+            }
+            JS_FreeValue(ctx, sVal);
+
+            JSValue lVal = JS_GetPropertyStr(ctx, argv[0], "libLog");
+            if (!JS_IsUndefined(lVal)) libLog = JS_ToBool(ctx, lVal);
+            JS_FreeValue(ctx, lVal);
+
+            JSValue cVal = JS_GetPropertyStr(ctx, argv[0], "onLoading");
+            if (JS_IsFunction(ctx, cVal)) jsCbLoading = cVal; else JS_FreeValue(ctx, cVal);
+
+            JSValue dVal = JS_GetPropertyStr(ctx, argv[0], "onLoaded");
+            if (JS_IsFunction(ctx, dVal)) jsCbLoaded = dVal; else JS_FreeValue(ctx, dVal);
+        }
+    }
+
+    uintptr_t target = ResolveDlopenAddress();
+    if (!target) {
+        return JS_ThrowInternalError(ctx, "[!] Failed to resolve android_dlopen_ext/dlopen address");
+    }
+
+    auto cbLoadingGuard = std::shared_ptr<JSValue>(new JSValue(jsCbLoading), [](JSValue* p) {
+        if (p) {
+            if (g_ctx && !JS_IsUndefined(*p)) JS_FreeValue(g_ctx, *p);
+            delete p;
+        }
+    });
+    auto cbLoadedGuard = std::shared_ptr<JSValue>(new JSValue(jsCbLoaded), [](JSValue* p) {
+        if (p) {
+            if (g_ctx && !JS_IsUndefined(*p)) JS_FreeValue(g_ctx, *p);
+            delete p;
+        }
+    });
+
+    HwHookConfig cfg;
+    cfg.type = HwHookType::BREAKPOINT;
+    cfg.address = target;
+    cfg.slot = -1;
+    cfg.thread_id = 0;
+    cfg.once = false;
+
+    cfg.on_hit = [stopLib, libLog, cbLoadingGuard, cbLoadedGuard](HwCpuContext& hwctx) {
+        std::string soPath = ExtractSoName(hwctx.x[0]);
+
+        if (libLog) {
+            char logBuf[512];
+            snprintf(logBuf, sizeof(logBuf), "[dlopen] Loading SO: %s (caller=0x%" PRIx64 ")",
+                     soPath.c_str(), hwctx.lr);
+            HW_LOGI("%s", logBuf);
+            BroadcastLog("dlopen", logBuf);
+        }
+
+        // JS onLoading callback
+        JSContext* jsctx = g_ctx;
+        if (jsctx && !JS_IsUndefined(*cbLoadingGuard) && t_jsReentrancyDepth == 0) {
+            std::lock_guard<std::mutex> lk(g_jsMutex);
+            JSValue args[2];
+            args[0] = JS_NewString(jsctx, soPath.c_str());
+            args[1] = MakeHwContextObject(jsctx, hwctx, HwHookType::BREAKPOINT);
+            JSValue r = JS_Call(jsctx, *cbLoadingGuard, JS_UNDEFINED, 2, args);
+            JS_FreeValue(jsctx, r);
+            JS_FreeValue(jsctx, args[0]);
+            JS_FreeValue(jsctx, args[1]);
+        }
+
+        // Arm temporary return breakpoint on caller LR to observe onLoaded
+        if ((jsctx && !JS_IsUndefined(*cbLoadedGuard)) || !stopLib.empty()) {
+            uintptr_t retAddr = static_cast<uintptr_t>(hwctx.lr);
+            if (retAddr >= 0x1000) {
+                HwHookConfig retCfg;
+                retCfg.type = HwHookType::BREAKPOINT;
+                retCfg.address = retAddr;
+                retCfg.slot = -1;
+                retCfg.thread_id = hwctx.thread_id;
+                retCfg.once = true; // One-shot return hook
+                retCfg.on_hit = [soPath, cbLoadedGuard](HwCpuContext& retCtx) {
+                    uint64_t handle = retCtx.x[0];
+                    char logBuf[512];
+                    snprintf(logBuf, sizeof(logBuf), "[dlopen] Loaded SO: %s -> handle=0x%" PRIx64,
+                             soPath.c_str(), handle);
+                    HW_LOGI("%s", logBuf);
+                    BroadcastLog("dlopen", logBuf);
+
+                    JSContext* c = g_ctx;
+                    if (c && !JS_IsUndefined(*cbLoadedGuard) && t_jsReentrancyDepth == 0) {
+                        std::lock_guard<std::mutex> lk(g_jsMutex);
+                        JSValue a[3];
+                        a[0] = JS_NewString(c, soPath.c_str());
+                        a[1] = NewBigIntOrInt(c, handle);
+                        a[2] = MakeHwContextObject(c, retCtx, HwHookType::BREAKPOINT);
+                        JSValue r = JS_Call(c, *cbLoadedGuard, JS_UNDEFINED, 3, a);
+                        JS_FreeValue(c, r);
+                        JS_FreeValue(c, a[0]);
+                        JS_FreeValue(c, a[1]);
+                        JS_FreeValue(c, a[2]);
+                    }
+                };
+                HwHookManager::instance().attach(retCfg);
+            }
+        }
+
+        // If matched stopLib, pause main thread right at dlopen entry
+        if (!stopLib.empty() && soPath.find(stopLib) != std::string::npos) {
+            char stopMsg[512];
+            snprintf(stopMsg, sizeof(stopMsg),
+                     "[+] [stop-lib] Target library '%s' intercepted at dlopen! Main thread PAUSED. (type 'resume' to continue)",
+                     soPath.c_str());
+            HW_LOGI("%s", stopMsg);
+            BroadcastLog("dlopen", stopMsg);
+            ArtPIPauseCurrentThread(hwctx.pc);
+        }
+    };
+
+    uint32_t id = HwHookManager::instance().attach(cfg);
+    if (id == 0) {
+        return JS_ThrowInternalError(ctx, "[!] Failed to attach hardware breakpoint on dlopen");
+    }
+
+    int assignedSlot = -1;
+    for (const auto& s : HwHookManager::instance().listSessions()) {
+        if (s.id == id) { assignedSlot = s.assigned_slot; break; }
+    }
+
+    return CreateHandleObject(ctx, id, assignedSlot, HwHookType::BREAKPOINT, target);
+}
+
 } // namespace
 
 void RegisterHwHookApis(JSContext* ctx, JSValue global) {
-    // 1. HWBreakpoint class/namespace
+    // 0. Modern HW unified namespace (HW.attach & HW.watch)
+    JSValue hw = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, hw, "attach", JS_NewCFunction(ctx, JsHwBreakpointAttach, "attach", 2));
+    JS_SetPropertyStr(ctx, hw, "watch", JS_NewCFunction(ctx, JsHwWatchpointAttach, "watch", 2));
+    JS_SetPropertyStr(ctx, hw, "detach", JS_NewCFunction(ctx, JsHwBreakpointDetach, "detach", 1));
+    JS_SetPropertyStr(ctx, hw, "detachAll", JS_NewCFunction(ctx, JsHwBreakpointDetachAll, "detachAll", 0));
+    JS_SetPropertyStr(ctx, hw, "list", JS_NewCFunction(ctx, JsHwBreakpointList, "list", 0));
+    JS_SetPropertyStr(ctx, hw, "watchDlopen", JS_NewCFunction(ctx, JsHwWatchDlopen, "watchDlopen", 1));
+    JS_SetPropertyStr(ctx, global, "HW", hw);
+
+    // 1. HWBreakpoint class/namespace (backward compat)
     JSValue bp = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, bp, "attach", JS_NewCFunction(ctx, JsHwBreakpointAttach, "attach", 2));
     JS_SetPropertyStr(ctx, bp, "detach", JS_NewCFunction(ctx, JsHwBreakpointDetach, "detach", 1));
@@ -513,7 +695,7 @@ void RegisterHwHookApis(JSContext* ctx, JSValue global) {
     JS_SetPropertyStr(ctx, bp, "list", JS_NewCFunction(ctx, JsHwBreakpointList, "list", 0));
     JS_SetPropertyStr(ctx, global, "HWBreakpoint", bp);
 
-    // 2. HWWatchpoint class/namespace
+    // 2. HWWatchpoint class/namespace (backward compat)
     JSValue wp = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, wp, "attach", JS_NewCFunction(ctx, JsHwWatchpointAttach, "attach", 2));
     JS_SetPropertyStr(ctx, wp, "detach", JS_NewCFunction(ctx, JsHwBreakpointDetach, "detach", 1));
@@ -530,6 +712,51 @@ void RegisterHwHookApis(JSContext* ctx, JSValue global) {
 
 size_t HwHookDetachAll() {
     return HwHookManager::instance().detachAll();
+}
+
+bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog) {
+    uintptr_t target = ResolveDlopenAddress();
+    if (!target) {
+        HW_LOGE("SetupDlopenHwMonitor: failed to resolve dlopen address");
+        return false;
+    }
+
+    HwHookConfig cfg;
+    cfg.type = HwHookType::BREAKPOINT;
+    cfg.address = target;
+    cfg.slot = -1;
+    cfg.thread_id = 0;
+    cfg.once = false;
+
+    cfg.on_hit = [stopLib, libLog](HwCpuContext& hwctx) {
+        std::string soPath = ExtractSoName(hwctx.x[0]);
+
+        if (libLog) {
+            char logBuf[512];
+            snprintf(logBuf, sizeof(logBuf), "[dlopen] Loading SO: %s (caller=0x%" PRIx64 ")",
+                     soPath.c_str(), hwctx.lr);
+            HW_LOGI("%s", logBuf);
+            BroadcastLog("dlopen", logBuf);
+        }
+
+        if (!stopLib.empty() && soPath.find(stopLib) != std::string::npos) {
+            char stopMsg[512];
+            snprintf(stopMsg, sizeof(stopMsg),
+                     "[+] [stop-lib] Target library '%s' intercepted at dlopen! Main thread PAUSED. (type 'resume' to continue)",
+                     soPath.c_str());
+            HW_LOGI("%s", stopMsg);
+            BroadcastLog("dlopen", stopMsg);
+            ArtPIPauseCurrentThread(hwctx.pc);
+        }
+    };
+
+    uint32_t id = HwHookManager::instance().attach(cfg);
+    if (id > 0) {
+        HW_LOGI("SetupDlopenHwMonitor: armed dlopen hardware breakpoint at 0x%lx (stopLib='%s', libLog=%d)",
+                (unsigned long)target, stopLib.c_str(), libLog ? 1 : 0);
+        return true;
+    }
+    return false;
 }
 
 }} // namespace artpi::agent

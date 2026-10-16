@@ -9,5 +9,6 @@ namespace artpi { namespace agent {
 
 void RegisterHwHookApis(JSContext* ctx, JSValue global);
 size_t HwHookDetachAll();
+bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog);
 
 }} // namespace artpi::agent

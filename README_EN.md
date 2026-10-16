@@ -32,7 +32,7 @@ Target Platform: **Android 7.0 ~ 15 (arm64-v8a)**, root privileges required for 
 | **Dynamic Reflective Proxies** | `artobject(addr)` wraps live heap instances into global references with chainable member calls, property access, and interactive REPL Tab completions |
 | **UI Automation (`UI.*`)** | `UI.dump` prints the view hierarchy, `UI.find` returns the ancestor chain and nearest click target, and `UI.click` / `swipe` / `setText` drive the UI directly without ADB |
 | **Self-Contained Multi-Payload Packing** | A single `artpi-cli` binary encapsulates the injector ELF, XZ-compressed `libartpi_agent.so`, and deflated `jadxcli.jar` (~10MB total), auto-extracting upon launch |
-| **Hardware Breakpoint / Watchpoint** | `Interceptor.attach`-like pseudo-hook API (`HWBreakpoint.attach` / `HWWatchpoint.attach`), powered by ARM64 debug registers with zero code patching, zero stealth footprint, cross-thread arming, and seamless step-over state machine |
+| **Hardware Breakpoint / Watchpoint** | Modern unified API (`HW.attach` code breakpoint / `HW.watch` data watchpoint / `HW.watchDlopen` library monitoring), powered by ARM64 debug registers with zero code patching, zero stealth footprint, cross-thread arming, and seamless step-over state machine |
 | **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with registrable proxy domains (`dynamic.java.*`, `dynamic.native.*`; `unity` / `objc` mounted by runtime), eliminating script compilation overhead |
 
 ---
@@ -154,6 +154,12 @@ adb shell su -c "/data/local/tmp/artpi-cli -k com.example.app -f /data/local/tmp
 
 # 4. Or evaluate a single expression from command line
 adb shell su -c "/data/local/tmp/artpi-cli -k com.example.app -e 'findclass(\"*Activity\");'"
+
+# 5. Spawn and monitor dynamic library loading (zero-patch hardware breakpoint on dlopen)
+adb shell su -c "/data/local/tmp/artpi-cli -S com.example.app --lib-log"
+
+# 6. Spawn and pause main thread automatically when target SO library is loaded
+adb shell su -c "/data/local/tmp/artpi-cli -S com.example.app --stop-lib libnative.so"
 ```
 
 > **Connection Reuse**: `artpi-cli` automatically probes ports `20700..20800` to reconnect to an already injected Agent. If the target has not yet been injected, it extracts payloads and completes remote ptrace injection. If the app lacks `INTERNET` permissions, it automatically falls back to an abstract UNIX Domain Socket (`@artpi_agent_<pid>`).
@@ -421,20 +427,22 @@ Sample output:
 
 ---
 
-### 6.7 Hardware Breakpoints & Watchpoints (`HWBreakpoint` / `HWWatchpoint`) — Zero-Patching Pseudo-Hook
+### 6.7 Hardware Breakpoints & Watchpoints (`HW`) — Zero-Patching Pseudo-Hook & dlopen Monitoring
 
-Leveraging ARM64 physical hardware debug registers and Frida-Gum's `GumExceptor` engine, ArtPI provides an `Interceptor.attach`-like **pseudo-hook** syntax. **Zero code patching** is required (the `.text` section remains strictly read-only, leaving no memory patch signatures or `BRK` opcodes). An automatic **hardware single-step (Step-Over) state machine** handles step-over and re-arming upon each hit, completely eliminating infinite break loops.
+Leveraging ARM64 physical hardware debug registers and Frida-Gum's `GumExceptor` engine, ArtPI provides a modern, unified hardware breakpoint API. **Zero code patching** is required (the `.text` section remains strictly read-only, leaving no memory patch signatures or `BRK` opcodes). An automatic **hardware single-step (Step-Over) state machine** handles step-over and re-arming upon each hit, completely eliminating infinite break loops.
 
-#### 1. Core APIs
+#### 1. Core APIs (`HW`)
 
 | API | Signature | Description |
 |---|---|---|
-| `HWBreakpoint.attach` | `(target, options)` | Arm a hardware breakpoint (execution breakpoint) at the given symbol or address |
-| `HWWatchpoint.attach` | `(target, options)` | Arm a hardware watchpoint (data read/write breakpoint) on a memory address range |
-| `HWBreakpoint.list()` / `HWWatchpoint.list()` | `()` | List all active hardware breakpoint/watchpoint sessions |
-| `HWBreakpoint.detach(id)` / `HWWatchpoint.detach(id)` | `(id)` | Detach and free debug registers for a specific session ID |
-| `HWBreakpoint.detachAll()` / `HWWatchpoint.detachAll()` | `()` | Detach all hardware sessions and release all physical register slots |
+| `HW.attach` | `(target, options \| cb)` | Arm a **hardware execution breakpoint** (pseudo-hook / instruction interception) |
+| `HW.watch` | `(addr, options \| cb)` | Arm a **hardware watchpoint** (data read/write monitoring) |
+| `HW.watchDlopen` | `(options)` | Hardware breakpoint based `dlopen` monitor, logs SO loads and optionally pauses main thread upon target SO hit |
+| `HW.list()` | `()` | List all active hardware breakpoint/watchpoint sessions |
+| `HW.detach(id)` | `(id)` | Detach and free debug registers for a specific session ID |
+| `HW.detachAll()` | `()` | Detach all hardware sessions and release all physical register slots |
 | Global Aliases | `hwhook()` / `hwwatch()` / `hwunhook()` / `hwunhookall()` | Global convenience shortcuts |
+| Legacy Aliases | `HWBreakpoint.attach` / `HWWatchpoint.attach` | Backward compatibility with legacy API |
 
 **Target (`target`) Resolution**:
 - Symbol string: `"libnative.so!exported_func"` or `("libnative.so", "exported_func")`
@@ -442,12 +450,16 @@ Leveraging ARM64 physical hardware debug registers and Frida-Gum's `GumExceptor`
 - Integer / Pointer: `BigInt` / `Number`
 
 **Options (`options`)**:
-- `onEnter` / `onHit`: Callback function `function(ctx) { ... }`
+- `onEnter` / `onHit`: Callback function `function(ctx) { ... }` (passing a function directly as the 2nd argument is shorthand for `{ onEnter: cb }`)
 - `slot`: Specific debug register slot (`0` ~ `3`, default `-1` for automatic allocation)
 - `threadId`: Target thread TID (`0` for all existing threads in target process)
 - `once`: Single-shot trigger (`true` disarms after first hit; default `false` for continuous interception)
-- (Watchpoint) `size`: Watch byte size (`1`, `2`, `4`, `8`, default `4`)
-- (Watchpoint) `conditions`: Access condition (`'r'` read, `'w'` write, `'rw'` read/write, default `'w'`)
+- (`HW.watch` only) `size`: Watch byte size (`1`, `2`, `4`, `8`, default `4`)
+- (`HW.watch` only) `conditions`: Access condition (`'r'` read, `'w'` write, `'rw'` read/write, default `'w'`)
+- (`HW.watchDlopen` only) `stopLib`: Pause main thread automatically via futex when library matching name is loaded (type `resume` in REPL to continue)
+- (`HW.watchDlopen` only) `libLog`: Log all SO load events (default `true`)
+- (`HW.watchDlopen` only) `onLoading(path, caller)`: Callback fired when SO begins loading
+- (`HW.watchDlopen` only) `onLoaded(path, handle)`: Callback fired when SO finishes loading (captures return handle at LR)
 
 #### 2. Callback Context (`ctx`)
 
@@ -473,19 +485,43 @@ When a hardware breakpoint triggers, `ctx` delivers complete ARM64 execution con
 #### 3. Example
 
 ```javascript
-// Attach hardware execution breakpoint to JNI native method
-var bp = HWBreakpoint.attach("liboattest.so!Java_com_axhlzy_oattest_MainActivity_stringFromJNI", {
+// 1. Code execution interception (pseudo-hook / instruction breakpoint)
+var bp = HW.attach("liboattest.so!Java_com_axhlzy_oattest_MainActivity_stringFromJNI", {
     onEnter: function(ctx) {
-        console.log("[+] [HWBreakpoint HIT!] stringFromJNI entered!");
-        console.log("[+] PC: 0x" + ctx.pc.toString(16));
-        console.log("[+] LR: 0x" + ctx.lr.toString(16));
-        console.log("[+] JNIEnv (x0): 0x" + ctx.x0.toString(16));
-        console.log("[+] jobject (x1): 0x" + ctx.x1.toString(16));
+        console.log("[+] [HW HIT] stringFromJNI entered!");
+        console.log("[+] PC: 0x" + ctx.pc.toString(16) + ", LR: 0x" + ctx.lr.toString(16));
+        console.log("[+] JNIEnv (x0): 0x" + ctx.args[0].toString(16));
+        console.log("[+] jobject (x1): 0x" + ctx.args[1].toString(16));
     }
 });
 
-// Detach breakpoint
+// 2. Memory data access monitoring (hardware watchpoint)
+var wp = HW.watch("0x7012345000", {
+    size: 4,
+    conditions: "rw",
+    onHit: function(ctx) {
+        console.log("[+] [Watchpoint HIT] Addr: 0x" + ctx.memory.address.toString(16) +
+                    ", op: " + ctx.memory.operation + ", PC: 0x" + ctx.pc.toString(16));
+    }
+});
+
+// 3. Dynamic library loading monitor & interceptor (dlopen)
+HW.watchDlopen({
+    stopLib: "liboattest.so", // Pause main thread when liboattest.so is loaded
+    onLoading: function(name, caller) {
+        console.log("[dlopen] Loading SO: " + name + " (caller=0x" + caller.toString(16) + ")");
+    },
+    onLoaded: function(name, handle) {
+        console.log("[dlopen] Loaded SO: " + name + " handle=0x" + handle.toString(16));
+    }
+});
+
+// List all active hardware sessions
+console.log(JSON.stringify(HW.list()));
+
+// Detach specific or all sessions
 bp.detach();
+HW.detachAll();
 ```
 
 ---

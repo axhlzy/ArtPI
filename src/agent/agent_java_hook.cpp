@@ -477,6 +477,11 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
 }
 
 static JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    // TODO: [HW-JAVA-HOOK] Future Hardware Breakpoint Branch for Java Hook & Trace:
+    // 1. For JNI Native methods: Use HW.attach(artMethod->GetData()) directly without modifying ArtMethod or .text.
+    // 2. For AOT/JIT compiled methods: Use HW.attach(artMethod->GetEntryPointFromCompiledCode()) using Quick calling convention (x0=ArtMethod*, x1=this/arg0).
+    // 3. For Interpreted methods: Use HW.watch(&artMethod->dex_code_item_offset_, { conditions: 'r' }) to trap interpreter method dispatch without global bridge pollution.
+    // 4. For Java Trace: Step-Over state machine hardware single-step instruction tracing across method execution.
     if (argc < 1) return JS_NewString(ctx, "Usage: jhook(artMethod, [onEnter], [onLeave], [className], [methodName], [sig])");
     int64_t ptr = ParsePtr(ctx, argv[0]);
     if (!ptr || ptr < 0x1000) return JS_NewString(ctx, "[!] Invalid method pointer");

@@ -34,6 +34,8 @@ namespace {
         bool pauseMainThread = false;
         bool noPtrace = false;
         bool serverMode = false;
+        std::string stopLib;
+        bool libLog = false;
     };
 
     void Usage(const char *argv0) {
@@ -48,6 +50,8 @@ namespace {
             "  -S, --spawn [<pkg>]  Force-stop, launch app, and inject at startup specialization\n"
             "  -W, --wait <name>    Wait for a new process matching <name> (e.g. dex2oat), inject & pause\n"
             "  --pause              Keep target main thread paused after injection until 'resume' is entered\n"
+            "  -L, --lib-log        Log all libraries loaded via dlopen (hardware breakpoint based)\n"
+            "  --stop-lib <name>    Pause main thread when library matching <name> is loaded via dlopen\n"
             "  -t, --top            Attach to the foreground (top Activity) app\n"
             "  --no-ptrace          Inject via /proc/<pid>/mem without ptrace (auto-enabled if TracerPid != 0)\n"
             "  -e, --eval <script>  Evaluate a JavaScript expression and exit\n"
@@ -90,6 +94,16 @@ namespace {
             printf("[+] Server mode: ArtPI Agent is active, exiting.\n");
             exit(0);
         }
+        if (opt.libLog || !opt.stopLib.empty()) {
+            std::string js = "HW.watchDlopen({ stopLib: \"" + opt.stopLib + "\", libLog: true });";
+            std::string res, err;
+            if (artpi::injector::EvalScript(ep, js, res, err)) {
+                printf("[+] Armed hardware breakpoint on dlopen (stopLib='%s', libLog=%d)\n",
+                       opt.stopLib.empty() ? "(none)" : opt.stopLib.c_str(), opt.libLog ? 1 : 0);
+            } else {
+                fprintf(stderr, "[!] Failed to arm dlopen hardware breakpoint: %s\n", err.c_str());
+            }
+        }
         if (!opt.evalScript.empty()) {
             std::string result, err;
             if (artpi::injector::EvalScript(ep, opt.evalScript, result, err)) {
@@ -109,6 +123,10 @@ namespace {
         if (opt.pauseMainThread) {
             printf("[*] Target main thread (PID %d) is PAUSED. Set your hooks, then type 'resume' to continue!\n",
                    opt.pid);
+        } else if (!opt.stopLib.empty()) {
+            std::string res, err;
+            artpi::injector::EvalScript(ep, "Process.resume()", res, err);
+            printf("[*] App running. Will PAUSE automatically when '%s' is loaded via dlopen...\n", opt.stopLib.c_str());
         }
         printf("[*] Attaching directly to interactive REPL session...\n");
         artpi::injector::RunInteractiveRepl(ep);
@@ -305,6 +323,11 @@ int main(int argc, char **argv) {
             opt.pauseMainThread = true;
         }
         else if (a == "--pause") opt.pauseMainThread = true;
+        else if (a == "-L" || a == "--lib-log") opt.libLog = true;
+        else if (a == "--stop-lib") {
+            opt.stopLib = needValue("--stop-lib");
+            opt.libLog = true;
+        }
         else if (a == "-t" || a == "--top") opt.topActivity = true;
         else if (a == "--no-ptrace") opt.noPtrace = true;
         else if (a == "-e" || a == "--eval") opt.evalScript = needValue("-e/--eval");

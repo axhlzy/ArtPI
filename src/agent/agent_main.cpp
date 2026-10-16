@@ -144,6 +144,12 @@ bool ArtPIResumeProcess() {
     return false;
 }
 
+void ArtPIPauseCurrentThread(uint64_t pc) {
+    artpi_gate_state.pc = pc;
+    __atomic_store_n(&artpi_gate_state.paused, 1, __ATOMIC_RELEASE);
+    ArtPIGateWait();
+}
+
 }} // namespace artpi::agent
 
 namespace {
