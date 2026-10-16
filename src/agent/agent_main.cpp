@@ -4,20 +4,151 @@
 //
 #include "agent_net.h"
 #include "agent_js.h"
+#include "agent_common.h"
 #include "../../include/ArtPI.h"
 
 #include <pthread.h>
 #include <unistd.h>
 #include <cstdio>
 #include <fcntl.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <dlfcn.h>
 #include <android/log.h>
 
 #define AG_LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "ArtPI", __VA_ARGS__)
 #define AG_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "ArtPI", __VA_ARGS__)
 
+extern "C" {
+
+struct ArtPIGateState {
+    uint64_t regs[31];          // offset 0..240
+    uint64_t sp;                // offset 248
+    uint64_t pc;                // offset 256
+    uint64_t pstate;            // offset 264
+    volatile int32_t paused;    // offset 272 (1 = paused, 0 = resumed)
+    int32_t  pad;
+};
+
+__attribute__((visibility("default"), used))
+ArtPIGateState artpi_gate_state = {};
+
+
+
+__attribute__((visibility("default"), used))
+ArtPIGateState* ArtPIGateWait() {
+    AG_LOGI("ArtPIGateWait: main thread (tid=%d) paused at PC=0x%llx, waiting for resume()...",
+            gettid(), (unsigned long long) artpi_gate_state.pc);
+    while (__atomic_load_n(&artpi_gate_state.paused, __ATOMIC_ACQUIRE) != 0) {
+        syscall(__NR_futex, const_cast<int32_t*>(&artpi_gate_state.paused),
+                FUTEX_WAIT, 1, nullptr, nullptr, 0);
+    }
+    AG_LOGI("ArtPIGateWait: main thread (tid=%d) resumed -> jumping to PC=0x%llx",
+            gettid(), (unsigned long long) artpi_gate_state.pc);
+    return &artpi_gate_state;
+}
+
+__attribute__((visibility("default"), used))
+void artpi_gate_trampoline();
+
+} // extern "C"
+
+__asm__(
+    ".text\n"
+    ".align 4\n"
+    ".global artpi_gate_trampoline\n"
+    ".type artpi_gate_trampoline, %function\n"
+    "artpi_gate_trampoline:\n"
+    "sub sp, sp, #512\n"
+    "stp q0,  q1,  [sp, #0]\n"
+    "stp q2,  q3,  [sp, #32]\n"
+    "stp q4,  q5,  [sp, #64]\n"
+    "stp q6,  q7,  [sp, #96]\n"
+    "stp q8,  q9,  [sp, #128]\n"
+    "stp q10, q11, [sp, #160]\n"
+    "stp q12, q13, [sp, #192]\n"
+    "stp q14, q15, [sp, #224]\n"
+    "stp q16, q17, [sp, #256]\n"
+    "stp q18, q19, [sp, #288]\n"
+    "stp q20, q21, [sp, #320]\n"
+    "stp q22, q23, [sp, #352]\n"
+    "stp q24, q25, [sp, #384]\n"
+    "stp q26, q27, [sp, #416]\n"
+    "stp q28, q29, [sp, #448]\n"
+    "stp q30, q31, [sp, #480]\n"
+
+    "bl ArtPIGateWait\n"
+    "mov x16, x0\n"
+
+    "ldp q0,  q1,  [sp, #0]\n"
+    "ldp q2,  q3,  [sp, #32]\n"
+    "ldp q4,  q5,  [sp, #64]\n"
+    "ldp q6,  q7,  [sp, #96]\n"
+    "ldp q8,  q9,  [sp, #128]\n"
+    "ldp q10, q11, [sp, #160]\n"
+    "ldp q12, q13, [sp, #192]\n"
+    "ldp q14, q15, [sp, #224]\n"
+    "ldp q16, q17, [sp, #256]\n"
+    "ldp q18, q19, [sp, #288]\n"
+    "ldp q20, q21, [sp, #320]\n"
+    "ldp q22, q23, [sp, #352]\n"
+    "ldp q24, q25, [sp, #384]\n"
+    "ldp q26, q27, [sp, #416]\n"
+    "ldp q28, q29, [sp, #448]\n"
+    "ldp q30, q31, [sp, #480]\n"
+    "add sp, sp, #512\n"
+
+    "ldr  x17, [x16, #264]\n"
+    "msr  nzcv, x17\n"
+    "ldr  x17, [x16, #248]\n"
+    "mov  sp, x17\n"
+
+    "ldp x0,  x1,  [x16, #0]\n"
+    "ldp x2,  x3,  [x16, #16]\n"
+    "ldp x4,  x5,  [x16, #32]\n"
+    "ldp x6,  x7,  [x16, #48]\n"
+    "ldp x8,  x9,  [x16, #64]\n"
+    "ldp x10, x11, [x16, #80]\n"
+    "ldp x12, x13, [x16, #96]\n"
+    "ldp x14, x15, [x16, #112]\n"
+    "ldp x18, x19, [x16, #144]\n"
+    "ldp x20, x21, [x16, #160]\n"
+    "ldp x22, x23, [x16, #176]\n"
+    "ldp x24, x25, [x16, #192]\n"
+    "ldp x26, x27, [x16, #208]\n"
+    "ldp x28, x29, [x16, #224]\n"
+    "ldr x30,      [x16, #240]\n"
+    "ldr x17,      [x16, #256]\n"
+    "ldr x16,      [x16, #128]\n"
+    "br  x17\n"
+);
+
+namespace artpi { namespace agent {
+
+bool ArtPIIsProcessPaused() {
+    return __atomic_load_n(&artpi_gate_state.paused, __ATOMIC_ACQUIRE) != 0;
+}
+
+uint64_t ArtPIGetGatePc() {
+    return artpi_gate_state.pc;
+}
+
+bool ArtPIResumeProcess() {
+    int32_t expected = 1;
+    if (__atomic_compare_exchange_n(&artpi_gate_state.paused, &expected, 0,
+                                    false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+        syscall(__NR_futex, const_cast<int32_t*>(&artpi_gate_state.paused),
+                FUTEX_WAKE, 0x7fffffff, nullptr, nullptr, 0);
+        return true;
+    }
+    return false;
+}
+
+}} // namespace artpi::agent
+
 namespace {
 
-JavaVM* FindJavaVM() {
+[[maybe_unused]] JavaVM* FindJavaVM() {
     typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
     void* handle = xdl_open("libart.so", XDL_DEFAULT);
     if (!handle) handle = xdl_open("libdvm.so", XDL_DEFAULT);
@@ -79,33 +210,14 @@ artpi::msgpack::Value HandleClientCommand(const artpi::msgpack::Value& req) {
 
 void* AgentThreadEntry(void*) {
     AG_LOGI("AgentThreadEntry: start (tid=%d)", gettid());
-    // 1. Resolve JavaVM & JNIEnv (poll briefly in case of very early spawn injection)
-    JavaVM* vm = nullptr;
-    for (int i = 0; i < 50; ++i) {
-        vm = FindJavaVM();
-        if (vm) break;
-        usleep(10 * 1000);
-    }
-    AG_LOGI("AgentThreadEntry: FindJavaVM -> %p", (void*) vm);
-    JNIEnv* env = nullptr;
-    if (vm) {
-        vm->AttachCurrentThread(&env, nullptr);
-    }
-    AG_LOGI("AgentThreadEntry: AttachCurrentThread -> %p", (void*) env);
 
-    if (env) {
-        // 3. Initialize Core ArtPI (from libartpi_static.a)
-        AG_LOGI("AgentThreadEntry: PI::init ...");
-        PI::init(env);
-        AG_LOGI("AgentThreadEntry: PI::init done");
-    }
-
-    // 4. Initialize QuickJS Runtime & Bindings
+    // 1. Initialize QuickJS Runtime & Bindings immediately (without blocking on JNI/ART locks).
+    //    JavaVM / PI::init / ClassLoader are lazily initialized on the first GetEnv() call.
     AG_LOGI("AgentThreadEntry: InitJs ...");
-    bool jsOk = artpi::agent::InitJs(env);
+    bool jsOk = artpi::agent::InitJs(nullptr);
     AG_LOGI("AgentThreadEntry: InitJs -> %d", jsOk ? 1 : 0);
 
-    // 5. Start Agent NetServer (MessagePack over TCP / AF_UNIX)
+    // 2. Start Agent NetServer (MessagePack over TCP / AF_UNIX) immediately
     AG_LOGI("AgentThreadEntry: StartServer ...");
     bool srvOk = artpi::agent::StartServer(HandleClientCommand);
     for (int i = 0; i < 60; ++i) {
@@ -117,10 +229,6 @@ void* AgentThreadEntry(void*) {
     AG_LOGI("AgentThreadEntry: StartServer -> %d, tcp_port=%d, unix=%s",
             srvOk ? 1 : 0, artpi::agent::GetServerPort(), unixName ? unixName : "(none)");
 
-    if (vm) {
-        vm->DetachCurrentThread();
-    }
-
     return nullptr;
 }
 
@@ -131,6 +239,7 @@ void ArtPiAgentCtor() {
     int rc = pthread_create(&th, nullptr, AgentThreadEntry, nullptr);
     AG_LOGI("ArtPiAgentCtor: pthread_create rc=%d tid=%lu", rc, (unsigned long) th);
     if (rc == 0) pthread_detach(th);
+
 }
 
 } // namespace

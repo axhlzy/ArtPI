@@ -26,10 +26,12 @@ namespace {
     struct Options {
         int pid = 0;
         std::string pkgName;
+        std::string waitName;
         std::string libPath;
         std::string evalScript;
         bool topActivity = false;
         bool spawnMode = false;
+        bool pauseMainThread = false;
         bool noPtrace = false;
         bool serverMode = false;
     };
@@ -44,6 +46,8 @@ namespace {
             "  -P, --pid <pid>      Target process PID\n"
             "  -k, --pkg <name>     Target package name (e.g. com.example.app)\n"
             "  -S, --spawn [<pkg>]  Force-stop, launch app, and inject at startup specialization\n"
+            "  -W, --wait <name>    Wait for a new process matching <name> (e.g. dex2oat), inject & pause\n"
+            "  --pause              Keep target main thread paused after injection until 'resume' is entered\n"
             "  -t, --top            Attach to the foreground (top Activity) app\n"
             "  --no-ptrace          Inject via /proc/<pid>/mem without ptrace (auto-enabled if TracerPid != 0)\n"
             "  -e, --eval <script>  Evaluate a JavaScript expression and exit\n"
@@ -92,11 +96,19 @@ namespace {
                 if (!result.empty() && result != "undefined" && result != "[undefined]") {
                     printf("%s\n", result.c_str());
                 }
-                exit(0);
+                if (!opt.pauseMainThread) {
+                    exit(0);
+                }
             } else {
                 fprintf(stderr, "[!] %s\n", err.c_str());
-                exit(1);
+                if (!opt.pauseMainThread) {
+                    exit(1);
+                }
             }
+        }
+        if (opt.pauseMainThread) {
+            printf("[*] Target main thread (PID %d) is PAUSED. Set your hooks, then type 'resume' to continue!\n",
+                   opt.pid);
         }
         printf("[*] Attaching directly to interactive REPL session...\n");
         artpi::injector::RunInteractiveRepl(ep);
@@ -288,6 +300,11 @@ int main(int argc, char **argv) {
                 opt.pkgName = argv[++i];
             }
         }
+        else if (a == "-W" || a == "--wait") {
+            opt.waitName = needValue("-W/--wait");
+            opt.pauseMainThread = true;
+        }
+        else if (a == "--pause") opt.pauseMainThread = true;
         else if (a == "-t" || a == "--top") opt.topActivity = true;
         else if (a == "--no-ptrace") opt.noPtrace = true;
         else if (a == "-e" || a == "--eval") opt.evalScript = needValue("-e/--eval");
@@ -330,7 +347,43 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> preExtractedPayload;
     std::string preDeployedSoPath;
 
-    if (opt.spawnMode) {
+    if (!opt.waitName.empty()) {
+        std::string preErr;
+        bool ok = opt.libPath.empty() ? ExtractEmbeddedPayload(preExtractedPayload, preErr, "PPAYLOAD")
+                                      : ReadFileAll(opt.libPath, preExtractedPayload, preErr);
+        if (!ok) {
+            fprintf(stderr, "[!] payload extraction failed: %s\n", preErr.c_str());
+            return 1;
+        }
+        std::string dataDir, dataErr;
+        if (ResolveAppDataDir(0, opt.waitName, dataDir, dataErr)) {
+            if (DeployPayload(dataDir, dataDir, preExtractedPayload, preDeployedSoPath, preErr)) {
+                printf("[+] pre-deployed payload -> %s (%zu bytes)\n",
+                       preDeployedSoPath.c_str(), preExtractedPayload.size());
+            }
+        } else {
+            // Native process (e.g. dex2oat): pre-deploy to /data/app/libartpi_agent.so
+            // (since u:r:dex2oat:s0 can search /data/app [apk_data_file], unlike /data/local/tmp [shell_data_file])
+            // with system_lib_file SELinux label from /system/lib64/libc.so.
+            if (DeployPayload("/data/app", "/system/lib64/libc.so",
+                              preExtractedPayload, preDeployedSoPath, preErr) ||
+                DeployPayload("/data/local/tmp", "/system/lib64/libc.so",
+                              preExtractedPayload, preDeployedSoPath, preErr)) {
+                printf("[+] pre-deployed payload -> %s (%zu bytes)\n",
+                       preDeployedSoPath.c_str(), preExtractedPayload.size());
+            }
+        }
+
+        pid_t waitedPid = -1;
+        std::string matchedName, waitErr;
+        if (!WaitForNewProcessByName(opt.waitName, waitedPid, matchedName, waitErr)) {
+            fprintf(stderr, "[!] wait failed: %s\n", waitErr.c_str());
+            return 1;
+        }
+        opt.pid = waitedPid;
+        if (opt.pkgName.empty()) opt.pkgName = matchedName;
+        printf("[+] caught new process '%s' -> PID %d\n", matchedName.c_str(), opt.pid);
+    } else if (opt.spawnMode) {
         if (opt.pkgName.empty()) {
             fprintf(stderr, "[!] -S/--spawn requires a package name (-S <pkg> or -k <pkg>)\n");
             return 1;
@@ -392,7 +445,7 @@ int main(int argc, char **argv) {
     // 2. If libartpi_agent.so is ALREADY mapped in the target process (e.g. server starting up),
     // do NOT re-deploy (which truncates the running .so causing SIGBUS crash!)
     // and do NOT re-inject. Wait briefly and retry connecting!
-    if (IsLibraryMapped(opt.pid, "libartpi_agent.so")) {
+    if (!opt.spawnMode && IsLibraryMapped(opt.pid, "libartpi_agent.so")) {
         printf("[*] libartpi_agent.so is mapped in PID %d, waiting for agent to come up...\n", opt.pid);
         for (int retry = 0; retry < 25; retry++) {
             usleep(200 * 1000);
@@ -420,7 +473,9 @@ int main(int argc, char **argv) {
 
     // apkPath is used to pick the linker-namespace caller (base.apk mapping) when available.
     std::string libDir, apkPath;
-    FindAppLibDir(opt.pid, opt.pkgName, libDir, apkPath);
+    if (!opt.spawnMode) {
+        FindAppLibDir(opt.pid, opt.pkgName, libDir, apkPath);
+    }
 
     std::string deployedSoPath = preDeployedSoPath;
     bool deployed = !deployedSoPath.empty();
@@ -436,14 +491,25 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "[i] %s, falling back to lib dir\n", dataErr.c_str());
         }
+        if (!deployed && !libDir.empty()) {
+            if (DeployPayload(libDir, apkPath, payload, deployedSoPath, err)) {
+                deployed = true;
+            }
+        }
+        // Fallback for non-app native processes (e.g. dex2oat64): deploy to /data/app (or /data/local/tmp)
         if (!deployed) {
-            if (libDir.empty() || !DeployPayload(libDir, apkPath, payload, deployedSoPath, err)) {
+            if (DeployPayload("/data/app", "/system/lib64/libc.so", payload, deployedSoPath, err) ||
+                DeployPayload("/data/local/tmp", "/system/lib64/libc.so", payload, deployedSoPath, err)) {
+                deployed = true;
+            } else {
                 fprintf(stderr, "[!] deploy failed: %s\n", err.c_str());
                 return 1;
             }
         }
         printf("[+] deployed payload -> %s\n", deployedSoPath.c_str());
     }
+
+
 
     size_t lastSlash = apkPath.rfind('/');
     std::string apkPrefix = (lastSlash != std::string::npos) ? apkPath.substr(0, lastSlash + 1) : "";
@@ -463,7 +529,7 @@ int main(int argc, char **argv) {
         injOk = InjectLibraryNoPtrace(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err);
     } else {
         printf("[*] injecting libartpi_agent.so via ptrace (SEIZE) into pid %d ...\n", opt.pid);
-        injOk = InjectLibrary(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err);
+        injOk = InjectLibrary(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err, opt.pauseMainThread);
         if (!injOk && err.find("PTRACE_") != std::string::npos) {
             printf("[!] ptrace attach failed (%s), falling back to --no-ptrace (/proc/mem) mode...\n", err.c_str());
             err.clear();

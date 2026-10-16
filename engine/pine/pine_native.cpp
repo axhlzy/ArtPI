@@ -21,6 +21,9 @@
 #include <sstream>
 #include <unwind.h>
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +32,7 @@ using namespace pine;
 
 static std::atomic<bool> g_pine_native_initialized{false};
 static JavaVM* g_jvm = nullptr;
+static std::atomic<uint32_t> g_javaLangClassArtPtr{0};
 
 namespace pine_native {
 
@@ -95,6 +99,16 @@ bool PineNative_Init(JNIEnv* env) {
 
     // Initialize ArtMethod member offsets without loading any Java Ruler class
     art::ArtMethod::InitMembersNative(env);
+
+    if (jclass jlCls = env->FindClass("java/lang/Class")) {
+        void* rawCls = PineNative_ToArtObject(env, jlCls);
+        if (rawCls) {
+            g_javaLangClassArtPtr.store(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rawCls)),
+                                        std::memory_order_release);
+        }
+        env->DeleteLocalRef(jlCls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
 
     g_pine_native_initialized.store(true, std::memory_order_release);
     LOGI("PineNative_Init successfully initialized!");
@@ -1256,6 +1270,77 @@ extern "C" PINE_EXPORT bool PineNative_GetSavedHookManagedStack(uintptr_t out_sa
     return true;
 }
 
+static bool SafeReadUint32(uintptr_t addr, uint32_t* out) {
+    struct iovec local = {out, sizeof(uint32_t)};
+    struct iovec remote = {reinterpret_cast<void*>(addr), sizeof(uint32_t)};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == sizeof(uint32_t);
+}
+
+static bool IsValidArtHeapObject(JNIEnv* env, uint64_t val) {
+    if (val < 0x10000ULL || val >= 0x100000000ULL || (val & 0x7ULL) != 0) {
+        return false;
+    }
+    uint32_t classClassPtr = g_javaLangClassArtPtr.load(std::memory_order_acquire);
+    if (classClassPtr == 0 && env) {
+        if (jclass jlCls = env->FindClass("java/lang/Class")) {
+            void* rawCls = PineNative_ToArtObject(env, jlCls);
+            if (rawCls) {
+                classClassPtr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rawCls));
+                g_javaLangClassArtPtr.store(classClassPtr, std::memory_order_release);
+            }
+            env->DeleteLocalRef(jlCls);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+    if (classClassPtr == 0) return false;
+
+    uint32_t k1 = 0;
+    if (!SafeReadUint32(static_cast<uintptr_t>(val), &k1)) {
+        return false;
+    }
+    if (k1 < 0x10000U || (k1 & 0x7U) != 0) {
+        return false;
+    }
+    uint32_t k2 = 0;
+    if (!SafeReadUint32(static_cast<uintptr_t>(k1), &k2)) {
+        return false;
+    }
+    return k2 == classClassPtr;
+}
+
+// Pin ART callee-saved registers (x20..x28) that hold live mirror::Object*
+// references across the hook body so that if a Moving GC runs during
+// onEnter/callOriginal/onLeave, the moved object addresses are written back
+// into ctx->r[20..28] before returning to the AOT/JIT caller.
+struct ScopedPinCalleeSavedRefs {
+    JNIEnv* env = nullptr;
+    PineNativeContext* ctx = nullptr;
+    jobject pinned[9] = {nullptr};
+
+    ScopedPinCalleeSavedRefs(JNIEnv* e, PineNativeContext* c) : env(e), ctx(c) {
+        if (!env || !ctx) return;
+        for (int i = 0; i < 9; ++i) {
+            uint64_t raw = ctx->r[20 + i];
+            if (IsValidArtHeapObject(env, raw)) {
+                pinned[i] = PineNative_ToJObject(env, reinterpret_cast<void*>(raw));
+            }
+        }
+    }
+
+    ~ScopedPinCalleeSavedRefs() {
+        if (!env || !ctx) return;
+        for (int i = 0; i < 9; ++i) {
+            if (pinned[i]) {
+                void* updated = PineNative_ToArtObject(env, pinned[i]);
+                if (updated) {
+                    ctx->r[20 + i] = reinterpret_cast<uintptr_t>(updated);
+                }
+                env->DeleteLocalRef(pinned[i]);
+            }
+        }
+    }
+};
+
 static void MethodHookDispatcher(void* target, PineNativeContext* ctx, void* origin) {
     if (tl_active_hooks.find(target) != tl_active_hooks.end()) {
         // Recursion detected on this thread for this method! Directly invoke origin/backup.
@@ -1284,6 +1369,7 @@ static void MethodHookDispatcher(void* target, PineNativeContext* ctx, void* ori
     // Make the managed stack walkable for the whole hook body (JS callback +
     // callOriginal), so the hooked method's own stack walks don't abort.
     ScopedHookManagedStack msguard(env);
+    ScopedPinCalleeSavedRefs pinguard(env, ctx);
 
     tl_active_hooks.insert(target);
     struct RecursionGuard {

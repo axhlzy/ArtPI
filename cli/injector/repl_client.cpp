@@ -250,6 +250,15 @@ const std::vector<std::string> kCompletions = {
     "findandhookall(",
     "Java.findAndHook(",
     "Java.findAndHookAll(",
+    "Process.",
+    "Process.enumerateThreads()",
+    "Process.enumerateModules()",
+    "Process.findModuleByName(",
+    "Process.findModuleByAddress(",
+    "Process.findSymbol(",
+    "Process.enumerateRanges(",
+    "Process.resume()",
+    "resume",
     "nhook(",
     "unhook(",
     "unhookall()",
@@ -1235,6 +1244,7 @@ static void RunInteractiveSession(const AgentEndpoint& ep) {
               << "========================================================\n" << std::endl;
 
     std::atomic<bool> running{true};
+    std::atomic<bool> isExiting{false};
     std::atomic<int64_t> currentSeq{1};
     std::atomic<int64_t> lastCompletedSeq{0};
 
@@ -1288,7 +1298,9 @@ static void RunInteractiveSession(const AgentEndpoint& ep) {
                             std::string err = frame.getString("err", "error");
                             std::cout << "\r\033[K[!] " << err << "\r\n";
                         }
-                        RefreshLineLocked();
+                        if (!isExiting.load()) {
+                            RefreshLineLocked();
+                        }
                     } else if (t == 3) {
                         // EVT: async event / console log stream
                         std::string ch = frame.getString("ch");
@@ -1298,7 +1310,9 @@ static void RunInteractiveSession(const AgentEndpoint& ep) {
                         std::lock_guard<std::mutex> lk(g_termMutex);
                         ClearMenuLocked();
                         std::cout << "\r\033[K[" << ch << "] " << text << "\r\n";
-                        RefreshLineLocked();
+                        if (!isExiting.load()) {
+                            RefreshLineLocked();
+                        }
                     }
                 }
                 rbuf.erase(rbuf.begin(), rbuf.begin() + 4 + frameLen);
@@ -1352,6 +1366,31 @@ static void RunInteractiveSession(const AgentEndpoint& ep) {
         for (int w = 0; w < 50; w++) {
             if (lastCompletedSeq.load() >= seq) break;
             usleep(20 * 1000);
+        }
+    }
+
+    isExiting.store(true);
+
+    // If target process main thread is still paused, auto-resume it so the app doesn't hang
+    {
+        msgpack::Value req = msgpack::Value::makeMap();
+        req.set("t", msgpack::Value(1)); // 1 = CMD
+        int64_t seq = currentSeq.fetch_add(1);
+        req.set("seq", msgpack::Value(seq));
+        req.set("cmd", msgpack::Value("eval"));
+
+        msgpack::Value args = msgpack::Value::makeMap();
+        args.set("script", msgpack::Value(
+            "if (typeof Process !== 'undefined' && Process.isPaused && Process.isPaused()) { "
+            "Process.resume(); "
+            "}"));
+        req.set("args", args);
+
+        if (SendMsgpackFrame(fd, req)) {
+            for (int w = 0; w < 25; w++) {
+                if (lastCompletedSeq.load() >= seq) break;
+                usleep(20 * 1000);
+            }
         }
     }
 

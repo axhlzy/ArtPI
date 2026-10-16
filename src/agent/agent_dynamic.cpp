@@ -24,8 +24,9 @@ namespace {
 static JSValue JsGetCompletionData(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
     JSValue root = JS_NewObject(ctx);
 
-    // 1. Initial App Classes (keep payload fast & lightweight, < 300 entries)
-    JNIEnv* env = GetEnv();
+    // 1. Initial App Classes (keep payload fast & lightweight, < 300 entries).
+    //    Skip JNI enumeration while the main thread is paused in the startup gate.
+    JNIEnv* env = ArtPIIsProcessPaused() ? nullptr : GetEnv();
     std::vector<std::string> classes;
     if (env) {
         std::string pkg;

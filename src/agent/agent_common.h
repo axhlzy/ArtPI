@@ -59,4 +59,9 @@ void InstallConsole(JSContext* ctx);
 int AgentReleaseMethodInstrumentation(void* artMethod);
 std::string FormatReleasedInstrumentation(int mask);
 
+// Early-startup main-thread pause gate (used by -W/--wait and --pause)
+bool ArtPIIsProcessPaused();
+uint64_t ArtPIGetGatePc();
+bool ArtPIResumeProcess();
+
 }} // namespace artpi::agent

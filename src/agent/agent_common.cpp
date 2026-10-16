@@ -6,6 +6,7 @@
 #include "agent_java.h"
 #include "agent_trace.h"
 #include "agent_debug.h"
+#include "../../include/ArtPI.h"
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -16,6 +17,7 @@ JSRuntime* g_rt = nullptr;
 JSContext* g_ctx = nullptr;
 std::mutex g_jsMutex;
 JavaVM* g_jvm = nullptr;
+static bool g_piInited = false;
 
 thread_local int t_jsReentrancyDepth = 0;
 
@@ -26,7 +28,25 @@ static std::vector<std::string> g_cachedClassNames;
 static std::mutex g_namesMutex;
 
 JNIEnv* GetEnv() {
-    if (!g_jvm) return nullptr;
+    if (!g_jvm) {
+        static std::mutex g_jvmMutex;
+        std::lock_guard<std::mutex> lk(g_jvmMutex);
+        if (!g_jvm) {
+            typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
+            void* handle = xdl_open("libart.so", XDL_DEFAULT);
+            if (handle) {
+                auto getVms = reinterpret_cast<JNI_GetCreatedJavaVMs_t>(
+                    xdl_sym(handle, "JNI_GetCreatedJavaVMs", nullptr));
+                JavaVM* vms[2] = {nullptr};
+                jsize num = 0;
+                if (getVms && getVms(vms, 2, &num) == JNI_OK && num > 0) {
+                    g_jvm = vms[0];
+                }
+                xdl_close(handle);
+            }
+        }
+        if (!g_jvm) return nullptr;
+    }
     JNIEnv* env = nullptr;
     jint status = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
     if (status == JNI_EDETACHED) {
@@ -35,6 +55,14 @@ JNIEnv* GetEnv() {
 #else
         g_jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
 #endif
+    }
+    if (env) {
+        static std::once_flag g_piOnce;
+        std::call_once(g_piOnce, [env]() {
+            g_piInited = true;
+            PI::init(env);
+            InitJRefClassCache(env);
+        });
     }
     return env;
 }

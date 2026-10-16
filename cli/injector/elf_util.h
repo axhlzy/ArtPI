@@ -49,5 +49,11 @@ bool IsAppSpecialized(pid_t pid);
 // (via LOG_ID_EVENTS am_proc_start + /proc fast poll), and wait until specialized.
 bool SpawnAndWatchPackage(const std::string& pkgName, pid_t& outPid, std::string& err);
 
+// Wait for a newly started process whose cmdline or comm matches `procPattern`
+// (case-insensitive substring or wildcard, e.g. "dex2oat" or "com.example.app").
+bool WaitForNewProcessByName(const std::string& procPattern, pid_t& outPid,
+                             std::string& outName, std::string& err);
+
+
 
 

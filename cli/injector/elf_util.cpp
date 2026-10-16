@@ -320,7 +320,7 @@ static bool IsValidPkgName(const std::string& pkg) {
 }
 
 static std::string ResolveLauncherComponent(const std::string& pkg) {
-    std::string cmd = "cmd package resolve-activity --brief " + pkg + " 2>/dev/null";
+    std::string cmd = "cmd package resolve-activity --brief " + pkg + " </dev/null 2>/dev/null";
     FILE* fp = popen(cmd.c_str(), "r");
     if (!fp) return "";
     char line[512];
@@ -337,7 +337,7 @@ static std::string ResolveLauncherComponent(const std::string& pkg) {
 
 static bool ForceStopAndWaitDead(const std::string& pkg) {
     if (!IsValidPkgName(pkg)) return false;
-    std::string cmd = "am force-stop " + pkg + " >/dev/null 2>&1";
+    std::string cmd = "am force-stop " + pkg + " </dev/null >/dev/null 2>&1";
     system(cmd.c_str());
     for (int i = 0; i < 50; ++i) {
         pid_t p = FindPidByPackageName(pkg);
@@ -352,10 +352,10 @@ static bool LaunchAppPackage(const std::string& pkg) {
     if (!IsValidPkgName(pkg)) return false;
     std::string comp = ResolveLauncherComponent(pkg);
     if (!comp.empty()) {
-        std::string cmd = "am start -n " + comp + " >/dev/null 2>&1";
+        std::string cmd = "am start -n " + comp + " </dev/null >/dev/null 2>&1";
         if (system(cmd.c_str()) == 0) return true;
     }
-    std::string monkeyCmd = "monkey -p " + pkg + " -c android.intent.category.LAUNCHER --pct-syskeys 0 --pct-anyevent 0 1 >/dev/null 2>&1";
+    std::string monkeyCmd = "monkey -p " + pkg + " -c android.intent.category.LAUNCHER --pct-syskeys 0 --pct-anyevent 0 1 </dev/null >/dev/null 2>&1";
     return system(monkeyCmd.c_str()) == 0;
 }
 
@@ -438,9 +438,10 @@ bool SpawnAndWatchPackage(const std::string& pkgName, pid_t& outPid, std::string
 
     // Launch the app asynchronously after watchers are armed
     printf("[*] Launching '%s' and waiting for am_proc_start / zygote specialize...\n", pkgName.c_str());
-    std::thread launchThread([&]() {
+    std::string launchPkg = pkgName;
+    std::thread launchThread([launchPkg]() {
         usleep(15 * 1000);
-        LaunchAppPackage(pkgName);
+        LaunchAppPackage(launchPkg);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10000);
@@ -450,9 +451,9 @@ bool SpawnAndWatchPackage(const std::string& pkgName, pid_t& outPid, std::string
     }
 
     stopWatch.store(true, std::memory_order_relaxed);
-    if (launchThread.joinable()) launchThread.join();
-    if (eventThread.joinable()) eventThread.join();
-    if (procThread.joinable()) procThread.join();
+    if (launchThread.joinable()) launchThread.detach();
+    if (eventThread.joinable()) eventThread.detach();
+    if (procThread.joinable()) procThread.detach();
 
     pid_t pid = caughtPid.load();
     if (pid <= 0) {
@@ -476,6 +477,151 @@ bool SpawnAndWatchPackage(const std::string& pkgName, pid_t& outPid, std::string
     outPid = pid;
     return true;
 }
+
+#include <unordered_set>
+
+namespace {
+
+static std::string ToLowerAscii(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return out;
+}
+
+static bool DoesProcessMatch(pid_t pid, pid_t selfPid, pid_t parentPid,
+                             const std::string& lowerPat, std::string& outName) {
+    if (pid <= 1 || pid == selfPid || pid == parentPid) return false;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", static_cast<int>(pid));
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[512] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    std::string argv0(buf, n > 0 ? strlen(buf) : 0);
+    if (argv0.find("artpi-cli") != std::string::npos) return false;
+    const char* slash = strrchr(argv0.c_str(), '/');
+    std::string base = slash ? (slash + 1) : argv0;
+    if (base == "sh" || base == "su" || base == "bash" || base == "magisk" || base == "adbd") {
+        return false;
+    }
+
+    std::string comm;
+    snprintf(path, sizeof(path), "/proc/%d/comm", static_cast<int>(pid));
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char cbuf[128] = {0};
+        ssize_t cn = read(fd, cbuf, sizeof(cbuf) - 1);
+        close(fd);
+        if (cn > 0) {
+            cbuf[strcspn(cbuf, "\r\n")] = '\0';
+            comm = cbuf;
+        }
+    }
+
+    if (comm == "artpi-cli" || comm == "sh" || comm == "su") return false;
+
+    std::string lArgv0 = ToLowerAscii(argv0);
+    std::string lBase  = ToLowerAscii(base);
+    std::string lComm  = ToLowerAscii(comm);
+
+    if ((!lBase.empty() && lBase.find(lowerPat) != std::string::npos) ||
+        (!lArgv0.empty() && lArgv0.find(lowerPat) != std::string::npos) ||
+        (!lComm.empty() && lComm.find(lowerPat) != std::string::npos)) {
+        // Avoid matching unspecialized zygote64/usap64 before setArgV0 sets package/process name
+        if (lBase == "zygote" || lBase == "zygote64" || lBase == "usap32" || lBase == "usap64" ||
+            lComm == "zygote" || lComm == "zygote64" || lComm == "usap32" || lComm == "usap64") {
+            return false;
+        }
+        outName = !argv0.empty() ? argv0 : comm;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool WaitForNewProcessByName(const std::string& procPattern, pid_t& outPid,
+                             std::string& outName, std::string& err) {
+    outPid = -1;
+    outName.clear();
+    if (procPattern.empty()) {
+        err = "empty process pattern";
+        return false;
+    }
+
+    std::string lowerPat = ToLowerAscii(procPattern);
+    pid_t selfPid = getpid();
+    pid_t parentPid = getppid();
+
+    // Snapshot currently running matching PIDs so we only trigger on a NEW process instance
+    std::unordered_set<pid_t> existingPids;
+    if (DIR* dir = opendir("/proc")) {
+        struct dirent* ent = nullptr;
+        while ((ent = readdir(dir)) != nullptr) {
+            if (ent->d_type != DT_DIR) continue;
+            char* endp = nullptr;
+            long p = strtol(ent->d_name, &endp, 10);
+            if (*endp != '\0' || p <= 1) continue;
+            std::string tmp;
+            if (DoesProcessMatch(static_cast<pid_t>(p), selfPid, parentPid, lowerPat, tmp)) {
+                existingPids.insert(static_cast<pid_t>(p));
+            }
+        }
+        closedir(dir);
+    }
+
+    printf("[*] Waiting for new process matching '%s' (existing ignored: %zu)...\n",
+           procPattern.c_str(), existingPids.size());
+
+    for (;;) {
+        DIR* dir = opendir("/proc");
+        if (!dir) {
+            err = "cannot open /proc";
+            return false;
+        }
+        struct dirent* ent = nullptr;
+        pid_t foundPid = -1;
+        std::string foundName;
+        while ((ent = readdir(dir)) != nullptr) {
+            if (ent->d_type != DT_DIR) continue;
+            char* endp = nullptr;
+            long p = strtol(ent->d_name, &endp, 10);
+            if (*endp != '\0' || p <= 1) continue;
+            pid_t pid = static_cast<pid_t>(p);
+            if (existingPids.find(pid) != existingPids.end()) continue;
+            if (DoesProcessMatch(pid, selfPid, parentPid, lowerPat, foundName)) {
+                foundPid = pid;
+                break;
+            }
+        }
+        closedir(dir);
+
+        if (foundPid > 0) {
+            // Wait until it leaves zygote/usap domain if it was forked from Zygote
+            auto specDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+            while (!IsAppSpecialized(foundPid)) {
+                if (kill(foundPid, 0) != 0) {
+                    foundPid = -1;
+                    break;
+                }
+                if (std::chrono::steady_clock::now() >= specDeadline) break;
+                usleep(1000);
+            }
+            if (foundPid > 0 && kill(foundPid, 0) == 0) {
+                outPid = foundPid;
+                outName = foundName;
+                return true;
+            }
+        }
+        usleep(10 * 1000); // 10ms poll interval
+    }
+}
+
 
 
 

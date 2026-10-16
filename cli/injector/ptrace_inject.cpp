@@ -39,6 +39,10 @@
 #define PTRACE_O_TRACESYSGOOD 0x00000001
 #endif
 
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+
 static_assert(offsetof(android_dlextinfo, flags) == 0x00, "unexpected android_dlextinfo.flags offset");
 static_assert(offsetof(android_dlextinfo, library_fd) == 0x1c, "unexpected android_dlextinfo.library_fd offset");
 
@@ -221,7 +225,7 @@ namespace {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
         for (;;) {
             int status = 0;
-            pid_t r = waitpid(pid, &status, WNOHANG);
+            pid_t r = waitpid(pid, &status, WNOHANG | __WALL);
             if (r == pid) {
                 if (WIFSTOPPED(status)) {
                     *sigOut = WSTOPSIG(status);
@@ -236,15 +240,15 @@ namespace {
                 return false;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
-                err = "remote call timed out";
+                    err = "remote call timed out waiting for traced stop";
                 return false;
             }
             usleep(500);
         }
     }
 
-    bool RemoteCall(pid_t pid, uint64_t func, const uint64_t args[6], int nargs,
-                    uint64_t &ret, std::string &err) {
+    bool RemoteCall(pid_t pid, uint64_t func, const uint64_t args[8], int nargs,
+                    uint64_t &ret, std::string &err, int timeoutMs = 30000) {
         Arm64Regs saved{}, run{}, out{};
         if (!GetRegs(pid, saved)) { err = "GETREGSET failed"; return false; }
         // If the target thread was interrupted in the middle of a restartable syscall
@@ -255,7 +259,7 @@ namespace {
             saved.regs[0] = static_cast<uint64_t>(-static_cast<int64_t>(EINTR));
         }
         run = saved;
-        for (int i = 0; i < 6; i++) run.regs[i] = (i < nargs) ? args[i] : 0;
+        for (int i = 0; i < 8; i++) run.regs[i] = (i < nargs) ? args[i] : 0;
         run.regs[30] = 0;                        // LR sentinel
         run.sp = (saved.sp - 0x1000) & ~0xFull;  // scratch frame
         run.pc = func;
@@ -266,10 +270,10 @@ namespace {
             return false;
         }
         int sig = 0;
-        if (!WaitStop(pid, 30000, &sig, err)) {
+        if (!WaitStop(pid, timeoutMs, &sig, err)) {
             kill(pid, SIGSTOP);
             int st = 0;
-            waitpid(pid, &st, 0);
+            waitpid(pid, &st, __WALL);
             SetRegs(pid, saved);
             return false;
         }
@@ -286,6 +290,8 @@ namespace {
         if (!SetRegs(pid, saved)) { err = "restore regs failed"; return false; }
         return true;
     }
+
+
 
     bool PokeBytes(pid_t pid, uint64_t addr, const void *data, size_t len) {
         size_t n8 = (len + 7) / 8;
@@ -387,48 +393,18 @@ bool WaitForEarlyWindow(pid_t pid, const char *apkDirPrefix, int timeoutMs) {
     }
 }
 
-bool InjectLibrary(pid_t pid, const char *soPath, const char *apkDirPrefix, std::string &err) {
-    std::vector<Module> mods;
-    const Module *linker = nullptr;
-    const Module *libc = nullptr;
-    for (int waitIter = 0; waitIter < 80; ++waitIter) {
-        if (GetModules(pid, mods)) {
-            linker = FindModuleByBasename(mods, "linker64");
-            libc = FindModuleByBasename(mods, "libc.so");
-            if (linker && libc) break;
-        }
-        usleep(10 * 1000);
-    }
-    if (!linker || !libc) {
-        err = "linker64/libc.so not mapped in target (process too young?)";
-        return false;
-    }
+struct RemoteGateState {
+    uint64_t regs[31];
+    uint64_t sp;
+    uint64_t pc;
+    uint64_t pstate;
+    int32_t  paused;
+    int32_t  pad;
+};
 
-    Module callerStorage;
-    bool hasAppCaller = FindCallerModule(pid, apkDirPrefix, callerStorage);
-    if (!hasAppCaller) {
-        // During early --spawn, give the process up to ~350ms to map its APK/native lib;
-        // if still absent (e.g. pure-Java app or pre-bindApplication), fall back to libc.so + library_fd.
-        for (int i = 0; i < 70; ++i) {
-            usleep(5 * 1000);
-            if (FindCallerModule(pid, apkDirPrefix, callerStorage)) {
-                hasAppCaller = true;
-                break;
-            }
-        }
-    }
-    const Module *caller = hasAppCaller ? &callerStorage : libc;
-
-    uint64_t offMmap = ElfSymbolOffset(libc->path.c_str(), {"mmap"});
-    uint64_t offOpen = ElfSymbolOffset(libc->path.c_str(), {"open", "__open_2"});
-    uint64_t offClose = ElfSymbolOffset(libc->path.c_str(), {"close"});
-    uint64_t offDlopenExt = ElfSymbolOffset(linker->path.c_str(),
-                                            {"__loader_android_dlopen_ext", "android_dlopen_ext"});
-    if (!offMmap) { err = "symbol 'mmap' not found in " + libc->path; return false; }
-    if (!offDlopenExt) { err = "symbol 'android_dlopen_ext' not found in " + linker->path; return false; }
-
-    // Prefer PTRACE_SEIZE + PTRACE_INTERRUPT so ONLY the main thread is stopped;
-    // sibling threads holding g_dl_mutex can finish instead of deadlocking dlopen.
+bool InjectLibrary(pid_t pid, const char *soPath, const char *apkDirPrefix,
+                   std::string &err, bool pauseMainThread) {
+    // 1. Attach / Seize target process immediately to freeze the main thread as early as possible
     bool attached = false;
     if (ptrace(PTRACE_SEIZE, pid, nullptr, (void *) (uintptr_t) PTRACE_O_TRACESYSGOOD) == 0) {
         if (ptrace(PTRACE_INTERRUPT, pid, nullptr, nullptr) == 0) {
@@ -454,9 +430,54 @@ bool InjectLibrary(pid_t pid, const char *soPath, const char *apkDirPrefix, std:
     int sig = 0;
     if (!WaitStop(pid, 5000, &sig, err)) { detach(); return false; }
 
+    Arm64Regs initialRegs{};
+    if (!GetRegs(pid, initialRegs)) {
+        err = "GETREGSET(initial) failed";
+        detach();
+        return false;
+    }
+    int64_t initX0 = static_cast<int64_t>(initialRegs.regs[0]);
+    if (initX0 <= -512 && initX0 >= -516) {
+        initialRegs.regs[0] = static_cast<uint64_t>(-static_cast<int64_t>(EINTR));
+    }
+
+    std::vector<Module> mods;
+    const Module *linker = nullptr;
+    const Module *libc = nullptr;
+    for (int waitIter = 0; waitIter < 50; ++waitIter) {
+        if (GetModules(pid, mods)) {
+            linker = FindModuleByBasename(mods, "linker64");
+            libc = FindModuleByBasename(mods, "libc.so");
+            if (linker && libc) break;
+        }
+        usleep(1000);
+    }
+    if (!linker || !libc) {
+        err = "linker64/libc.so not mapped in target (process too young?)";
+        detach();
+        return false;
+    }
+
+    Module callerStorage;
+    bool hasAppCaller = FindCallerModule(pid, apkDirPrefix, callerStorage);
+    const Module *caller = hasAppCaller ? &callerStorage : libc;
+    uint64_t span = caller->end - caller->base;
+    uint64_t callerAddr = caller->base + (span > 0x2000 ? 0x1000 : span / 2);
+
+    uint64_t offMmap = ElfSymbolOffset(libc->path.c_str(), {"mmap"});
+    uint64_t offOpen = ElfSymbolOffset(libc->path.c_str(), {"open", "__open_2"});
+    uint64_t offClose = ElfSymbolOffset(libc->path.c_str(), {"close"});
+    uint64_t offDlopenExt = ElfSymbolOffset(linker->path.c_str(),
+                                            {"__loader_android_dlopen_ext", "android_dlopen_ext"});
+    uint64_t offCreateNs = ElfSymbolOffset(linker->path.c_str(),
+                                           {"__loader_android_create_namespace", "android_create_namespace"});
+
+    if (!offMmap) { err = "symbol 'mmap' not found in " + libc->path; detach(); return false; }
+    if (!offDlopenExt) { err = "symbol 'android_dlopen_ext' not found in " + linker->path; detach(); return false; }
+
     // 1) remote scratch buffer: mmap(NULL, 16K, RW, PRIVATE|ANON, -1, 0)
-    uint64_t args[6] = {0, 0x4000, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t) -1, 0};
+    uint64_t args[8] = {0, 0x4000, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t) -1, 0, 0, 0};
     uint64_t ret = 0;
     if (!RemoteCall(pid, libc->base + offMmap, args, 6, ret, err)) { detach(); return false; }
     if (ret == 0 || ret >= (uint64_t) -4095) {
@@ -476,19 +497,61 @@ bool InjectLibrary(pid_t pid, const char *soPath, const char *apkDirPrefix, std:
         return false;
     }
 
-    // 3) __loader_android_dlopen_ext(path, RTLD_NOW, NULL, caller_addr)
-    uint64_t span = caller->end - caller->base;
-    uint64_t callerAddr = caller->base + (span > 0x2000 ? 0x1000 : span / 2);
+    // 3) If an app caller module is already loaded (attach mode), dlopen directly into that namespace
     ret = 0;
     if (hasAppCaller) {
         args[0] = remoteBuf;
         args[1] = RTLD_NOW;
         args[2] = 0; // no extinfo: caller_addr selects the namespace
         args[3] = callerAddr;
-        if (!RemoteCall(pid, linker->base + offDlopenExt, args, 4, ret, err)) { detach(); return false; }
+        RemoteCall(pid, linker->base + offDlopenExt, args, 4, ret, err, 8000);
     }
 
-    // 4) Fallback: if caller had no app namespace yet or dlopen returned NULL,
+    // 4) Early injection mode (no app caller yet): create an isolated/shared namespace
+    //    permitting the deployed .so directory so dlopen succeeds before any app .so is loaded!
+    if (ret == 0 && offCreateNs) {
+        std::string soStr(soPath);
+        size_t lastSlash = soStr.rfind('/');
+        std::string libDir = (lastSlash != std::string::npos) ? soStr.substr(0, lastSlash) : "/data/local/tmp";
+        std::string permitted = libDir + ":/data/app:/data/user/0:/data/data:/data/local/tmp";
+
+        const char* nsName = "artpi_ns";
+        uint64_t addrNsName = remoteBuf + 0x400;
+        uint64_t addrLibDir = remoteBuf + 0x500;
+        uint64_t addrPermitted = remoteBuf + 0x800;
+        uint64_t addrExtInfo = remoteBuf + 0x1800;
+
+        PokeBytes(pid, addrNsName, nsName, strlen(nsName) + 1);
+        PokeBytes(pid, addrLibDir, libDir.c_str(), libDir.size() + 1);
+        PokeBytes(pid, addrPermitted, permitted.c_str(), permitted.size() + 1);
+
+        uint64_t nsArgs[8] = {
+            addrNsName,          // name
+            addrLibDir,          // ld_library_path
+            addrLibDir,          // default_library_path
+            2,                   // type: ANDROID_NAMESPACE_TYPE_SHARED (2)
+            addrPermitted,       // permitted_when_isolated_path
+            0,                   // parent (nullptr)
+            callerAddr,          // caller_addr
+            0
+        };
+        uint64_t nsRet = 0;
+        std::string nsErr;
+        if (RemoteCall(pid, linker->base + offCreateNs, nsArgs, 7, nsRet, nsErr) && nsRet != 0) {
+            android_dlextinfo extinfo{};
+            extinfo.flags = 0x200; // ANDROID_DLEXT_USE_NAMESPACE
+            extinfo.library_namespace = reinterpret_cast<struct android_namespace_t*>(nsRet);
+            if (PokeBytes(pid, addrExtInfo, &extinfo, sizeof(extinfo))) {
+                args[0] = remoteBuf;
+                args[1] = RTLD_NOW;
+                args[2] = addrExtInfo;
+                args[3] = callerAddr;
+                RemoteCall(pid, linker->base + offDlopenExt, args, 4, ret, err, 8000);
+            }
+        }
+    }
+
+    // 5) Fallback: if caller had no app namespace yet or dlopen returned NULL,
     //    open the deployed .so inside the target and pass ANDROID_DLEXT_USE_LIBRARY_FD.
     if (ret == 0 && offOpen && offClose) {
         args[0] = remoteBuf;
@@ -508,10 +571,35 @@ bool InjectLibrary(pid_t pid, const char *soPath, const char *apkDirPrefix, std:
                 args[3] = callerAddr;
                 RemoteCall(pid, linker->base + offDlopenExt, args, 4, ret, err);
             }
-            uint64_t closeArgs[6] = {fdRet, 0, 0, 0, 0, 0};
+            uint64_t closeArgs[8] = {fdRet, 0, 0, 0, 0, 0, 0, 0};
             uint64_t dummy = 0;
             std::string dummyErr;
             RemoteCall(pid, libc->base + offClose, closeArgs, 1, dummy, dummyErr);
+        }
+    }
+
+    bool pausedOk = false;
+    if (ret != 0 && pauseMainThread) {
+        std::vector<Module> postMods;
+        if (GetModules(pid, postMods)) {
+            const Module* agentMod = FindModuleByBasename(postMods, "libartpi_agent.so");
+            uint64_t offGateState = ElfSymbolOffset(soPath, {"artpi_gate_state"});
+            uint64_t offGateTramp = ElfSymbolOffset(soPath, {"artpi_gate_trampoline"});
+            if (agentMod && offGateState && offGateTramp) {
+                RemoteGateState gs{};
+                memcpy(gs.regs, initialRegs.regs, sizeof(gs.regs));
+                gs.sp = initialRegs.sp;
+                gs.pc = initialRegs.pc;
+                gs.pstate = initialRegs.pstate;
+                gs.paused = 1;
+                if (PokeBytes(pid, agentMod->base + offGateState, &gs, sizeof(gs))) {
+                    Arm64Regs gateRegs = initialRegs;
+                    gateRegs.pc = agentMod->base + offGateTramp;
+                    if (SetRegs(pid, gateRegs)) {
+                        pausedOk = true;
+                    }
+                }
+            }
         }
     }
 
@@ -521,10 +609,18 @@ bool InjectLibrary(pid_t pid, const char *soPath, const char *apkDirPrefix, std:
         err = "remote dlopen returned NULL (check logcat for linker/selinux error)";
         return false;
     }
-    char info[256];
-    snprintf(info, sizeof(info), "dlopen handle=%p (caller=%s+0x%llx)",
-             (void *) (uintptr_t) ret, caller->path.c_str(),
-             (unsigned long long) (callerAddr - caller->base));
+    char info[320];
+    if (pausedOk) {
+        snprintf(info, sizeof(info),
+                 "dlopen handle=%p (caller=%s+0x%llx) [MAIN THREAD PAUSED @ 0x%llx]",
+                 (void *) (uintptr_t) ret, caller->path.c_str(),
+                 (unsigned long long) (callerAddr - caller->base),
+                 (unsigned long long) initialRegs.pc);
+    } else {
+        snprintf(info, sizeof(info), "dlopen handle=%p (caller=%s+0x%llx)",
+                 (void *) (uintptr_t) ret, caller->path.c_str(),
+                 (unsigned long long) (callerAddr - caller->base));
+    }
     err = info;
     return true;
 }

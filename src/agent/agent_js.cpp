@@ -137,6 +137,21 @@ static const std::map<std::string, std::string> kApiDocs = {
      "  - Finds an ELF shared library module and returns base address, size, and path."},
     {"findmodule", "Alias for findModule(nameOrPattern)"},
 
+    {"Process",
+     "Frida-style global Process namespace:\n"
+     "  Process.id / Process.arch / Process.platform / Process.pointerSize / Process.pageSize\n"
+     "  Process.getCurrentThreadId()               // current TID\n"
+     "  Process.enumerateThreads()                 // list all threads {id, name, state}\n"
+     "  Process.enumerateModules([filter])         // list loaded .so modules {name, base, size, path}\n"
+     "  Process.findModuleByName(nameOrPattern)    // find module across all Android namespaces\n"
+     "  Process.findModuleByAddress(addr)          // find module containing address\n"
+     "  Process.findSymbol([module,] symPattern)   // find exported/debug symbol address\n"
+     "  Process.enumerateRanges([prot])            // list memory mappings (e.g. \"r-x\", \"rw-\")\n"
+     "  Process.isPaused() / Process.resume()      // check/resume main thread paused by -W/--wait or --pause"},
+    {"resume",
+     "Usage: resume  (or resume() / Process.resume())\n"
+     "  - Resumes the target process's main thread when paused by -W/--wait or --pause."},
+
     {"findSymbol",
      "Usage: findSymbol(moduleName, symbolName)\n"
      "  - Locates export or dynamic symbol address in specified ELF module via xDL."},
@@ -309,21 +324,23 @@ bool InitJs(JNIEnv* env) {
         std::string pkg;
 
         // 1. Preferred: ActivityThread.currentPackageName() (real apps).
-        jclass atCls = env->FindClass("android/app/ActivityThread");
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        if (atCls) {
-            jmethodID curPkg = env->GetStaticMethodID(atCls, "currentPackageName", "()Ljava/lang/String;");
+        if (env) {
+            jclass atCls = env->FindClass("android/app/ActivityThread");
             if (env->ExceptionCheck()) env->ExceptionClear();
-            if (curPkg) {
-                jstring js = (jstring) env->CallStaticObjectMethod(atCls, curPkg);
+            if (atCls) {
+                jmethodID curPkg = env->GetStaticMethodID(atCls, "currentPackageName", "()Ljava/lang/String;");
                 if (env->ExceptionCheck()) env->ExceptionClear();
-                if (js) {
-                    const char* c = env->GetStringUTFChars(js, nullptr);
-                    if (c) { pkg = c; env->ReleaseStringUTFChars(js, c); }
-                    env->DeleteLocalRef(js);
+                if (curPkg) {
+                    jstring js = (jstring) env->CallStaticObjectMethod(atCls, curPkg);
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    if (js) {
+                        const char* c = env->GetStringUTFChars(js, nullptr);
+                        if (c) { pkg = c; env->ReleaseStringUTFChars(js, c); }
+                        env->DeleteLocalRef(js);
+                    }
                 }
+                env->DeleteLocalRef(atCls);
             }
-            env->DeleteLocalRef(atCls);
         }
 
         // 2. Fallback (app_process / tests): scan /proc/self/cmdline for the
@@ -384,7 +401,12 @@ std::string EvalJs(const std::string& script, const char* filename) {
     while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t' || trimmed.back() == '\n' || trimmed.back() == ';')) trimmed.pop_back();
     while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
 
-    JSValue val = JS_Eval(g_ctx, script.c_str(), script.size(), filename, JS_EVAL_TYPE_GLOBAL);
+    std::string effectiveScript = script;
+    if (trimmed == "resume" || trimmed == "resum") {
+        effectiveScript = "Process.resume()";
+    }
+
+    JSValue val = JS_Eval(g_ctx, effectiveScript.c_str(), effectiveScript.size(), filename, JS_EVAL_TYPE_GLOBAL);
 
     // The QuickJS context persists across -e/-f invocations. A top-level `let`/`const`
     // from a previous run makes the next one fail with a "redeclaration" SyntaxError.

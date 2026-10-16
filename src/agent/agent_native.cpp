@@ -18,6 +18,7 @@
 #include <functional>
 #include <dlfcn.h>
 #include <elf.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -63,6 +64,8 @@ static int FindModulePhdrCallback(struct dl_phdr_info* info, size_t /*size*/, vo
     return 0;
 }
 
+static JSValue MakeModuleObject(JSContext* ctx, const LoadedModuleInfo& mod);
+
 JSValue JsFindModule(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_NewString(ctx, "Usage: findModule(nameOrPattern)");
     const char* str = JS_ToCString(ctx, argv[0]);
@@ -70,14 +73,19 @@ JSValue JsFindModule(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValu
     std::string query(str);
     JS_FreeCString(ctx, str);
 
+    LoadedModuleInfo mod;
+    if (FindLoadedModule(query, mod)) {
+        return MakeModuleObject(ctx, mod);
+    }
+
     ModuleMatchCtx mctx{query, JS_NULL, ctx};
     dl_iterate_phdr(FindModulePhdrCallback, &mctx);
     return mctx.result;
 }
 
 // Module-name filter for the symbol-matching helpers: accepts an exact
-// basename, a full path, a wildcard, or empty / "*" (match anything).
-static bool ModuleNameMatches(const std::string& modField, const std::string& query) {
+// basename, a full path, a wildcard, '|'-separated patterns, or empty / "*".
+static bool ModuleNameMatchesSingle(const std::string& modField, const std::string& query) {
     if (query.empty() || query == "*") return true;
     if (modField == query) return true;
     const char* slash = strrchr(modField.c_str(), '/');
@@ -88,6 +96,19 @@ static bool ModuleNameMatches(const std::string& modField, const std::string& qu
     if (base.size() > 3 && base.substr(base.size() - 3) == ".so" &&
         base.substr(0, base.size() - 3) == query) return true;
     return MatchWildcard(base, query) || MatchWildcard(modField, query);
+}
+
+static bool ModuleNameMatches(const std::string& modField, const std::string& query) {
+    if (query.empty() || query == "*") return true;
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        size_t bar = query.find('|', pos);
+        std::string sub = (bar == std::string::npos) ? query.substr(pos) : query.substr(pos, bar - pos);
+        if (!sub.empty() && ModuleNameMatchesSingle(modField, sub)) return true;
+        if (bar == std::string::npos) break;
+        pos = bar + 1;
+    }
+    return false;
 }
 
 // Locate all loaded modules across all Android linker namespaces and /proc/self/maps.
@@ -913,6 +934,353 @@ size_t NativeUnhookAllCount() {
     return n;
 }
 
+// ===========================================================================
+// Frida-style Process & Module namespace
+// ===========================================================================
+
+static size_t ComputeModuleMappedSize(const std::string& modPath, uintptr_t modBase) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    uintptr_t minStart = UINTPTR_MAX;
+    uintptr_t maxEnd = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+        const char* p = strchr(line, '/');
+        if (!p) continue;
+        std::string lp(p);
+        while (!lp.empty() && (lp.back() == '\n' || lp.back() == '\r' || lp.back() == ' ')) lp.pop_back();
+        if (lp == modPath || (modBase != 0 && start == modBase)) {
+            if (start < minStart) minStart = start;
+            if (end > maxEnd) maxEnd = end;
+        }
+    }
+    fclose(f);
+    return (maxEnd > minStart) ? static_cast<size_t>(maxEnd - minStart) : 0;
+}
+
+static JSValue JsModuleToString(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/) {
+    JSValue nameV = JS_GetPropertyStr(ctx, this_val, "name");
+    JSValue baseV = JS_GetPropertyStr(ctx, this_val, "base");
+    JSValue sizeV = JS_GetPropertyStr(ctx, this_val, "size");
+    JSValue pathV = JS_GetPropertyStr(ctx, this_val, "path");
+    const char* name = JS_IsString(nameV) ? JS_ToCString(ctx, nameV) : nullptr;
+    const char* path = JS_IsString(pathV) ? JS_ToCString(ctx, pathV) : nullptr;
+    int64_t base = ParsePtr(ctx, baseV);
+    int64_t sz = 0;
+    JS_ToInt64(ctx, &sz, sizeV);
+
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "[Module %s @ 0x%llx (size=0x%llx, path=%s)]",
+             name ? name : "?",
+             static_cast<unsigned long long>(base),
+             static_cast<unsigned long long>(sz),
+             path ? path : "?");
+    if (name) JS_FreeCString(ctx, name);
+    if (path) JS_FreeCString(ctx, path);
+    JS_FreeValue(ctx, nameV);
+    JS_FreeValue(ctx, baseV);
+    JS_FreeValue(ctx, sizeV);
+    JS_FreeValue(ctx, pathV);
+    return JS_NewString(ctx, buf);
+}
+
+static JSValue JsModuleFindSymbolByName(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NULL;
+    JSValue pathV = JS_GetPropertyStr(ctx, this_val, "path");
+    JSValue args[2] = { pathV, argv[0] };
+    JSValue res = JsFindSymbol(ctx, JS_UNDEFINED, 2, args);
+    JS_FreeValue(ctx, pathV);
+    return res;
+}
+
+static JSValue JsModuleEnumerateSymbols(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JSValue pathV = JS_GetPropertyStr(ctx, this_val, "path");
+    const char* p = JS_IsString(pathV) ? JS_ToCString(ctx, pathV) : nullptr;
+    std::string modPath = p ? p : "";
+    if (p) JS_FreeCString(ctx, p);
+    JS_FreeValue(ctx, pathV);
+
+    std::string pattern = "*";
+    if (argc >= 1 && JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (s) { pattern = s; JS_FreeCString(ctx, s); }
+    }
+
+    LoadedModuleInfo mod;
+    if (!FindLoadedModule(modPath, mod)) return JS_NewArray(ctx);
+
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t idx = 0;
+    EnumerateModuleSymbols(mod, [&](const char* name, uintptr_t addr) -> bool {
+        if (pattern == "*" || MatchWildcard(name, pattern) || strstr(name, pattern.c_str()) != nullptr) {
+            JSValue item = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, item, "name", JS_NewString(ctx, name));
+            JS_SetPropertyStr(ctx, item, "address", JS_NewBigInt64(ctx, static_cast<int64_t>(addr)));
+            JS_SetPropertyUint32(ctx, arr, idx++, item);
+        }
+        return idx < 2000;
+    });
+    return arr;
+}
+
+static JSValue MakeModuleObject(JSContext* ctx, const LoadedModuleInfo& mod) {
+    JSValue obj = JS_NewObject(ctx);
+    size_t sz = ComputeModuleMappedSize(mod.path, mod.base);
+    JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, mod.name.c_str()));
+    JS_SetPropertyStr(ctx, obj, "path", JS_NewString(ctx, mod.path.c_str()));
+    JS_SetPropertyStr(ctx, obj, "base", JS_NewBigInt64(ctx, static_cast<int64_t>(mod.base)));
+    JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, static_cast<int64_t>(sz)));
+    JS_SetPropertyStr(ctx, obj, "findExportByName", JS_NewCFunction(ctx, JsModuleFindSymbolByName, "findExportByName", 1));
+    JS_SetPropertyStr(ctx, obj, "findSymbolByName", JS_NewCFunction(ctx, JsModuleFindSymbolByName, "findSymbolByName", 1));
+    JS_SetPropertyStr(ctx, obj, "findSymbol", JS_NewCFunction(ctx, JsModuleFindSymbolByName, "findSymbol", 1));
+    JS_SetPropertyStr(ctx, obj, "enumerateSymbols", JS_NewCFunction(ctx, JsModuleEnumerateSymbols, "enumerateSymbols", 1));
+    JS_SetPropertyStr(ctx, obj, "enumerateExports", JS_NewCFunction(ctx, JsModuleEnumerateSymbols, "enumerateExports", 1));
+    JS_SetPropertyStr(ctx, obj, "toString", JS_NewCFunction(ctx, JsModuleToString, "toString", 0));
+    return obj;
+}
+
+static JSValue JsProcessGetCurrentThreadId(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    return JS_NewInt32(ctx, static_cast<int32_t>(gettid()));
+}
+
+static JSValue JsThreadToString(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JSValue idV = JS_GetPropertyStr(ctx, this_val, "id");
+    JSValue nmV = JS_GetPropertyStr(ctx, this_val, "name");
+    JSValue stV = JS_GetPropertyStr(ctx, this_val, "state");
+    int32_t tid = 0;
+    JS_ToInt32(ctx, &tid, idV);
+    const char* nm = JS_IsString(nmV) ? JS_ToCString(ctx, nmV) : nullptr;
+    const char* st = JS_IsString(stV) ? JS_ToCString(ctx, stV) : nullptr;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "[Thread id=%d name=\"%s\" state=%s]",
+             tid, nm ? nm : "?", st ? st : "?");
+    if (nm) JS_FreeCString(ctx, nm);
+    if (st) JS_FreeCString(ctx, st);
+    JS_FreeValue(ctx, idV);
+    JS_FreeValue(ctx, nmV);
+    JS_FreeValue(ctx, stV);
+    return JS_NewString(ctx, buf);
+}
+
+static JSValue JsProcessEnumerateThreads(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    JSValue arr = JS_NewArray(ctx);
+    DIR* dir = opendir("/proc/self/task");
+    if (!dir) return arr;
+
+    uint32_t idx = 0;
+    struct dirent* ent = nullptr;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (ent->d_name[0] == '.') continue;
+        long tid = strtol(ent->d_name, nullptr, 10);
+        if (tid <= 0) continue;
+
+        char commPath[64];
+        snprintf(commPath, sizeof(commPath), "/proc/self/task/%ld/comm", tid);
+        char comm[128] = {0};
+        int fd = open(commPath, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            ssize_t n = read(fd, comm, sizeof(comm) - 1);
+            close(fd);
+            if (n > 0) comm[strcspn(comm, "\r\n")] = '\0';
+        }
+
+        char statusPath[64];
+        snprintf(statusPath, sizeof(statusPath), "/proc/self/task/%ld/status", tid);
+        std::string stateStr = "waiting";
+        if (FILE* sf = fopen(statusPath, "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), sf)) {
+                if (strncmp(line, "State:", 6) == 0) {
+                    const char* p = line + 6;
+                    while (*p == ' ' || *p == '\t') p++;
+                    if (*p == 'R') stateStr = "running";
+                    else if (*p == 'S') stateStr = "sleeping";
+                    else if (*p == 'D') stateStr = "uninterruptible";
+                    else if (*p == 'T' || *p == 't') stateStr = "stopped";
+                    else if (*p == 'Z') stateStr = "zombie";
+                    break;
+                }
+            }
+            fclose(sf);
+        }
+
+        JSValue th = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, th, "id", JS_NewInt32(ctx, static_cast<int32_t>(tid)));
+        JS_SetPropertyStr(ctx, th, "name", JS_NewString(ctx, comm));
+        JS_SetPropertyStr(ctx, th, "state", JS_NewString(ctx, stateStr.c_str()));
+        JS_SetPropertyStr(ctx, th, "toString", JS_NewCFunction(ctx, JsThreadToString, "toString", 0));
+        JS_SetPropertyUint32(ctx, arr, idx++, th);
+    }
+    closedir(dir);
+    return arr;
+}
+
+static JSValue JsProcessEnumerateModules(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    std::string filter;
+    if (argc >= 1 && JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (s) { filter = s; JS_FreeCString(ctx, s); }
+    }
+    auto all = EnumerateAllLoadedModules();
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t idx = 0;
+    for (const auto& mod : all) {
+        if (!filter.empty() && !ModuleNameMatches(mod.name, filter) &&
+            !ModuleNameMatches(mod.path, filter) &&
+            mod.path.find(filter) == std::string::npos) {
+            continue;
+        }
+        JS_SetPropertyUint32(ctx, arr, idx++, MakeModuleObject(ctx, mod));
+    }
+    return arr;
+}
+
+static JSValue JsProcessFindModuleByName(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NULL;
+    const char* s = JS_ToCString(ctx, argv[0]);
+    if (!s) return JS_NULL;
+    std::string query(s);
+    JS_FreeCString(ctx, s);
+
+    LoadedModuleInfo mod;
+    if (FindLoadedModule(query, mod)) {
+        return MakeModuleObject(ctx, mod);
+    }
+    return JS_NULL;
+}
+
+static JSValue JsProcessFindModuleByAddress(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NULL;
+    uintptr_t addr = static_cast<uintptr_t>(ParsePtr(ctx, argv[0]));
+    if (addr < 0x1000) return JS_NULL;
+
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return JS_NULL;
+    char line[1024];
+    std::string hitPath;
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+        if (addr >= start && addr < end) {
+            const char* p = strchr(line, '/');
+            if (p) {
+                hitPath = p;
+                while (!hitPath.empty() && (hitPath.back() == '\n' || hitPath.back() == '\r' || hitPath.back() == ' ')) {
+                    hitPath.pop_back();
+                }
+            }
+            break;
+        }
+    }
+    fclose(f);
+
+    if (!hitPath.empty()) {
+        LoadedModuleInfo mod;
+        if (FindLoadedModule(hitPath, mod)) {
+            return MakeModuleObject(ctx, mod);
+        }
+    }
+    return JS_NULL;
+}
+
+static JSValue JsProcessFindSymbol(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (argc == 1 && JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (!s) return JS_NULL;
+        std::string spec(s);
+        JS_FreeCString(ctx, s);
+        size_t bang = spec.find('!');
+        if (bang != std::string::npos) {
+            JSValue a0 = JS_NewString(ctx, spec.substr(0, bang).c_str());
+            JSValue a1 = JS_NewString(ctx, spec.substr(bang + 1).c_str());
+            JSValue args[2] = {a0, a1};
+            JSValue r = JsFindSymbol(ctx, this_val, 2, args);
+            JS_FreeValue(ctx, a0);
+            JS_FreeValue(ctx, a1);
+            return r;
+        }
+        uintptr_t addr = LookupSymbolByName(spec.c_str());
+        return addr ? JS_NewBigInt64(ctx, static_cast<int64_t>(addr)) : JS_NULL;
+    }
+    if (argc >= 2 && (JS_IsNull(argv[0]) || JS_IsUndefined(argv[0]))) {
+        const char* sym = JS_ToCString(ctx, argv[1]);
+        if (!sym) return JS_NULL;
+        uintptr_t addr = LookupSymbolByName(sym);
+        JS_FreeCString(ctx, sym);
+        return addr ? JS_NewBigInt64(ctx, static_cast<int64_t>(addr)) : JS_NULL;
+    }
+    return JsFindSymbol(ctx, this_val, argc, argv);
+}
+
+static JSValue JsProcessEnumerateRanges(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    std::string wantProt;
+    if (argc >= 1 && JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (s) { wantProt = s; JS_FreeCString(ctx, s); }
+    }
+
+    JSValue arr = JS_NewArray(ctx);
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return arr;
+
+    uint32_t idx = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0, offset = 0;
+        char perms[8] = {};
+        if (sscanf(line, "%lx-%lx %4s %lx", &start, &end, perms, &offset) < 3) continue;
+        std::string prot(perms, 3);
+        if (!wantProt.empty()) {
+            bool match = true;
+            for (size_t i = 0; i < wantProt.size() && i < 3; ++i) {
+                if (wantProt[i] != '-' && wantProt[i] != prot[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) continue;
+        }
+
+        JSValue r = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, r, "base", JS_NewBigInt64(ctx, static_cast<int64_t>(start)));
+        JS_SetPropertyStr(ctx, r, "size", JS_NewInt64(ctx, static_cast<int64_t>(end - start)));
+        JS_SetPropertyStr(ctx, r, "protection", JS_NewString(ctx, prot.c_str()));
+
+        const char* p = strchr(line, '/');
+        if (p) {
+            std::string path(p);
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) path.pop_back();
+            JSValue fileObj = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, fileObj, "path", JS_NewString(ctx, path.c_str()));
+            JS_SetPropertyStr(ctx, fileObj, "offset", JS_NewInt64(ctx, static_cast<int64_t>(offset)));
+            JS_SetPropertyStr(ctx, r, "file", fileObj);
+        }
+        JS_SetPropertyUint32(ctx, arr, idx++, r);
+    }
+    fclose(f);
+    return arr;
+}
+
+// Process.onSoLoad disabled to prevent anti-tamper / anti-cheat detection
+
+static JSValue JsProcessIsPaused(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    return JS_NewBool(ctx, ArtPIIsProcessPaused());
+}
+
+static JSValue JsProcessResume(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    uint64_t pc = ArtPIGetGatePc();
+    if (ArtPIResumeProcess()) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "[+] Resumed main thread (PID %d) at PC=0x%llx",
+                 (int) getpid(), (unsigned long long) pc);
+        return JS_NewString(ctx, buf);
+    }
+    return JS_NewString(ctx, "[i] Process is not paused");
+}
+
+
 void RegisterNativeApis(JSContext* ctx, JSValue global, JSValue native) {
     // Native namespace
     JS_SetPropertyStr(ctx, native, "findModule", JS_NewCFunction(ctx, JsFindModule, "findModule", 1));
@@ -931,6 +1299,31 @@ void RegisterNativeApis(JSContext* ctx, JSValue global, JSValue native) {
     JS_SetPropertyStr(ctx, native, "DebugSymbol", JS_DupValue(ctx, debugSymbol));
     JS_SetPropertyStr(ctx, global, "DebugSymbol", debugSymbol);
 
+    // Frida-style Process namespace
+    JSValue proc = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, proc, "id", JS_NewInt32(ctx, static_cast<int32_t>(getpid())));
+    JS_SetPropertyStr(ctx, proc, "arch", JS_NewString(ctx, "arm64"));
+    JS_SetPropertyStr(ctx, proc, "platform", JS_NewString(ctx, "linux"));
+    JS_SetPropertyStr(ctx, proc, "pointerSize", JS_NewInt32(ctx, static_cast<int32_t>(sizeof(void*))));
+    JS_SetPropertyStr(ctx, proc, "pageSize", JS_NewInt32(ctx, static_cast<int32_t>(getpagesize())));
+    JS_SetPropertyStr(ctx, proc, "getCurrentThreadId", JS_NewCFunction(ctx, JsProcessGetCurrentThreadId, "getCurrentThreadId", 0));
+    JS_SetPropertyStr(ctx, proc, "enumerateThreads", JS_NewCFunction(ctx, JsProcessEnumerateThreads, "enumerateThreads", 0));
+    JS_SetPropertyStr(ctx, proc, "threads", JS_NewCFunction(ctx, JsProcessEnumerateThreads, "threads", 0));
+    JS_SetPropertyStr(ctx, proc, "enumerateModules", JS_NewCFunction(ctx, JsProcessEnumerateModules, "enumerateModules", 1));
+    JS_SetPropertyStr(ctx, proc, "modules", JS_NewCFunction(ctx, JsProcessEnumerateModules, "modules", 1));
+    JS_SetPropertyStr(ctx, proc, "findModuleByName", JS_NewCFunction(ctx, JsProcessFindModuleByName, "findModuleByName", 1));
+    JS_SetPropertyStr(ctx, proc, "getModuleByName", JS_NewCFunction(ctx, JsProcessFindModuleByName, "getModuleByName", 1));
+    JS_SetPropertyStr(ctx, proc, "findModule", JS_NewCFunction(ctx, JsProcessFindModuleByName, "findModule", 1));
+    JS_SetPropertyStr(ctx, proc, "findModuleByAddress", JS_NewCFunction(ctx, JsProcessFindModuleByAddress, "findModuleByAddress", 1));
+    JS_SetPropertyStr(ctx, proc, "getModuleByAddress", JS_NewCFunction(ctx, JsProcessFindModuleByAddress, "getModuleByAddress", 1));
+    JS_SetPropertyStr(ctx, proc, "findSymbol", JS_NewCFunction(ctx, JsProcessFindSymbol, "findSymbol", 2));
+    JS_SetPropertyStr(ctx, proc, "findSymbolByName", JS_NewCFunction(ctx, JsProcessFindSymbol, "findSymbolByName", 2));
+    JS_SetPropertyStr(ctx, proc, "findSymbolsMatching", JS_NewCFunction(ctx, JsFindSymbolsMatching, "findSymbolsMatching", 2));
+    JS_SetPropertyStr(ctx, proc, "enumerateRanges", JS_NewCFunction(ctx, JsProcessEnumerateRanges, "enumerateRanges", 1));
+    JS_SetPropertyStr(ctx, proc, "isPaused", JS_NewCFunction(ctx, JsProcessIsPaused, "isPaused", 0));
+    JS_SetPropertyStr(ctx, proc, "resume", JS_NewCFunction(ctx, JsProcessResume, "resume", 0));
+    JS_SetPropertyStr(ctx, global, "Process", proc);
+
     // Flat global aliases
     JS_SetPropertyStr(ctx, global, "findModule", JS_NewCFunction(ctx, JsFindModule, "findModule", 1));
     JS_SetPropertyStr(ctx, global, "findmodule", JS_NewCFunction(ctx, JsFindModule, "findmodule", 1));
@@ -942,6 +1335,7 @@ void RegisterNativeApis(JSContext* ctx, JSValue global, JSValue native) {
     JS_SetPropertyStr(ctx, global, "dumpnative", JS_NewCFunction(ctx, JsDumpNative, "dumpnative", 2));
     JS_SetPropertyStr(ctx, global, "nhook", JS_NewCFunction(ctx, JsNativeHook, "nhook", 2));
     JS_SetPropertyStr(ctx, global, "nunhookall", JS_NewCFunction(ctx, JsNativeUnhookAll, "nunhookall", 0));
+    JS_SetPropertyStr(ctx, global, "resume", JS_NewCFunction(ctx, JsProcessResume, "resume", 0));
 }
 
 }} // namespace artpi::agent
