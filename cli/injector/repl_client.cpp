@@ -244,6 +244,9 @@ const std::vector<std::string> kCompletions = {
     "disassembly(",
     "choose(",
     "jhook(",
+    "findAndHook(",
+    "findandhook(",
+    "Java.findAndHook(",
     "nhook(",
     "unhook(",
     "unhookall()",
@@ -319,7 +322,7 @@ static const char* kJavaMethodActions[] = {
     "dumpCode()", "dumpSmali()", "dumpNative()", "disassembly()", "decompile()", "hook(", "hookallclassmethods(", "trace(", "break()", "address", "ptr", "artMethod", "isNative"
 };
 static const char* kJavaClassActions[] = {
-    "dumpCode()", "dumpSmali()", "disassembly()", "decompile()", "listMethods()", "findMethods(", "hookall(", "choose("
+    "dumpCode()", "dumpSmali()", "disassembly()", "decompile()", "listMethods()", "findMethods(", "hookall(", "findAndHook(", "choose("
 };
 static const char* kNativeSymbolActions[] = {
     "dumpNative()", "break()", "hook(", "hexdump()", "address", "ptr", "readCString()", "readByteArray("
@@ -515,7 +518,7 @@ static std::vector<std::string> GetCandidatesForToken(const std::string& token) 
 
             // Java-domain top-level helpers (implemented directly on the java
             // root proxy, not real classes).
-            for (const char* special : {"dumpAllDex", "dumpalldex", "dumpDex"}) {
+            for (const char* special : {"dumpAllDex", "dumpalldex", "dumpDex", "findAndHook", "findandhook"}) {
                 std::string cand = std::string("dynamic.java.") + special;
                 if (StartsWithIgnoreCase(cand, token)) results.push_back(cand);
             }

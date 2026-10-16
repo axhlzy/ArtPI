@@ -108,6 +108,16 @@ static const std::map<std::string, std::string> kApiDocs = {
     {"jhook",
      "Usage: jhook(artMethod, [callbackOrOpt])\n"
      "  - Installs an ART method hook."},
+    {"findAndHook",
+     "Usage:\n"
+     "  findAndHook(keyword [, onEnter, onLeave, maxHooks])\n"
+     "  findAndHook(classPattern, methodPattern [, onEnter, onLeave, maxHooks])\n"
+     "  - Fast in-memory DEX search + batch ART method hook (case-insensitive substring/wildcard, '|' supported).\n"
+     "  - Examples:\n"
+     "      findAndHook(\"md5\")\n"
+     "      findAndHook(\"*encrypt*\", \"encrypt|decrypt\")\n"
+     "      findAndHook(\"com.cmccit.netmodule.CommonHttp\", \"encrypt|Header\")"},
+    {"findandhook", "Alias for findAndHook(...)"},
     {"choose",
      "Usage: choose(className, [callbacks])\n"
      "  - Scans active heap memory for live instances of the specified class (like Frida's Java.choose).\n"

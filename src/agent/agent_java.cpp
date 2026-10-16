@@ -7,6 +7,7 @@
 #include "agent_debug.h"
 #include "../../include/ArtPI.h"
 #include "art/art_method.h"
+#include "dex/pi_dex_resolver.h"
 
 #include "android.h"
 #include <dlfcn.h>
@@ -160,6 +161,44 @@ static jclass GetOrCreateGlobalClassRef(JNIEnv* env, const std::string& classNam
     return gCls;
 }
 
+// Case-insensitive flexible matcher:
+// - Empty or "*" matches anything.
+// - Pipe-separated terms ("md5|aes|rsa") match if any term matches.
+// - A term starting with '=' (e.g. "=MD5") requires an exact case-insensitive match.
+// - A term containing '*' or '?' uses wildcard matching (MatchWildcard).
+// - Any plain keyword (e.g. "md5") matches as a case-insensitive substring ("*md5*").
+static bool MatchPatternSubstr(const std::string& str, const std::string& pattern) {
+    if (pattern.empty() || pattern == "*") return true;
+    size_t start = 0;
+    while (start <= pattern.size()) {
+        size_t bar = pattern.find('|', start);
+        std::string term = (bar == std::string::npos)
+                               ? pattern.substr(start)
+                               : pattern.substr(start, bar - start);
+        // Trim whitespace around term
+        size_t first = term.find_first_not_of(" \t");
+        if (first != std::string::npos) {
+            size_t last = term.find_last_not_of(" \t");
+            term = term.substr(first, last - first + 1);
+        } else {
+            term.clear();
+        }
+        if (!term.empty()) {
+            if (term == "*") return true;
+            if (term[0] == '=' && term.size() > 1) {
+                if (MatchWildcard(str, term.substr(1))) return true;
+            } else if (term.find('*') != std::string::npos || term.find('?') != std::string::npos) {
+                if (MatchWildcard(str, term)) return true;
+            } else {
+                if (MatchWildcard(str, "*" + term + "*")) return true;
+            }
+        }
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return false;
+}
+
 static void InspectClassMethods(JNIEnv* env, jclass targetCls, const std::string& pattern,
                                 std::ostringstream& ss, int& count, int maxCount = 50) {
     if (!targetCls) return;
@@ -222,7 +261,14 @@ static void InspectClassMethods(JNIEnv* env, jclass targetCls, const std::string
                 }
             }
 
-            bool match = pattern.empty() || pattern == "*" || MatchWildcard(nameStr, pattern) || MatchWildcard(desc, pattern);
+            bool match = false;
+            if (pattern.empty() || pattern == "*") {
+                match = true;
+            } else if (pattern.find('(') != std::string::npos || pattern.find(' ') != std::string::npos) {
+                match = MatchPatternSubstr(desc, pattern);
+            } else {
+                match = MatchPatternSubstr(nameStr, pattern);
+            }
             if (match) {
                 PI::Method pm = PI::resolve(env, mObj);
                 void* art = pm.isValid() ? pm.getArtMethod() : nullptr;
@@ -471,8 +517,227 @@ JSValue JsListMethods(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVal
     return JS_NewString(ctx, ss.str().c_str());
 }
 
+// Convert a DEX type descriptor ("Lcom/foo/Bar;") to dotted class name ("com.foo.Bar").
+static std::string DescriptorToDotName(const char* desc) {
+    if (!desc || desc[0] != 'L') return "";
+    size_t len = std::strlen(desc);
+    if (len <= 2 || desc[len - 1] != ';') return "";
+    std::string out(desc + 1, len - 2);
+    for (char& c : out) {
+        if (c == '/') c = '.';
+    }
+    return out;
+}
+
+// Collect all native art::DexFile* pointers from the app ClassLoader's DexPathList
+// cookies (mInternalCookie / mCookie) without loading any Java classes.
+static std::vector<const void*> CollectAppNativeDexFiles(JNIEnv* env) {
+    std::vector<const void*> result;
+    if (!env) return result;
+    jobject cl = GetAppClassLoader(env);
+    if (!cl) return result;
+
+    jclass baseCls = env->FindClass("dalvik/system/BaseDexClassLoader");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); baseCls = nullptr; }
+    jfieldID pathListField = baseCls ? env->GetFieldID(baseCls, "pathList", "Ldalvik/system/DexPathList;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jobject pathList = pathListField ? env->GetObjectField(cl, pathListField) : nullptr;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); pathList = nullptr; }
+
+    jclass dplCls = env->FindClass("dalvik/system/DexPathList");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); dplCls = nullptr; }
+    jfieldID dexElementsField = dplCls ? env->GetFieldID(dplCls, "dexElements", "[Ldalvik/system/DexPathList$Element;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    if (!pathList || !dexElementsField) {
+        if (baseCls) env->DeleteLocalRef(baseCls);
+        if (dplCls) env->DeleteLocalRef(dplCls);
+        if (pathList) env->DeleteLocalRef(pathList);
+        return result;
+    }
+
+    auto dexElements = (jobjectArray)env->GetObjectField(pathList, dexElementsField);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); dexElements = nullptr; }
+
+    jclass elemCls = env->FindClass("dalvik/system/DexPathList$Element");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); elemCls = nullptr; }
+    jfieldID dexFileField = elemCls ? env->GetFieldID(elemCls, "dexFile", "Ldalvik/system/DexFile;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    jclass dexFileCls = env->FindClass("dalvik/system/DexFile");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); dexFileCls = nullptr; }
+    jfieldID internalCookieField = dexFileCls ? env->GetFieldID(dexFileCls, "mInternalCookie", "Ljava/lang/Object;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jfieldID cookieField = dexFileCls ? env->GetFieldID(dexFileCls, "mCookie", "Ljava/lang/Object;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (dexFileCls) env->DeleteLocalRef(dexFileCls);
+
+    std::unordered_set<const void*> seen;
+    auto collectCookie = [&](jobject df, jfieldID fid) {
+        if (!fid) return;
+        jobject cookie = env->GetObjectField(df, fid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); cookie = nullptr; }
+        if (!cookie) return;
+        jclass ccls = env->GetObjectClass(cookie);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); ccls = nullptr; }
+        if (ccls) {
+            jclass classCls = AgentCachedClass("java/lang/Class");
+            if (!classCls) classCls = env->FindClass("java/lang/Class");
+            jmethodID gn = classCls ? env->GetMethodID(classCls, "getName", "()Ljava/lang/String;") : nullptr;
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            jstring jn = gn ? (jstring)env->CallObjectMethod(ccls, gn) : nullptr;
+            if (env->ExceptionCheck()) { env->ExceptionClear(); jn = nullptr; }
+            bool isLongArr = false;
+            if (jn) {
+                const char* cs = env->GetStringUTFChars(jn, nullptr);
+                if (cs && std::strcmp(cs, "[J") == 0) isLongArr = true;
+                if (cs) env->ReleaseStringUTFChars(jn, cs);
+                env->DeleteLocalRef(jn);
+            }
+            env->DeleteLocalRef(ccls);
+            if (isLongArr) {
+                jsize n = env->GetArrayLength(reinterpret_cast<jarray>(cookie));
+                jlong* data = env->GetLongArrayElements(reinterpret_cast<jlongArray>(cookie), nullptr);
+                if (data) {
+                    for (jsize k = 0; k < n; ++k) {
+                        const void* p = reinterpret_cast<const void*>(static_cast<uintptr_t>(data[k]));
+                        if (p && reinterpret_cast<uintptr_t>(p) > 0x10000 && seen.insert(p).second) {
+                            result.push_back(p);
+                        }
+                    }
+                    env->ReleaseLongArrayElements(reinterpret_cast<jlongArray>(cookie), data, JNI_ABORT);
+                }
+            }
+        }
+        env->DeleteLocalRef(cookie);
+    };
+
+    if (dexElements && dexFileField) {
+        jsize len = env->GetArrayLength(dexElements);
+        for (jsize i = 0; i < len; ++i) {
+            jobject elem = env->GetObjectArrayElement(dexElements, i);
+            if (!elem) continue;
+            jobject df = env->GetObjectField(elem, dexFileField);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); df = nullptr; }
+            if (df) {
+                collectCookie(df, internalCookieField);
+                collectCookie(df, cookieField);
+                env->DeleteLocalRef(df);
+            }
+            env->DeleteLocalRef(elem);
+        }
+    }
+
+    if (dexElements) env->DeleteLocalRef(dexElements);
+    if (elemCls) env->DeleteLocalRef(elemCls);
+    if (dplCls) env->DeleteLocalRef(dplCls);
+    if (baseCls) env->DeleteLocalRef(baseCls);
+    env->DeleteLocalRef(pathList);
+    return result;
+}
+
+// Zero-reflection in-memory DEX pre-scanner:
+// Scans `class_defs` and `method_ids` tables across all loaded art::DexFile* images
+// in a few milliseconds without calling ClassLoader.loadClass() on 100k+ classes.
+// - If `singleKeywordMode` is true: matches any class whose name matches `methodPattern`
+//   OR any class that defines a method whose name matches `methodPattern`.
+// - If `singleKeywordMode` is false: matches any class whose name matches `classPattern`
+//   AND (if `methodPattern` is non-empty/non-"*") defines a method matching `methodPattern`.
+static std::vector<std::string> FastScanCandidateClasses(JNIEnv* env,
+                                                         const std::string& classPattern,
+                                                         const std::string& methodPattern,
+                                                         bool singleKeywordMode) {
+    std::vector<std::string> candidates;
+    std::unordered_set<std::string> seenClasses;
+
+    std::vector<const void*> dexPtrs = CollectAppNativeDexFiles(env);
+    for (const void* dfp : dexPtrs) {
+        // Crash-safe probe of art::DexFile header before initializing DexResolver
+        struct iovec liov, riov;
+        uint8_t fields[0x20];
+        liov = { fields, sizeof(fields) };
+        riov = { const_cast<void*>(dfp), sizeof(fields) };
+        if (syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0) != sizeof(fields)) continue;
+        const uint8_t* dex_begin = *reinterpret_cast<const uint8_t* const*>(fields + 0x08);
+        if (!dex_begin) continue;
+        uint8_t magic[8];
+        liov = { magic, sizeof(magic) };
+        riov = { const_cast<uint8_t*>(dex_begin), sizeof(magic) };
+        if (syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0) != sizeof(magic)) continue;
+        if (std::memcmp(magic, "dex\n", 4) != 0 && std::memcmp(magic, "cdex", 4) != 0) continue;
+
+        PI::DexResolver resolver;
+        if (!resolver.init(dfp)) continue;
+        const auto* hdr = resolver.header();
+        if (!hdr || !hdr->class_defs_size || !hdr->class_defs_off || !hdr->type_ids_size) continue;
+
+        // 0 = not defined in this dex / excluded, 1 = needs method check, 2 = already accepted
+        std::vector<uint8_t> state(hdr->type_ids_size, 0);
+        size_t needMethodCheckCount = 0;
+
+        const uint8_t* classDefsBase = dex_begin + hdr->class_defs_off;
+        for (uint32_t i = 0; i < hdr->class_defs_size; ++i) {
+            uint32_t class_idx = *reinterpret_cast<const uint32_t*>(classDefsBase + i * 32);
+            if (class_idx >= hdr->type_ids_size) continue;
+            const char* desc = resolver.typeUtf(class_idx);
+            if (!desc) continue;
+            std::string dotName = DescriptorToDotName(desc);
+            if (dotName.empty()) continue;
+
+            if (singleKeywordMode) {
+                if (MatchPatternSubstr(dotName, methodPattern)) {
+                    state[class_idx] = 2;
+                    if (seenClasses.insert(dotName).second) candidates.push_back(dotName);
+                } else {
+                    state[class_idx] = 1;
+                    needMethodCheckCount++;
+                }
+            } else {
+                if (!MatchPatternSubstr(dotName, classPattern)) {
+                    state[class_idx] = 0;
+                } else if (methodPattern.empty() || methodPattern == "*") {
+                    state[class_idx] = 2;
+                    if (seenClasses.insert(dotName).second) candidates.push_back(dotName);
+                } else {
+                    state[class_idx] = 1;
+                    needMethodCheckCount++;
+                }
+            }
+        }
+
+        if (needMethodCheckCount > 0 && hdr->method_ids_size && hdr->method_ids_off) {
+            const auto* methodIds = reinterpret_cast<const PI::DexMethodId*>(dex_begin + hdr->method_ids_off);
+            for (uint32_t m = 0; m < hdr->method_ids_size && needMethodCheckCount > 0; ++m) {
+                uint16_t cidx = methodIds[m].class_idx;
+                if (cidx >= hdr->type_ids_size || state[cidx] != 1) continue;
+                const char* mname = resolver.resolveString(methodIds[m].name_idx);
+                if (mname && MatchPatternSubstr(mname, methodPattern)) {
+                    state[cidx] = 2;
+                    needMethodCheckCount--;
+                    const char* desc = resolver.typeUtf(cidx);
+                    std::string dotName = DescriptorToDotName(desc);
+                    if (!dotName.empty() && seenClasses.insert(dotName).second) {
+                        candidates.push_back(dotName);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback if native DexFile cookies were unavailable
+    if (dexPtrs.empty()) {
+        std::vector<std::string> allNames = EnumerateAppClassNames(env);
+        for (const auto& cn : allNames) {
+            if (singleKeywordMode || MatchPatternSubstr(cn, classPattern)) {
+                candidates.push_back(cn);
+            }
+        }
+    }
+    return candidates;
+}
+
 JSValue JsFindMethods(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    if (argc < 1) return JS_NewString(ctx, "Usage: findMethods(classOrPattern[, methodPattern])  (methodPattern defaults to \"\")\nExamples:\n  findMethods(\"com.android.boot.MainActivity\")            // all methods of the class\n  findMethods(\"com.android.boot.MainActivity\", \"*Weather*\")\n  findMethods(\"*boot*\")                                     // wildcard: search methods across classes");
+    if (argc < 1) return JS_NewString(ctx, "Usage: findMethods(classOrPattern[, methodPattern])  (methodPattern defaults to \"\")\nExamples:\n  findMethods(\"com.android.boot.MainActivity\")            // all methods of the class\n  findMethods(\"com.android.boot.MainActivity\", \"*Weather*\")\n  findMethods(\"md5\")                                        // search classes/methods containing 'md5'");
     JNIEnv* env = GetEnv();
     if (!env) return JS_NULL;
 
@@ -499,9 +764,7 @@ JSValue JsFindMethods(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVal
 
         // 2) Class-name form: the second argument defaults to "" so that
         //    findMethods("com.foo.Bar") == findMethods("com.foo.Bar", "").
-        //    FindClassWithFallback() returns nullptr for wildcard specs, which
-        //    cleanly distinguishes an exact class name from a method pattern.
-        jclass exactCls = FindClassWithFallback(env, arg0);
+        jclass exactCls = (arg0.find('|') == std::string::npos) ? FindClassWithFallback(env, arg0) : nullptr;
         if (exactCls) {
             InspectClassMethods(env, exactCls, "", ss, count, 100);
             env->DeleteLocalRef(exactCls);
@@ -509,8 +772,8 @@ JSValue JsFindMethods(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVal
             return JS_NewString(ctx, ss.str().c_str());
         }
 
-        // 3) Fallback: treat the single argument as a method pattern searched across all classes.
-        std::vector<std::string> classNames = EnumerateAppClassNames(env);
+        // 3) Fast in-memory DEX scan across all classes for class/method matching `arg0`.
+        std::vector<std::string> classNames = FastScanCandidateClasses(env, "", arg0, true);
         for (const auto& cn : classNames) {
             if (count >= 50) break;
             jclass cls = FindClassWithFallback(env, cn);
@@ -542,25 +805,23 @@ JSValue JsFindMethods(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVal
         std::string classSpec(clzStr);
         JS_FreeCString(ctx, clzStr);
 
-        if (classSpec.find('*') != std::string::npos || classSpec.find('?') != std::string::npos) {
-            std::vector<std::string> allNames = EnumerateAppClassNames(env);
-            for (const auto& cn : allNames) {
-                if (count >= 50) break;
-                if (MatchWildcard(cn, classSpec)) {
-                    jclass cls = FindClassWithFallback(env, cn);
-                    if (cls) {
-                        InspectClassMethods(env, cls, methodPattern, ss, count, 50);
-                        env->DeleteLocalRef(cls);
-                    }
-                }
-            }
+        jclass exactCls = (classSpec.find('*') == std::string::npos &&
+                           classSpec.find('?') == std::string::npos &&
+                           classSpec.find('|') == std::string::npos)
+                              ? FindClassWithFallback(env, classSpec)
+                              : nullptr;
+        if (exactCls) {
+            InspectClassMethods(env, exactCls, methodPattern, ss, count, 100);
+            env->DeleteLocalRef(exactCls);
         } else {
-            jclass cls = FindClassWithFallback(env, classSpec);
-            if (cls) {
-                InspectClassMethods(env, cls, methodPattern, ss, count, 100);
-                env->DeleteLocalRef(cls);
-            } else {
-                return JS_NewString(ctx, ("[!] Class not found: " + classSpec).c_str());
+            std::vector<std::string> matchedClasses = FastScanCandidateClasses(env, classSpec, methodPattern, false);
+            for (const auto& cn : matchedClasses) {
+                if (count >= 50) break;
+                jclass cls = FindClassWithFallback(env, cn);
+                if (cls) {
+                    InspectClassMethods(env, cls, methodPattern, ss, count, 50);
+                    env->DeleteLocalRef(cls);
+                }
             }
         }
     }
@@ -2811,53 +3072,10 @@ static void AttachLazyStackGetter(JSContext* jsctx, JSValue obj, const PI::CallF
     JS_FreeAtom(jsctx, atom);
 }
 
-JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    if (argc < 1) return JS_NewString(ctx, "Usage: jhook(artMethod, [onEnter], [onLeave], [className], [methodName], [sig])");
-    int64_t ptr = ParsePtr(ctx, argv[0]);
-    if (!ptr || ptr < 0x1000) return JS_NewString(ctx, "[!] Invalid method pointer");
-
-    // Callback/metadata layout is positional:
-    //   jhook(art, cb)                                  -> single callback, no metadata
-    //   jhook(art, cb, className, methodName, sig)      -> single callback + metadata
-    //   jhook(art, onEnter, onLeave, className, mName, sig) -> two callbacks + metadata
-    // If argv[2] is a function it is the onLeave callback (metadata starts at 3);
-    // otherwise it is the className (metadata starts at 2).
-    bool twoCb = (argc >= 3 && JS_IsFunction(ctx, argv[2]));
-    int metaBase = twoCb ? 3 : 2;
-    std::string optClass, optMethod, optSig;
-    if (argc >= metaBase + 0 && JS_IsString(argv[metaBase + 0])) {
-        const char* s = JS_ToCString(ctx, argv[metaBase + 0]);
-        if (s) { optClass = s; JS_FreeCString(ctx, s); }
-    }
-    if (argc >= metaBase + 1 && JS_IsString(argv[metaBase + 1])) {
-        const char* s = JS_ToCString(ctx, argv[metaBase + 1]);
-        if (s) { optMethod = s; JS_FreeCString(ctx, s); }
-    }
-    if (argc >= metaBase + 2 && JS_IsString(argv[metaBase + 2])) {
-        const char* s = JS_ToCString(ctx, argv[metaBase + 2]);
-        if (s) { optSig = s; JS_FreeCString(ctx, s); }
-    }
-
-    PI::Method m;
-    if (!optClass.empty() && !optMethod.empty() && !optSig.empty()) {
-        JNIEnv* env = GetEnv();
-        if (env) {
-            jclass clazz = FindClassWithFallback(env, optClass);
-            if (clazz) {
-                m = PI::resolve(env, clazz, optMethod, optSig);
-                env->DeleteLocalRef(clazz);
-            }
-        }
-    }
-    if (!m.isValid()) {
-        m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
-    }
-    if (!m.isValid() && ptr) {
-        m = PI::Method(nullptr, nullptr, nullptr, reinterpret_cast<ArtMethod*>(ptr),
-                       optMethod.empty() ? "ArtMethod" : optMethod, optSig,
-                       reinterpret_cast<ArtMethod*>(ptr)->IsStatic());
-    }
-    if (!m.isValid()) return JS_NewString(ctx, "[!] Cannot resolve ArtMethod");
+static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
+                                 bool hasCb, bool twoCb,
+                                 JSValueConst cbArg1, JSValueConst cbArg2) {
+    if (!m.isValid()) return -1;
 
     // last-one-wins: drop any existing hook/trace/breakpoint on this ArtMethod
     // before installing a fresh trampoline (a method carries only one).
@@ -2871,7 +3089,7 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
     }
 
     PI::HookHandle handle;
-    if (!twoCb && (argc < 2 || !JS_IsFunction(ctx, argv[1]))) {
+    if (!twoCb && (!hasCb || !JS_IsFunction(ctx, cbArg1))) {
         // No callback -> default "call log" hook: Box-drawing call hierarchy with clear return packets.
         handle = m.hook([](JNIEnv* cbEnv, PI::CallFrame& frame) {
             if (cbEnv) cbEnv->PushLocalFrame(32);
@@ -2915,13 +3133,13 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
             if (cbEnv) cbEnv->PopLocalFrame(nullptr);
         });
     } else if (twoCb) {
-        // Two-callback form: onEnter(argv[1], optional) + onLeave(argv[2]). The original
+        // Two-callback form: onEnter(cbArg1, optional) + onLeave(cbArg2). The original
         // method ALWAYS runs between them; onLeave observes the return value and
         // may override it via setResult.
-        auto onEnterGuard = JS_IsFunction(ctx, argv[1])
-            ? GuardJsHookCb(JS_DupValue(ctx, argv[1]))
+        auto onEnterGuard = JS_IsFunction(ctx, cbArg1)
+            ? GuardJsHookCb(JS_DupValue(ctx, cbArg1))
             : nullptr;
-        auto onLeaveGuard = GuardJsHookCb(JS_DupValue(ctx, argv[2]));
+        auto onLeaveGuard = GuardJsHookCb(JS_DupValue(ctx, cbArg2));
         handle = m.hook([onEnterGuard, onLeaveGuard](JNIEnv* cbEnv, PI::CallFrame& frame) {
             JSContext* jsctx = g_ctx;
             if (!jsctx) { frame.invokeOriginal(); return; }
@@ -3036,7 +3254,7 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
     } else {
         // Keep the callback alive for the hook's lifetime; the deleter frees the
         // JSValue when the hook is removed (Pine destroys the std::function).
-        auto cbGuard = GuardJsHookCb(JS_DupValue(ctx, argv[1]));
+        auto cbGuard = GuardJsHookCb(JS_DupValue(ctx, cbArg1));
         handle = m.hook([cbGuard](JNIEnv* cbEnv, PI::CallFrame& frame) {
             JSContext* jsctx = g_ctx;
             if (!jsctx) { frame.invokeOriginal(); return; }
@@ -3164,15 +3382,307 @@ JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueC
     }
 
     if (!handle.isHooked()) {
-        return JS_NewString(ctx, "[!] Hook installation failed");
+        return -1;
     }
 
     std::lock_guard<std::mutex> lk(g_hooksMutex);
     g_activeHooks.push_back(handle);
-    size_t hookId = g_activeHooks.size() - 1;
+    return static_cast<int>(g_activeHooks.size() - 1);
+}
+
+JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NewString(ctx, "Usage: jhook(artMethod, [onEnter], [onLeave], [className], [methodName], [sig])");
+    int64_t ptr = ParsePtr(ctx, argv[0]);
+    if (!ptr || ptr < 0x1000) return JS_NewString(ctx, "[!] Invalid method pointer");
+
+    // Callback/metadata layout is positional:
+    //   jhook(art, cb)                                  -> single callback, no metadata
+    //   jhook(art, cb, className, methodName, sig)      -> single callback + metadata
+    //   jhook(art, onEnter, onLeave, className, mName, sig) -> two callbacks + metadata
+    // If argv[2] is a function it is the onLeave callback (metadata starts at 3);
+    // otherwise it is the className (metadata starts at 2).
+    bool twoCb = (argc >= 3 && JS_IsFunction(ctx, argv[2]));
+    int metaBase = twoCb ? 3 : 2;
+    std::string optClass, optMethod, optSig;
+    if (argc >= metaBase + 0 && JS_IsString(argv[metaBase + 0])) {
+        const char* s = JS_ToCString(ctx, argv[metaBase + 0]);
+        if (s) { optClass = s; JS_FreeCString(ctx, s); }
+    }
+    if (argc >= metaBase + 1 && JS_IsString(argv[metaBase + 1])) {
+        const char* s = JS_ToCString(ctx, argv[metaBase + 1]);
+        if (s) { optMethod = s; JS_FreeCString(ctx, s); }
+    }
+    if (argc >= metaBase + 2 && JS_IsString(argv[metaBase + 2])) {
+        const char* s = JS_ToCString(ctx, argv[metaBase + 2]);
+        if (s) { optSig = s; JS_FreeCString(ctx, s); }
+    }
+
+    PI::Method m;
+    if (!optClass.empty() && !optMethod.empty() && !optSig.empty()) {
+        JNIEnv* env = GetEnv();
+        if (env) {
+            jclass clazz = FindClassWithFallback(env, optClass);
+            if (clazz) {
+                m = PI::resolve(env, clazz, optMethod, optSig);
+                env->DeleteLocalRef(clazz);
+            }
+        }
+    }
+    if (!m.isValid()) {
+        m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
+    }
+    if (!m.isValid() && ptr) {
+        m = PI::Method(nullptr, nullptr, nullptr, reinterpret_cast<ArtMethod*>(ptr),
+                       optMethod.empty() ? "ArtMethod" : optMethod, optSig,
+                       reinterpret_cast<ArtMethod*>(ptr)->IsStatic());
+    }
+    if (!m.isValid()) return JS_NewString(ctx, "[!] Cannot resolve ArtMethod");
+
+    bool hasCb = (argc >= 2 && JS_IsFunction(ctx, argv[1]));
+    JSValueConst cb1 = (argc >= 2) ? argv[1] : JS_UNDEFINED;
+    JSValueConst cb2 = (argc >= 3) ? argv[2] : JS_UNDEFINED;
+    int hookId = InstallJavaMethodHook(ctx, m, hasCb, twoCb, cb1, cb2);
+    if (hookId < 0) {
+        return JS_NewString(ctx, "[!] Hook installation failed");
+    }
+
     char resBuf[64];
-    snprintf(resBuf, sizeof(resBuf), "Hook installed (id: %zu)", hookId);
+    snprintf(resBuf, sizeof(resBuf), "Hook installed (id: %d)", hookId);
     return JS_NewString(ctx, resBuf);
+}
+
+// ===========================================================================
+// findAndHook / findandhook:
+//   findAndHook("md5")                                     // hook all methods where class or method name matches "md5"
+//   findAndHook("md5", onEnter [, onLeave])                // with custom callback(s)
+//   findAndHook("*encrypt*", "md5|aes" [, onEnter, ...])   // class pattern + method pattern
+//   findAndHook("com.cmccit.netmodule.CommonHttp", "encrypt")
+//   findAndHook(clsPtr, "encrypt" [, onEnter, onLeave])
+// Optional trailing integer sets maxHooks (default 50, max 500).
+// ===========================================================================
+JSValue JsFindAndHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_NewString(ctx,
+            "Usage:\n"
+            "  findAndHook(keyword [, onEnter, onLeave, maxHooks])                 // match class OR method name (case-insensitive substring/wildcard)\n"
+            "  findAndHook(classPattern, methodPattern [, onEnter, onLeave, max])  // match class AND method pattern ('|' supported)\n"
+            "Examples:\n"
+            "  findAndHook(\"md5\")\n"
+            "  findAndHook(\"*encrypt*\", \"encrypt|decrypt\")\n"
+            "  findAndHook(\"com.cmccit.netmodule.CommonHttp\", \"encrypt|Header\")");
+    }
+
+    JNIEnv* env = GetEnv();
+    if (!env) return JS_NULL;
+
+    int effArgc = argc;
+    int maxHooks = 50;
+    if (effArgc >= 2 && JS_IsNumber(argv[effArgc - 1])) {
+        int lim = 50;
+        if (JS_ToInt32(ctx, &lim, argv[effArgc - 1]) == 0 && lim > 0) {
+            maxHooks = std::min(lim, 500);
+        }
+        effArgc--;
+    }
+
+    int64_t clsPtr = (!JS_IsString(argv[0]) && !JS_IsFunction(ctx, argv[0])) ? ParsePtr(ctx, argv[0]) : 0;
+    std::string arg0Str;
+    if (clsPtr == 0 && JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (s) { arg0Str = s; JS_FreeCString(ctx, s); }
+    }
+    if (clsPtr == 0 && arg0Str.empty()) {
+        return JS_NewString(ctx, "[!] findAndHook: first argument must be a pattern string or class pointer");
+    }
+
+    bool hasSecondPattern = (effArgc >= 2 && JS_IsString(argv[1]));
+    std::string classPattern;
+    std::string methodPattern;
+    bool singleKeywordMode = false;
+    int cbBase = 1;
+
+    if (hasSecondPattern) {
+        const char* s = JS_ToCString(ctx, argv[1]);
+        methodPattern = s ? s : "";
+        if (s) JS_FreeCString(ctx, s);
+        classPattern = arg0Str;
+        singleKeywordMode = false;
+        cbBase = 2;
+    } else {
+        cbBase = 1;
+        if (clsPtr != 0) {
+            methodPattern = "";
+            singleKeywordMode = false;
+        } else {
+            // If arg0 is an exact loaded class name (without wildcards or '|'), hook all its methods.
+            // Otherwise treat arg0 as a keyword matching either class name or method name.
+            bool hasMeta = (arg0Str.find('*') != std::string::npos ||
+                            arg0Str.find('?') != std::string::npos ||
+                            arg0Str.find('|') != std::string::npos);
+            jclass exact = !hasMeta ? FindClassWithFallback(env, arg0Str) : nullptr;
+            if (exact) {
+                env->DeleteLocalRef(exact);
+                classPattern = arg0Str;
+                methodPattern = "";
+                singleKeywordMode = false;
+            } else {
+                classPattern = arg0Str;
+                methodPattern = arg0Str;
+                singleKeywordMode = true;
+            }
+        }
+    }
+
+    bool hasCb = (effArgc > cbBase && JS_IsFunction(ctx, argv[cbBase]));
+    bool twoCb = (effArgc > cbBase + 1 && JS_IsFunction(ctx, argv[cbBase + 1]));
+    JSValueConst cb1 = (effArgc > cbBase) ? argv[cbBase] : JS_UNDEFINED;
+    JSValueConst cb2 = (effArgc > cbBase + 1) ? argv[cbBase + 1] : JS_UNDEFINED;
+
+    jclass classCls = env->FindClass("java/lang/Class");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return JS_NULL; }
+    jmethodID getDeclaredMethods = classCls ? env->GetMethodID(classCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;") : nullptr;
+    jclass methodCls = env->FindClass("java/lang/reflect/Method");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); methodCls = nullptr; }
+    jmethodID methodToString = methodCls ? env->GetMethodID(methodCls, "toString", "()Ljava/lang/String;") : nullptr;
+    jmethodID methodGetName = methodCls ? env->GetMethodID(methodCls, "getName", "()Ljava/lang/String;") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    std::unordered_set<void*> hookedArtMethods;
+    std::ostringstream details;
+    int hookedCount = 0;
+    int skippedNativeOrAbstract = 0;
+    int matchedClassCount = 0;
+
+    auto hookMethodsInClass = [&](jclass targetCls, const std::string& cn) {
+        if (!targetCls || !getDeclaredMethods || hookedCount >= maxHooks) return;
+        auto methodsObj = (jobjectArray)env->CallObjectMethod(targetCls, getDeclaredMethods);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+        if (!methodsObj) return;
+
+        bool classMatchesKeyword = singleKeywordMode && !cn.empty() && MatchPatternSubstr(cn, methodPattern);
+        bool classHadMatch = false;
+        jsize len = env->GetArrayLength(methodsObj);
+        for (jsize i = 0; i < len && hookedCount < maxHooks; i++) {
+            jobject mObj = env->GetObjectArrayElement(methodsObj, i);
+            if (!mObj) continue;
+
+            std::string nameStr;
+            if (methodGetName) {
+                auto jName = (jstring)env->CallObjectMethod(mObj, methodGetName);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (jName) {
+                    const char* utf = env->GetStringUTFChars(jName, nullptr);
+                    if (utf) { nameStr = utf; env->ReleaseStringUTFChars(jName, utf); }
+                    env->DeleteLocalRef(jName);
+                }
+            }
+            if (nameStr == "<clinit>") {
+                env->DeleteLocalRef(mObj);
+                continue;
+            }
+
+            std::string desc = nameStr;
+            if (methodToString) {
+                auto jStr = (jstring)env->CallObjectMethod(mObj, methodToString);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (jStr) {
+                    const char* utf = env->GetStringUTFChars(jStr, nullptr);
+                    if (utf) { desc = utf; env->ReleaseStringUTFChars(jStr, utf); }
+                    env->DeleteLocalRef(jStr);
+                }
+            }
+
+            bool match = false;
+            if (singleKeywordMode) {
+                // Single-keyword mode: if the class name itself matched the keyword
+                // (e.g. EncryptionMD5Util for "md5"), hook all its methods; otherwise
+                // only hook methods whose method name matches the keyword.
+                match = classMatchesKeyword || MatchPatternSubstr(nameStr, methodPattern);
+            } else if (methodPattern.empty() || methodPattern == "*") {
+                match = true;
+            } else if (methodPattern.find('(') != std::string::npos || methodPattern.find(' ') != std::string::npos) {
+                match = MatchPatternSubstr(desc, methodPattern);
+            } else {
+                match = MatchPatternSubstr(nameStr, methodPattern);
+            }
+
+            if (match) {
+                PI::Method pm = PI::resolve(env, mObj);
+                if (pm.isValid() && pm.getArtMethod()) {
+                    uint32_t flags = pm.getAccessFlags();
+                    // Skip abstract (0x0400) and native (0x0100) methods
+                    if ((flags & 0x0400) != 0 || (flags & 0x0100) != 0) {
+                        skippedNativeOrAbstract++;
+                    } else {
+                        void* artPtr = reinterpret_cast<void*>(pm.getArtMethod());
+                        if (hookedArtMethods.insert(artPtr).second) {
+                            int hid = InstallJavaMethodHook(ctx, pm, hasCb, twoCb, cb1, cb2);
+                            if (hid >= 0) {
+                                hookedCount++;
+                                classHadMatch = true;
+                                char lineBuf[96];
+                                snprintf(lineBuf, sizeof(lineBuf), "  [hook #%d] 0x%llx -> ",
+                                         hid, (unsigned long long)reinterpret_cast<uintptr_t>(artPtr));
+                                details << lineBuf << desc << "\n";
+                            }
+                        }
+                    }
+                }
+            }
+            env->DeleteLocalRef(mObj);
+        }
+        if (classHadMatch) matchedClassCount++;
+        env->DeleteLocalRef(methodsObj);
+    };
+
+    if (clsPtr != 0) {
+        hookMethodsInClass(reinterpret_cast<jclass>(clsPtr), "");
+    } else {
+        bool hasMeta = (classPattern.find('*') != std::string::npos ||
+                        classPattern.find('?') != std::string::npos ||
+                        classPattern.find('|') != std::string::npos);
+        jclass exactCls = (!singleKeywordMode && !hasMeta) ? FindClassWithFallback(env, classPattern) : nullptr;
+        if (exactCls) {
+            hookMethodsInClass(exactCls, classPattern);
+            env->DeleteLocalRef(exactCls);
+        } else {
+            std::vector<std::string> candidateClasses = FastScanCandidateClasses(env, classPattern, methodPattern, singleKeywordMode);
+            for (const auto& cn : candidateClasses) {
+                if (hookedCount >= maxHooks) break;
+                jclass cls = FindClassWithFallback(env, cn);
+                if (cls) {
+                    hookMethodsInClass(cls, cn);
+                    env->DeleteLocalRef(cls);
+                }
+            }
+        }
+    }
+
+    if (classCls) env->DeleteLocalRef(classCls);
+    if (methodCls) env->DeleteLocalRef(methodCls);
+
+    if (hookedCount == 0) {
+        std::string msg = "[!] findAndHook: no hookable methods matched ";
+        msg += singleKeywordMode ? ("\"" + methodPattern + "\"")
+                                 : ("class=\"" + classPattern + "\", method=\"" + methodPattern + "\"");
+        if (skippedNativeOrAbstract > 0) {
+            msg += " (skipped " + std::to_string(skippedNativeOrAbstract) + " abstract/native)";
+        }
+        return JS_NewString(ctx, msg.c_str());
+    }
+
+    std::ostringstream out;
+    out << "[*] findAndHook: hooked " << hookedCount << " method(s) across " << matchedClassCount << " class(es)";
+    if (skippedNativeOrAbstract > 0) {
+        out << " (skipped " << skippedNativeOrAbstract << " abstract/native)";
+    }
+    if (hookedCount >= maxHooks) {
+        out << " [reached limit=" << maxHooks << ", pass a larger limit to hook more]";
+    }
+    out << ":\n" << details.str();
+    std::string res = out.str();
+    if (!res.empty() && res.back() == '\n') res.pop_back();
+    return JS_NewString(ctx, res.c_str());
 }
 
 JSValue JsJavaUnhook(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -3929,6 +4439,8 @@ void RegisterJavaApis(JSContext* ctx, JSValue global, JSValue java) {
     JS_SetPropertyStr(ctx, java, "choose", JS_NewCFunction(ctx, JsJavaChoose, "choose", 2));
     JS_SetPropertyStr(ctx, global, "choose", JS_NewCFunction(ctx, JsJavaChoose, "choose", 2));
     JS_SetPropertyStr(ctx, java, "hook", JS_NewCFunction(ctx, JsJavaHook, "hook", 2));
+    JS_SetPropertyStr(ctx, java, "findAndHook", JS_NewCFunction(ctx, JsFindAndHook, "findAndHook", 3));
+    JS_SetPropertyStr(ctx, java, "findandhook", JS_NewCFunction(ctx, JsFindAndHook, "findandhook", 3));
     JS_SetPropertyStr(ctx, java, "unhook", JS_NewCFunction(ctx, JsJavaUnhook, "unhook", 1));
     JS_SetPropertyStr(ctx, java, "unhookAll", JS_NewCFunction(ctx, JsJavaUnhookAll, "unhookAll", 0));
     JS_SetPropertyStr(ctx, java, "prepare", JS_NewCFunction(ctx, JsPrepare, "prepare", 1));
@@ -3964,6 +4476,8 @@ void RegisterJavaApis(JSContext* ctx, JSValue global, JSValue java) {
     JS_SetPropertyStr(ctx, global, "decompile", JS_NewCFunction(ctx, JsDecompile, "decompile", 2));
     JS_SetPropertyStr(ctx, global, "disassembly", JS_NewCFunction(ctx, JsDecompile, "disassembly", 2));
     JS_SetPropertyStr(ctx, global, "jhook", JS_NewCFunction(ctx, JsJavaHook, "jhook", 2));
+    JS_SetPropertyStr(ctx, global, "findAndHook", JS_NewCFunction(ctx, JsFindAndHook, "findAndHook", 3));
+    JS_SetPropertyStr(ctx, global, "findandhook", JS_NewCFunction(ctx, JsFindAndHook, "findandhook", 3));
     JS_SetPropertyStr(ctx, global, "unhook", JS_NewCFunction(ctx, JsJavaUnhook, "unhook", 1));
     JS_SetPropertyStr(ctx, global, "unhookall", JS_NewCFunction(ctx, JsJavaUnhookAll, "unhookall", 0));
     JS_SetPropertyStr(ctx, global, "dumpAllDex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpAllDex", 1));

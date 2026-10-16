@@ -273,15 +273,25 @@ const char* kDynamicBootstrapJs = R"JS(
             return out;
         }
 
-        // Hook every declared method of this class; skip abstract/native (no body /
-        // unsafe to hook). Overloaded methods are all distinct here (by ArtMethod).
-        function hookAllMethods(cb) {
+        // Hook declared methods of this class; skip abstract/native (no body /
+        // unsafe to hook). Supports optional methodPattern filter as first arg:
+        //   cls.hookall()
+        //   cls.hookall(onEnter [, onLeave])
+        //   cls.hookall("encrypt|Header" [, onEnter, onLeave])
+        function hookAllMethods(arg0, arg1, arg2) {
+            if (typeof arg0 === 'string' && typeof Java.findAndHook === 'function') {
+                return Java.findAndHook(className, arg0, arg1, arg2);
+            }
             let entries = listMethodEntries();
             let n = 0, skipped = 0;
             for (let i = 0; i < entries.length; i++) {
                 let d = entries[i].desc;
                 if (/\babstract\b/.test(d) || /\bnative\b/.test(d)) { skipped++; continue; }
-                jhook(entries[i].art, cb);
+                if (typeof arg1 === 'function') {
+                    jhook(entries[i].art, arg0, arg1);
+                } else {
+                    jhook(entries[i].art, arg0);
+                }
                 n++;
             }
             return `Hooked ${n} method(s) of ${className}` +
@@ -459,9 +469,18 @@ const char* kDynamicBootstrapJs = R"JS(
             findMethods: function(pat) {
                 return Java.findMethods(className, pat || "");
             },
-            // Hook every declared method of this class (first overload per name).
-            hookall: function(cb) {
-                return hookAllMethods(cb);
+            // Hook every declared method of this class (or filter by pattern string).
+            hookall: function(a, b, c) {
+                return hookAllMethods(a, b, c);
+            },
+            hookAll: function(a, b, c) {
+                return hookAllMethods(a, b, c);
+            },
+            findAndHook: function(pat, onEnter, onLeave) {
+                return hookAllMethods(pat || "*", onEnter, onLeave);
+            },
+            findandhook: function(pat, onEnter, onLeave) {
+                return hookAllMethods(pat || "*", onEnter, onLeave);
             },
             // Search all live heap instances of this class (like Frida Java.choose)
             choose: function(callbacks) {
@@ -517,6 +536,14 @@ const char* kDynamicBootstrapJs = R"JS(
         // (e.g. dynamic.java.dumpalldex()).
         let pkgRoot = makeJavaPackage("");
         let specials = {
+            findAndHook: function(...args) {
+                if (typeof Java.findAndHook !== 'function') throw new Error("Java.findAndHook is unavailable");
+                return Java.findAndHook(...args);
+            },
+            findandhook: function(...args) {
+                if (typeof Java.findAndHook !== 'function') throw new Error("Java.findAndHook is unavailable");
+                return Java.findAndHook(...args);
+            },
             dumpAllDex: function(dir) {
                 if (typeof Java.dumpAllDex !== 'function') throw new Error("Java.dumpAllDex is unavailable");
                 return Java.dumpAllDex(dir);
