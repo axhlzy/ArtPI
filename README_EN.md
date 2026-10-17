@@ -102,7 +102,7 @@ impl_glm/
 │   ├── jadxcli.jar              # Embedded decompilation engine (auto-deployed at runtime)
 │   ├── pack_compress.py         # Payload XZ/LZMA compression utility
 │   └── artpi_repl.py            # Python host REPL client
-├── external/                    # xdl (linker namespace bypass) / xz-embedded / frida-gum / qbdi
+├── external/                    # xdl (linker namespace bypass) / xz-embedded / frida-gum / qbdi / magic_enum / dexter (slicer)
 ├── assets/                      # Static resources
 │   └── screenshots/             # Terminal session and feature showcase screenshots
 └── prebuild/                    # Build outputs (libartpi.so / libartpi_static.a / libartpi_agent.so / artpi-cli)
@@ -436,6 +436,14 @@ D();  // detaches Java / native / Unity hooks together
 | `Memory.writeByteArray` | `(addr, data)` | Writes bytes to memory (automatically calls `mprotect` RWX) |
 | `Memory.readCString` | `(addr)` | Reads null-terminated C string |
 | `Memory.readU32` / `writeU32` | `(addr[, val])` | Reads or writes 32-bit unsigned integer |
+| `Memory.crc32` / `crc32` | `(addr, len)` | Computes standard CRC-32 (IEEE 802.3) checksum for memory region, returning unsigned integer (e.g. `0x1a4d88ad`) |
+| `Memory.crc32c` / `crc32c` | `(addr, len)` | Computes Castagnoli CRC-32C checksum, returning unsigned integer |
+| `Memory.adler32` / `adler32` | `(addr, len)` | Computes Adler-32 checksum (standard for DEX Header checksum), returning unsigned integer |
+| `Memory.md5` / `md5` | `(addr, len)` | Computes MD5 hash of memory region (returns 32-char lowercase hex string) |
+| `Memory.sha1` / `sha1` | `(addr, len)` | Computes SHA-1 hash of memory region (standard for DEX Header signature, returns 40-char hex string) |
+| `Memory.sha256` / `sha256` | `(addr, len)` | Computes SHA-256 hash of memory region (returns 64-char hex string) |
+| `Memory.hash` / `hashmem` | `(algo, addr, len)` | Universal hash function, supports both parameter orders; `algo` supports `"crc32"`, `"crc32c"`, `"adler32"`, `"md5"`, `"sha1"`, `"sha256"` |
+| `Memory.verifyCodeIntegrity` | `(nameOrAddr)` | Alias for `Linker.verifyCodeIntegrity` (retains `verifyIntegrity` alias), verifies memory code pages against original disk image |
 
 ---
 
@@ -628,6 +636,7 @@ Provides deep introspection into the Bionic Linker's runtime internal data struc
 | `Linker.linkMap` | `()` | Traverse and return the `link_map` chain (`{addr, name, phnum}`) |
 | `Linker.load` | `(libName)` | Call Linker kernel `__loader_dlopen` directly, **bypassing Android 7.0+ Linker Namespace restrictions** |
 | `Linker.dump` | `(nameOrAddr)` | Return formatted text summary of the library metadata |
+| `Linker.verifyCodeIntegrity` / `linker.verifyCodeIntegrity` | `(nameOrAddr)` | **One-Click Memory Code Integrity Verification** (aliases `verifyIntegrity` / `checkIntegrity`): Compares loaded memory executable code pages (`PT_LOAD` / `PF_X`) against original disk ELF image to detect Inline Hooks, ShadowHooks, Frida Stalker, or memory patching. Accurately supports Direct-APK mapped libraries (`android:extractNativeLibs="false"`). Returns structured report with modified page addresses, file offsets, CRC32 diffs, altered byte count, and nearest symbol names |
 
 #### 2. `soinfo` Object Properties
 
@@ -660,6 +669,41 @@ console.log("Destructors: " + dtors.destructors.length);
 // 3. Inspect symbols
 let syms = linker.symbols("liboattest.so", 10);
 syms.forEach(s => console.log(`[${s.index}] ${s.name} @ ${s.address}`));
+```
+
+#### 4. Memory Code Integrity Verification (`Linker.verifyCodeIntegrity`)
+
+Detects runtime memory modifications (Inline Hook, ShadowHook, Frida Stalker, memory patches, or packer decryption):
+
+- **Direct-APK Mapping Support**: Handles Android 7.0+ uncompressed SOs directly mapped from `/data/app/.../base.apk` (`extractNativeLibs="false"`) as well as standalone SOs and APEX runtime modules. Uses `dl_iterate_phdr` to isolate target library's exact executable segments (`PT_LOAD` / `PF_X`) without bleeding into other libraries packed into the same APK.
+- **Accurate Tamper Pinpointing**: Compares memory pages against disk byte-for-byte using dynamic system page sizes (4KB / 16KB), displaying altered addresses, file offsets, CRC32 diffs, and closest function symbols (e.g. `custom_dt_init (+0x230b0)`).
+- **Instant Bidirectional Feedback**: Immediately reports `MISMATCH DETECTED` upon patch, and returns to `Clean` once restored. If any read fails or is truncated, `isClean` strictly reports `false`.
+
+```javascript
+// Check integrity
+let rep = linker.verifyCodeIntegrity("liboattest.so");
+console.log(rep.toString());
+
+// Clean output:
+// [Integrity] Module: liboattest.so (Base: 0x7b6465d000)
+//   File path   : /data/app/.../base.apk
+//   Checked     : 79 executable page(s) (316 KB)
+//   Status      : Clean (All pages match disk image)
+
+// Tampered output (e.g. after Inline Hook / NOP patch):
+// [Integrity] Module: liboattest.so (Base: 0x7b6465d000)
+//   File path   : /data/app/.../base.apk
+//   Checked     : 79 executable page(s) (316 KB)
+//   Status      : MISMATCH DETECTED (1 modified page(s))
+//   ----------------------------------------------------------------------
+//   [!] Page @ 0x7b64680000 (Offset: +0x43b000, 4 byte(s) altered):
+//       Disk CRC32 : 0x2a652d26 | Memory CRC32: 0x9d2d1f21
+//       Symbols    : custom_dt_init (+0x230b0)
+//   ----------------------------------------------------------------------
+
+// System libraries can also be verified
+console.log(linker.verifyIntegrity("libc.so"));
+console.log(linker.verifyIntegrity("libart.so"));
 ```
 
 ---
@@ -814,6 +858,47 @@ To reveal **which native routine or shared library initiated the JNI call**, ful
 
 ---
 
+### 6.11 `Memory.*` — Memory Hash Suite & Code Integrity (`HashSuite`)
+
+ArtPI provides a lightweight, zero-dependency in-process memory hashing and integrity suite for memory anomaly detection, anti-tamper validation, and snapshot comparison:
+
+#### 1. Core APIs
+
+| API | Signature | Description |
+|---|---|---|
+| `Memory.crc32` / `crc32` | `(addr, len)` | Computes standard CRC-32 (IEEE 802.3), returns unsigned integer |
+| `Memory.crc32c` / `crc32c` | `(addr, len)` | Computes Castagnoli CRC-32C, returns unsigned integer |
+| `Memory.adler32` / `adler32` | `(addr, len)` | Computes Adler-32 checksum, returns unsigned integer |
+| `Memory.md5` / `md5` | `(addr, len)` | Computes MD5 hash, returns 32-character lowercase hex string |
+| `Memory.sha1` / `sha1` | `(addr, len)` | Computes SHA-1 hash, returns 40-character lowercase hex string |
+| `Memory.sha256` / `sha256` | `(addr, len)` | Computes SHA-256 hash, returns 64-character lowercase hex string |
+| `Memory.hash` / `hashmem` | `(algo, addr, len)` | Generic hash entry point (`"crc32"`, `"crc32c"`, `"adler32"`, `"md5"`, `"sha1"`, `"sha256"`) |
+| `Memory.verifyCodeIntegrity` | `(nameOrAddr)` | Alias for `Linker.verifyCodeIntegrity` (also retains `verifyIntegrity` alias) |
+
+> **Safety & Robustness**:
+> - Defensive validation: rejects `addr < 0x1000` (prevents NULL pointer crashes) and limits max chunk length to 64 MB (`len <= 67108864`).
+> - Memory probing: verifies page readability before hash computation, throwing informative exceptions on invalid regions.
+> - Concurrency safe: CRC lookup tables are generated at compile-time with `constexpr`, completely eliminating multi-threading data races.
+
+#### 2. Example
+
+```javascript
+let base = linker.find("liboattest.so").base;
+
+// Calculate CRC-32 and SHA-256 of header 4096 bytes
+let crc = Memory.crc32(base, 4096);
+console.log("Header CRC32: 0x" + crc.toString(16));
+
+let sha = Memory.sha256(base, 4096);
+console.log("Header SHA256: " + sha);
+
+// Verify code segment integrity
+let rep = Memory.verifyCodeIntegrity("liboattest.so");
+console.log(rep.toString());
+```
+
+---
+
 ## 7. Dependencies & Acknowledgments
 
 - [Pine](https://github.com/canyie/pine) — ART method hooking foundation (trampolines & ArtMethod hijacking)
@@ -824,4 +909,6 @@ To reveal **which native routine or shared library initiated the JNI call**, ful
 - [QuickJS](https://bellard.org/quickjs/) — Lightweight embeddable JavaScript engine
 - [xDL](https://github.com/hexhacking/xDL) — Android 7.0+ linker namespace bypass
 - [UnityResolve.hpp](https://github.com/issuimo/UnityResolve.hpp) — Unity IL2CPP metadata resolution and invocation (MIT, vendored under `external/unityresolve`)
+- [magic_enum](https://github.com/Neargye/magic_enum) — Modern C++ Compile-time Enum Reflection (MIT, vendored under `external/magic_enum`)
+- [Dexter (slicer)](https://android.googlesource.com/platform/tools/dexter) — DEX manipulation and rewriting engine (Apache-2.0, vendored under `external/dexter`)
 - [xz-embedded](https://github.com/torvalds/linux/tree/master/lib/xz) — Embedded LZMA2/XZ decompression

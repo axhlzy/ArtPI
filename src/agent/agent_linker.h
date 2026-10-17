@@ -5,5 +5,4 @@
 namespace artpi { namespace agent {
 
 void RegisterLinkerApis(JSContext* ctx, JSValue global);
-
 }} // namespace artpi::agent

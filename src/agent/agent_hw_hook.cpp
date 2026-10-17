@@ -14,6 +14,7 @@
 #include <time.h>
 #include <dlfcn.h>
 #include "xdl.h"
+#include <magic_enum/magic_enum.hpp>
 
 #include <string>
 #include <vector>
@@ -522,10 +523,23 @@ static JSValue JsHwWatchpointAttach(JSContext* ctx, JSValueConst /*this_val*/, i
             if (JS_IsString(cVal)) {
                 const char* cs = JS_ToCString(ctx, cVal);
                 if (cs) {
-                    if (strcmp(cs, "r") == 0) condition = HwWatchCondition::READ;
-                    else if (strcmp(cs, "w") == 0) condition = HwWatchCondition::WRITE;
-                    else if (strcmp(cs, "rw") == 0) condition = HwWatchCondition::READ_WRITE;
+                    std::string cstr = cs;
                     JS_FreeCString(ctx, cs);
+                    std::string lower = cstr;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (lower == "r" || lower == "read") condition = HwWatchCondition::READ;
+                    else if (lower == "w" || lower == "write") condition = HwWatchCondition::WRITE;
+                    else if (lower == "rw" || lower == "read_write" || lower == "readwrite") condition = HwWatchCondition::READ_WRITE;
+                    else {
+                        auto parsed = magic_enum::enum_cast<HwWatchCondition>(cstr);
+                        if (parsed.has_value()) {
+                            condition = parsed.value();
+                        } else {
+                            JS_FreeValue(ctx, cVal);
+                            JS_FreeValue(ctx, jsCb);
+                            return JS_ThrowTypeError(ctx, "Unknown watch condition '%s'. Expected 'r'/'read', 'w'/'write', or 'rw'/'read_write'.", cstr.c_str());
+                        }
+                    }
                 }
             }
             JS_FreeValue(ctx, cVal);
@@ -1687,8 +1701,8 @@ size_t HwHookDetachAll() {
 std::vector<HwHookInfo> HwHookListAll() {
     std::vector<HwHookInfo> res;
     for (const auto& s : HwHookManager::instance().listSessions()) {
-        if (!s.active) continue;
-        std::string typeStr = (s.config.type == HwHookType::BREAKPOINT) ? "BREAKPOINT" : "WATCHPOINT";
+        auto tn = magic_enum::enum_name(s.config.type);
+        std::string typeStr = tn.empty() ? (s.config.type == HwHookType::BREAKPOINT ? "BREAKPOINT" : "WATCHPOINT") : std::string(tn);
         std::string condStr = "";
         if (s.config.type == HwHookType::WATCHPOINT) {
             int cond = static_cast<int>(s.config.condition);

@@ -15,6 +15,10 @@
 #include <memory>
 #include <mutex>
 #include <algorithm>
+#include <cinttypes>
+#include "frida-gum.h"
+#include "agent_integrity.h"
+#include "../../engine/utils/pi_hash.h"
 
 namespace artpi { namespace agent {
 
@@ -541,6 +545,117 @@ static JSValue JsMemoryProtect(JSContext* ctx, JSValueConst /*this_val*/, int ar
     return JS_NewBool(ctx, rc == 0);
 }
 
+// ============================================================================
+// Hash Suite: CRC32, CRC32C, Adler32, MD5, SHA-1, SHA-256
+// ============================================================================
+static bool ValidateHashArgs(JSContext* ctx, int argc, JSValueConst* argv, const char* usage, int64_t& outAddr, size_t& outLen) {
+    if (argc < 2) {
+        JS_ThrowTypeError(ctx, "Usage: %s", usage);
+        return false;
+    }
+    outAddr = ParsePtr(ctx, argv[0]);
+    if (outAddr < 0x1000) {
+        JS_ThrowTypeError(ctx, "Invalid memory address 0x%" PRIx64, outAddr);
+        return false;
+    }
+    int64_t len = 0;
+    JS_ToInt64(ctx, &len, argv[1]);
+    if (len <= 0) {
+        JS_ThrowTypeError(ctx, "Length must be greater than 0");
+        return false;
+    }
+    constexpr int64_t MAX_HASH_LEN = 64 * 1024 * 1024; // 64 MB
+    if (len > MAX_HASH_LEN) {
+        JS_ThrowRangeError(ctx, "Length (%" PRId64 ") exceeds maximum allowed limit (64 MB)", len);
+        return false;
+    }
+    if (!gum_memory_is_readable(reinterpret_cast<const void*>(outAddr), static_cast<size_t>(len))) {
+        JS_ThrowTypeError(ctx, "Memory at 0x%" PRIx64 " is not readable", outAddr);
+        return false;
+    }
+    outLen = static_cast<size_t>(len);
+    return true;
+}
+
+static JSValue JsMemoryCrc32(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int64_t addr = 0;
+    size_t len = 0;
+    if (!ValidateHashArgs(ctx, argc, argv, "Memory.crc32(address, length)", addr, len)) return JS_EXCEPTION;
+    uint32_t val = PI::Hash::Crc32(reinterpret_cast<const void*>(addr), len);
+    char hex[32];
+    snprintf(hex, sizeof(hex), "0x%08x", val);
+    return JS_NewString(ctx, hex);
+}
+
+static JSValue JsMemoryCrc32c(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int64_t addr = 0;
+    size_t len = 0;
+    if (!ValidateHashArgs(ctx, argc, argv, "Memory.crc32c(address, length)", addr, len)) return JS_EXCEPTION;
+    uint32_t val = PI::Hash::Crc32c(reinterpret_cast<const void*>(addr), len);
+    char hex[32];
+    snprintf(hex, sizeof(hex), "0x%08x", val);
+    return JS_NewString(ctx, hex);
+}
+
+static JSValue JsMemoryAdler32(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int64_t addr = 0;
+    size_t len = 0;
+    if (!ValidateHashArgs(ctx, argc, argv, "Memory.adler32(address, length)", addr, len)) return JS_EXCEPTION;
+    uint32_t val = PI::Hash::Adler32(reinterpret_cast<const void*>(addr), len);
+    char hex[32];
+    snprintf(hex, sizeof(hex), "0x%08x", val);
+    return JS_NewString(ctx, hex);
+}
+
+static JSValue JsMemoryMd5(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int64_t addr = 0;
+    size_t len = 0;
+    if (!ValidateHashArgs(ctx, argc, argv, "Memory.md5(address, length)", addr, len)) return JS_EXCEPTION;
+    std::string hex = PI::Hash::Md5Hex(reinterpret_cast<const void*>(addr), len);
+    return JS_NewString(ctx, hex.c_str());
+}
+
+static JSValue JsMemorySha1(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int64_t addr = 0;
+    size_t len = 0;
+    if (!ValidateHashArgs(ctx, argc, argv, "Memory.sha1(address, length)", addr, len)) return JS_EXCEPTION;
+    std::string hex = PI::Hash::Sha1Hex(reinterpret_cast<const void*>(addr), len);
+    return JS_NewString(ctx, hex.c_str());
+}
+
+static JSValue JsMemorySha256(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int64_t addr = 0;
+    size_t len = 0;
+    if (!ValidateHashArgs(ctx, argc, argv, "Memory.sha256(address, length)", addr, len)) return JS_EXCEPTION;
+    std::string hex = PI::Hash::Sha256Hex(reinterpret_cast<const void*>(addr), len);
+    return JS_NewString(ctx, hex.c_str());
+}
+
+static JSValue JsMemoryHash(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int64_t addr = 0;
+    size_t len = 0;
+    std::string algo = "sha256";
+    if (argc >= 3 && JS_IsString(argv[0])) {
+        // Form 1: Memory.hash(algo, address, length)
+        const char* aStr = JS_ToCString(ctx, argv[0]);
+        if (aStr) { algo = aStr; JS_FreeCString(ctx, aStr); }
+        JSValueConst shiftedArgv[2] = { argv[1], argv[2] };
+        if (!ValidateHashArgs(ctx, 2, shiftedArgv, "Memory.hash(algo, address, length)", addr, len)) return JS_EXCEPTION;
+    } else {
+        // Form 2: Memory.hash(address, length, [algo='sha256'])
+        if (!ValidateHashArgs(ctx, argc, argv, "Memory.hash(address, length, [algo='sha256'])", addr, len)) return JS_EXCEPTION;
+        if (argc >= 3 && JS_IsString(argv[2])) {
+            const char* aStr = JS_ToCString(ctx, argv[2]);
+            if (aStr) { algo = aStr; JS_FreeCString(ctx, aStr); }
+        }
+    }
+    std::string hex = PI::Hash::ComputeHex(algo, reinterpret_cast<const void*>(addr), len);
+    if (hex.empty()) {
+        return JS_ThrowTypeError(ctx, "Unsupported hash algorithm: '%s'. Supported: crc32, crc32c, adler32, md5, sha1, sha256", algo.c_str());
+    }
+    return JS_NewString(ctx, hex.c_str());
+}
+
 } // namespace
 
 void RegisterMemoryApis(JSContext* ctx, JSValue global, JSValue memory) {
@@ -557,6 +672,18 @@ void RegisterMemoryApis(JSContext* ctx, JSValue global, JSValue memory) {
     JS_SetPropertyStr(ctx, memory, "maps", JS_NewCFunction(ctx, JsMemoryMaps, "maps", 1));
     JS_SetPropertyStr(ctx, memory, "findNative", JS_NewCFunction(ctx, JsMemoryFindNative, "findNative", 2));
     JS_SetPropertyStr(ctx, memory, "protect", JS_NewCFunction(ctx, JsMemoryProtect, "protect", 3));
+
+    // Hash suite & integrity
+    JS_SetPropertyStr(ctx, memory, "crc32", JS_NewCFunction(ctx, JsMemoryCrc32, "crc32", 2));
+    JS_SetPropertyStr(ctx, memory, "crc32c", JS_NewCFunction(ctx, JsMemoryCrc32c, "crc32c", 2));
+    JS_SetPropertyStr(ctx, memory, "adler32", JS_NewCFunction(ctx, JsMemoryAdler32, "adler32", 2));
+    JS_SetPropertyStr(ctx, memory, "md5", JS_NewCFunction(ctx, JsMemoryMd5, "md5", 2));
+    JS_SetPropertyStr(ctx, memory, "sha1", JS_NewCFunction(ctx, JsMemorySha1, "sha1", 2));
+    JS_SetPropertyStr(ctx, memory, "sha256", JS_NewCFunction(ctx, JsMemorySha256, "sha256", 2));
+    JS_SetPropertyStr(ctx, memory, "hash", JS_NewCFunction(ctx, JsMemoryHash, "hash", 3));
+    JS_SetPropertyStr(ctx, memory, "verifyCodeIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "verifyCodeIntegrity", 1));
+    JS_SetPropertyStr(ctx, memory, "verifyIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "verifyIntegrity", 1));
+    JS_SetPropertyStr(ctx, memory, "checkIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "checkIntegrity", 1));
 
     // Flat global aliases
     JS_SetPropertyStr(ctx, global, "hexdump", JS_NewCFunction(ctx, JsHexDump, "hexdump", 2));
@@ -575,6 +702,10 @@ void RegisterMemoryApis(JSContext* ctx, JSValue global, JSValue memory) {
     JS_SetPropertyStr(ctx, global, "restoreall", JS_NewCFunction(ctx, JsMemoryRestoreAll, "restoreall", 0));
     JS_SetPropertyStr(ctx, global, "maps", JS_NewCFunction(ctx, JsMemoryMaps, "maps", 1));
     JS_SetPropertyStr(ctx, global, "findnative", JS_NewCFunction(ctx, JsMemoryFindNative, "findnative", 2));
+    JS_SetPropertyStr(ctx, global, "crc32", JS_NewCFunction(ctx, JsMemoryCrc32, "crc32", 2));
+    JS_SetPropertyStr(ctx, global, "hashmem", JS_NewCFunction(ctx, JsMemoryHash, "hashmem", 3));
+    JS_SetPropertyStr(ctx, global, "verifyCodeIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "verifyCodeIntegrity", 1));
+    JS_SetPropertyStr(ctx, global, "verifyIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "verifyIntegrity", 1));
 }
 
 }} // namespace artpi::agent

@@ -35,6 +35,7 @@ set(AGENT_SOURCES
     agent_unity.cpp
     agent_hw_hook.cpp
     agent_linker.cpp
+    agent_integrity.cpp
     agent_qbdi.cpp
     agent_jni.cpp
     jni_trampoline_arm64.S
@@ -61,6 +62,7 @@ target_include_directories(artpi_agent PRIVATE
     ../../external/unityresolve
     ../../external/KittyMemory
     ../../external/levenshtein
+    ../../external/magic_enum/include
     ../../engine/native
     ../../engine/native/qbdi
 )

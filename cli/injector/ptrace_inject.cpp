@@ -603,10 +603,39 @@ bool InjectLibrary(pid_t pid, const char *soPath, const char *apkDirPrefix,
         }
     }
 
+    std::string remoteDlerr;
+    if (ret == 0) {
+        uint64_t offDlerror = ElfSymbolOffset(linker->path.c_str(), {"__loader_dlerror", "dlerror"});
+        uint64_t targetBase = linker->base;
+        if (!offDlerror && libc) {
+            offDlerror = ElfSymbolOffset(libc->path.c_str(), {"dlerror"});
+            targetBase = libc->base;
+        }
+        if (offDlerror) {
+            uint64_t errPtr = 0;
+            std::string subErr;
+            if (RemoteCall(pid, targetBase + offDlerror, nullptr, 0, errPtr, subErr, 2000) && errPtr) {
+                char errBuf[512] = {0};
+                for (size_t i = 0; i < sizeof(errBuf) - sizeof(long); i += sizeof(long)) {
+                    errno = 0;
+                    long word = ptrace(PTRACE_PEEKDATA, pid, (void*)(uintptr_t)(errPtr + i), nullptr);
+                    if (word == -1 && errno != 0) break;
+                    memcpy(errBuf + i, &word, sizeof(long));
+                    if (memchr(&word, 0, sizeof(long))) break;
+                }
+                remoteDlerr = errBuf;
+            }
+        }
+    }
+
     detach();
 
     if (ret == 0) {
-        err = "remote dlopen returned NULL (check logcat for linker/selinux error)";
+        if (!remoteDlerr.empty()) {
+            err = "remote dlopen failed: " + remoteDlerr;
+        } else {
+            err = "remote dlopen returned NULL (check logcat for linker/selinux error)";
+        }
         return false;
     }
     char info[320];

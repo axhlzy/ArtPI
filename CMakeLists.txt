@@ -6,7 +6,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(COMMON_FLAGS "-Wall -Wextra -Wno-unused-parameter -Wno-macro-redefined -fvisibility=hidden -flto=thin")
 set(CXX_ONLY_FLAGS "-fvisibility-inlines-hidden -fno-exceptions -fno-rtti")
-set(LINKER_FLAGS "-fuse-ld=lld -flto=thin -ffixed-x18 -Wl,--hash-style=both -Wl,--unresolved-symbols=ignore-all")
+set(LINKER_FLAGS "-fuse-ld=lld -flto=thin -ffixed-x18 -Wl,--hash-style=both")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_FLAGS} ${CXX_ONLY_FLAGS}")
@@ -34,6 +34,7 @@ include_directories(
     # §NATIVE: libgum (Frida-Gum) / QBDI 引擎与跨层桥
     external/frida-gum/include
     external/qbdi/include
+    external/magic_enum/include
     engine/native
     engine/tracer/unified
 )
@@ -98,6 +99,7 @@ set(ARTPI_SOURCES
         engine/utils/scoped_memory_access_protection.cpp
         engine/utils/elf_image.cpp
         engine/utils/well_known_classes.cpp
+        engine/utils/pi_hash.cpp
 
         # External sub-tools
         ${XZ_EMBEDDED_SOURCE}
@@ -200,8 +202,10 @@ endif()
 # 这样在 CLion 里单独构建某个 target 时也会按整条链编译。
 #
 # 注意: 内嵌 payload (agent / jadxcli.jar) 的打包与 prebuild/ 的发布仍由 Gradle
-# 完成, CMake 只负责编译出各 target 并保证依赖顺序。
-# ==============================================================================
+option(ARTPI_ENABLE_DEXTER "Build Dexter (slicer) DEX manipulation library" OFF)
+if(ARTPI_ENABLE_DEXTER)
+    add_subdirectory(external/dexter)
+endif()
 add_subdirectory(src/agent)
 add_subdirectory(cli/injector)
 add_subdirectory(test)

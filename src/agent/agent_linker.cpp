@@ -11,6 +11,7 @@
 #include <iomanip>
 #include "xdl.h"
 #include "frida-gum.h"
+#include "agent_integrity.h"
 
 namespace artpi { namespace agent {
 
@@ -884,6 +885,8 @@ static JSValue JsLinkerDump(JSContext* ctx, JSValueConst /*this_val*/, int argc,
     return dt;
 }
 
+} // namespace
+
 static void PopulateLinkerObject(JSContext* ctx, JSValue obj) {
     JS_SetPropertyStr(ctx, obj, "main", JS_NewCFunction(ctx, JsLinkerMain, "main", 0));
     JS_SetPropertyStr(ctx, obj, "somain", JS_NewCFunction(ctx, JsLinkerMain, "somain", 0));
@@ -898,9 +901,10 @@ static void PopulateLinkerObject(JSContext* ctx, JSValue obj) {
     JS_SetPropertyStr(ctx, obj, "symtab", JS_NewCFunction(ctx, JsLinkerSymbols, "symtab", 1));
     JS_SetPropertyStr(ctx, obj, "load", JS_NewCFunction(ctx, JsLinkerLoad, "load", 1));
     JS_SetPropertyStr(ctx, obj, "dump", JS_NewCFunction(ctx, JsLinkerDump, "dump", 1));
+    JS_SetPropertyStr(ctx, obj, "verifyCodeIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "verifyCodeIntegrity", 1));
+    JS_SetPropertyStr(ctx, obj, "verifyIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "verifyIntegrity", 1));
+    JS_SetPropertyStr(ctx, obj, "checkIntegrity", JS_NewCFunction(ctx, JsVerifyCodeIntegrity, "checkIntegrity", 1));
 }
-
-} // namespace
 
 void RegisterLinkerApis(JSContext* ctx, JSValue global) {
     // 1. Linker (Uppercase L)

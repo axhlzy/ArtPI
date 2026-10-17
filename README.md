@@ -101,7 +101,7 @@ impl_glm/
 │   ├── injector/                # artpi-cli：ptrace 注入器 + 多 Payload 打包 + REPL 客户端
 │   ├── jadxcli.jar              # 反编译引擎（内嵌到 artpi-cli 中，运行时自动释放）
 │   └── artpi_repl.py            # Python 宿主端 REPL 客户端
-├── external/                    # xdl (linker 绕过) / xz-embedded / frida-gum / qbdi
+├── external/                    # xdl (linker 绕过) / xz-embedded / frida-gum / qbdi / magic_enum / dexter (slicer)
 ├── assets/                      # 静态展示资源
 │   └── screenshots/             # 实机交互运行效果截图
 └── prebuild/                    # 构建产物 (libartpi.so / libartpi_static.a / libartpi_agent.so / artpi-cli)
@@ -464,6 +464,14 @@ D();  // 同时卸载 Java / native / Unity 等全部 hook
 | `Memory.writeByteArray` | `(addr, data)` | 写入数据到内存（自动 `mprotect` RWX 绕过段只读） |
 | `Memory.readCString` | `(addr)` | 读取以 `\0` 结尾的 C 字符串 |
 | `Memory.readU32` / `writeU32` | `(addr[, val])` | 读写 32 位无符号整数 |
+| `Memory.crc32` / `crc32` | `(addr, len)` | 计算指定内存区域的标准 CRC-32 (IEEE 802.3) 校验和，返回无符号整型数值（如 `0x1a4d88ad`） |
+| `Memory.crc32c` / `crc32c` | `(addr, len)` | 计算 Castagnoli CRC-32C 校验和，返回无符号整型数值 |
+| `Memory.adler32` / `adler32` | `(addr, len)` | 计算 Adler-32 校验和（DEX Header 校验标准），返回无符号整型数值 |
+| `Memory.md5` / `md5` | `(addr, len)` | 计算内存区域的 MD5 哈希（返回 32 位小写十六进制字符串） |
+| `Memory.sha1` / `sha1` | `(addr, len)` | 计算内存区域的 SHA-1 哈希（DEX Header 签名标准，返回 40 位十六进制字符串） |
+| `Memory.sha256` / `sha256` | `(addr, len)` | 计算内存区域的 SHA-256 哈希（返回 64 位十六进制字符串） |
+| `Memory.hash` / `hashmem` | `(algo, addr, len)` | 通用哈希接口，支持双向参数顺序，`algo` 支持 `"crc32"`、`"crc32c"`、`"adler32"`、`"md5"`、`"sha1"`、`"sha256"` |
+| `Memory.verifyCodeIntegrity` | `(nameOrAddr)` | `Linker.verifyCodeIntegrity` 的别名（保留 `verifyIntegrity` 别名），一键校验内存模块代码段与磁盘镜像的一致性 |
 
 ---
 
@@ -701,6 +709,7 @@ HW.detachAll();
 | `Linker.linkMap` | `()` | 遍历并返回当前已加载模块的 `link_map` 链表数组（`{addr, name, phnum}`） |
 | `Linker.load` | `(libName)` | 借助 Linker 内核 `__loader_dlopen` 接口直接加载指定 SO 库，**彻底绕过 Android 7.0+ Linker Namespace 隔离限制** |
 | `Linker.dump` | `(nameOrAddr)` | 返回格式化后的完整 SO 详细信息文本（包含 base、size、phdr、dynamic、strtab、symtab、needed 依赖库、constructors 构造函数、destructors 析构函数） |
+| `Linker.verifyCodeIntegrity` / `linker.verifyCodeIntegrity` | `(nameOrAddr)` | **一键代码段完整性校验**（别名 `verifyIntegrity` / `checkIntegrity`）：比对已加载模块在内存中的可执行代码段（`PT_LOAD` / `PF_X`）与磁盘原始镜像的一致性，秒级定位 Inline Hook、ShadowHook、Frida Stalker、内存 Patch 篡改。自动精准支持直接从 APK 映射的原生库（`android:extractNativeLibs="false"`）。返回包含篡改页地址、文件偏移、内存/磁盘 CRC32、被修改字节数及最近符号名的结构化报告对象（终端打印自动触发排版展示） |
 
 #### 2. `soinfo` 对象属性说明
 
@@ -762,6 +771,41 @@ syms.forEach(s => {
 
 // 4. 绕过 Namespace 直接加载目标库
 let handle = linker.load("libmytest.so");
+```
+
+#### 4. 模块代码段完整性校验 (`Linker.verifyCodeIntegrity`)
+
+在 Android 逆向与加固分析中，经常需要检测加固厂商或分析工具（如 Frida、Inline Hook、ShadowHook）是否对 SO 库实施了内存代码篡改。`Linker.verifyCodeIntegrity`（别名 `verifyIntegrity` / `checkIntegrity`，亦可通过 `Memory.verifyCodeIntegrity` 调用）提供了一键比对内存可执行代码段（`PT_LOAD` / `PF_X`）与磁盘原始镜像的能力：
+
+- **透明兼容 Direct-APK 映射**：Android 7.0+ 默认将未压缩的 SO 库直接从 `/data/app/.../base.apk` 内存映射（`extractNativeLibs="false"`）。该 API 通过 `dl_iterate_phdr` 精准获取目标库专有的可执行段及文件内相对偏移，避免在 APK 共享映射中串入同 APK 其他库的代码。
+- **高精度篡改定位**：按动态系统页大小（支持 4KB / 16KB 页表）逐页比对内存与磁盘数据，定位篡改的内存虚拟地址、ELF 磁盘文件偏移、差异字节数，并通过 xDL 符号解析直接指出被修改函数符号与相对偏移（如 `custom_dt_init (+0x230b0)`）。
+- **完全双向实时验证**：发生修改后立即报告 `MISMATCH DETECTED`；内存恢复后立即报告 `Clean`。若读取失败或扫描不完整，严格置 `isClean: false`。
+
+```javascript
+// 1. 校验目标 SO 库完整性
+let rep = linker.verifyCodeIntegrity("liboattest.so");
+console.log(rep.toString());
+
+// 未被修改时输出：
+// [Integrity] Module: liboattest.so (Base: 0x7b6465d000)
+//   File path   : /data/app/.../base.apk
+//   Checked     : 79 executable page(s) (316 KB)
+//   Status      : Clean (All pages match disk image)
+
+// 发生代码篡改（如 Inline Hook 写入 NOP）时输出：
+// [Integrity] Module: liboattest.so (Base: 0x7b6465d000)
+//   File path   : /data/app/.../base.apk
+//   Checked     : 79 executable page(s) (316 KB)
+//   Status      : MISMATCH DETECTED (1 modified page(s))
+//   ----------------------------------------------------------------------
+//   [!] Page @ 0x7b64680000 (Offset: +0x43b000, 4 byte(s) altered):
+//       Disk CRC32 : 0x2a652d26 | Memory CRC32: 0x9d2d1f21
+//       Symbols    : custom_dt_init (+0x230b0)
+//   ----------------------------------------------------------------------
+
+// 2. 亦支持校验系统运行时库（如 libc、libart 等）
+console.log(linker.verifyIntegrity("libc.so"));
+console.log(linker.verifyIntegrity("libart.so"));
 ```
 
 ---
@@ -926,6 +970,47 @@ qbdi.trace({
 
 ---
 
+### 6.11 `Memory.*` — 内存哈希计算与完整性校验 (`HashSuite`)
+
+ArtPI 内置轻量高性能、零外部依赖的内存哈希计算套件，便于逆向分析中配合主动扫描、反反篡改与内存快照指纹对比：
+
+#### 1. 核心 API
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `Memory.crc32` / `crc32` | `(addr, len)` | 计算内存数据的标准 CRC-32 (IEEE 802.3)，返回无符号整型数值 |
+| `Memory.crc32c` / `crc32c` | `(addr, len)` | 计算 Castagnoli CRC-32C，返回无符号整型数值 |
+| `Memory.adler32` / `adler32` | `(addr, len)` | 计算 Adler-32 校验和，返回无符号整型数值 |
+| `Memory.md5` / `md5` | `(addr, len)` | 计算 MD5 哈希，返回 32 位小写十六进制字符串 |
+| `Memory.sha1` / `sha1` | `(addr, len)` | 计算 SHA-1 哈希，返回 40 位小写十六进制字符串 |
+| `Memory.sha256` / `sha256` | `(addr, len)` | 计算 SHA-256 哈希，返回 64 位小写十六进制字符串 |
+| `Memory.hash` / `hashmem` | `(algo, addr, len)` | 通用哈希入口，`algo` 支持 `"crc32"`、`"crc32c"`、`"adler32"`、`"md5"`、`"sha1"`、`"sha256"` |
+| `Memory.verifyCodeIntegrity` | `(nameOrAddr)` | `Linker.verifyCodeIntegrity` 的别名（亦保留 `verifyIntegrity` 别名） |
+
+> **安全与健壮性保障**：
+> - 严格防御性校验：限制 `addr >= 0x1000`（防空指针引发崩溃）且单次计算上限为 64 MB（`len <= 67108864`），避免传入过大长度导致 Agent 线程假死。
+> - 预检可读性：调用前通过内核探针校验指定范围内存可读性，不可读时抛出清晰异常。
+> - 多线程安全：CRC 查找表使用编译期 `constexpr` 构建，彻底避免运行时多线程数据竞争。
+
+#### 2. 示例代码
+
+```javascript
+let base = linker.find("liboattest.so").base;
+
+// 计算目标 SO 头部前 4096 字节的 CRC-32 与 SHA-256
+let crc = Memory.crc32(base, 4096);
+console.log("Header CRC32: 0x" + crc.toString(16));
+
+let sha = Memory.sha256(base, 4096);
+console.log("Header SHA256: " + sha);
+
+// 校验代码完整性
+let rep = Memory.verifyCodeIntegrity("liboattest.so");
+console.log(rep.toString());
+```
+
+---
+
 ## 7. 依赖与致谢
 
 - [Pine](https://github.com/canyie/pine) —— Java 方法 Hook 底座（ART 跳板 / ArtMethod 劫持）
@@ -936,4 +1021,6 @@ qbdi.trace({
 - [QuickJS](https://bellard.org/quickjs/) —— 嵌入式轻量 JavaScript 引擎
 - [xDL](https://github.com/hexhacking/xDL) —— Android 7.0+ linker namespace 绕过
 - [UnityResolve.hpp](https://github.com/issuimo/UnityResolve.hpp) —— Unity IL2CPP 元数据解析与调用（MIT，vendored 于 `external/unityresolve`）
+- [magic_enum](https://github.com/Neargye/magic_enum) —— Modern C++ Compile-time Enum Reflection（MIT，vendored 于 `external/magic_enum`）
+- [Dexter (slicer)](https://android.googlesource.com/platform/tools/dexter) —— DEX 字节码操作与重写引擎（Apache-2.0，vendored 于 `external/dexter`）
 - [xz-embedded](https://github.com/torvalds/linux/tree/master/lib/xz) —— LZMA 解压缩
