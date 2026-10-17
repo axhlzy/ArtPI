@@ -1,5 +1,6 @@
 #include "repl_client.h"
 #include "../../engine/mpack/mpack.h"
+#include "levenshtein.h"
 
 #include <iostream>
 #include <thread>
@@ -211,6 +212,12 @@ const std::vector<std::string> kCompletions = {
     "Memory.readCString(",
     "Memory.readU32(",
     "Memory.writeU32(",
+    "Memory.scan(",
+    "Memory.patch(",
+    "Memory.restoreAll()",
+    "Memory.maps(",
+    "Memory.findNative(",
+    "Memory.protect(",
 
     "UI.",
     "UI.dump(",
@@ -373,6 +380,12 @@ const std::vector<std::string> kCompletions = {
     "readstring(",
     "readu32(",
     "writeu32(",
+    "scanmem(",
+    "patchmem(",
+    "restoreall()",
+    "maps(",
+    "invoke(",
+    "callnative(",
 
     "console.log(",
     "console.warn(",
@@ -830,8 +843,27 @@ static std::vector<std::string> GetCandidatesForToken(const std::string& token) 
         }
     }
 
+    if (results.empty() && token.size() >= 3) {
+        std::vector<std::pair<std::string, double>> ranked;
+        for (const auto& c : kCompletions) {
+            double sim = artpi::utils::LevenshteinSimilarity(token, c);
+            if (sim >= 0.5) {
+                ranked.push_back({ c, sim });
+            }
+        }
+        if (!ranked.empty()) {
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                return a.second > b.second;
+            });
+            for (size_t i = 0; i < std::min<size_t>(ranked.size(), 5); ++i) {
+                results.push_back(ranked[i].first);
+            }
+        }
+    }
+
     return results;
 }
+
 
 static std::unordered_map<std::string, std::vector<std::string>> g_exprMembersCache;
 
@@ -869,6 +901,8 @@ struct CompletionContext {
     std::string prefix;
     std::string expr;
     bool isMemberAccess = false;
+    bool isCallArg = false;
+    std::string callFn;
 };
 
 static CompletionContext FindCompletionContext(const std::string& line, size_t pos) {
@@ -945,6 +979,54 @@ static CompletionContext FindCompletionContext(const std::string& line, size_t p
         }
     }
 
+    // Check if pos is inside a string argument of a function call:
+    // e.g. expr.class("Ball... or expr.method(".ct... or expr.assembly("...
+    size_t quoteScan = pos;
+    while (quoteScan > 0) {
+        char c = line[quoteScan - 1];
+        if (isalnum(c) || c == '_' || c == '$' || c == '.' || c == '-' || c == '<' || c == '>' || c == '`' || c == '~') {
+            quoteScan--;
+        } else {
+            break;
+        }
+    }
+    std::string argPrefix = line.substr(quoteScan, pos - quoteScan);
+    if (quoteScan > 0 && (line[quoteScan - 1] == '"' || line[quoteScan - 1] == '\'')) {
+        size_t openQuote = quoteScan - 1;
+        if (openQuote > 0 && line[openQuote - 1] == '(') {
+            size_t openParen = openQuote - 1;
+            size_t fnStart = openParen;
+            while (fnStart > 0 && (isalnum(line[fnStart - 1]) || line[fnStart - 1] == '_')) {
+                fnStart--;
+            }
+            std::string fnName = line.substr(fnStart, openParen - fnStart);
+            if (fnStart > 0 && line[fnStart - 1] == '.') {
+                size_t dotPos = fnStart - 1;
+                size_t p = dotPos;
+                int paren = 0, bracket = 0;
+                while (p > 0) {
+                    char c = line[p - 1];
+                    if (c == ')') { paren++; p--; }
+                    else if (c == '(') { if (paren == 0) break; paren--; p--; }
+                    else if (c == ']') { bracket++; p--; }
+                    else if (c == '[') { if (bracket == 0) break; bracket--; p--; }
+                    else if (paren > 0 || bracket > 0) { p--; }
+                    else if (isalnum(c) || c == '_' || c == '$' || c == '.' || c == '"' || c == '\'') { p--; }
+                    else break;
+                }
+                std::string expr = line.substr(p, dotPos - p);
+                if (!expr.empty()) {
+                    ctx.tokenStart = quoteScan;
+                    ctx.prefix = argPrefix;
+                    ctx.expr = expr;
+                    ctx.callFn = fnName;
+                    ctx.isCallArg = true;
+                    return ctx;
+                }
+            }
+        }
+    }
+
     // Default: normal word completion
     size_t wordStart = pos;
     while (wordStart > 0) {
@@ -962,8 +1044,42 @@ static CompletionContext FindCompletionContext(const std::string& line, size_t p
 }
 
 static std::vector<std::string> GetCandidatesForContext(const CompletionContext& ctx, bool allowNetwork = true) {
+    if (ctx.isCallArg) {
+        std::vector<std::string> candidates;
+        std::vector<std::pair<std::string, double>> ranked;
+        if (!ctx.expr.empty() && allowNetwork && g_agentFd >= 0) {
+            auto members = FetchExprMembers(ctx.expr);
+            std::string pattern = ctx.callFn + "(\"";
+            for (const auto& m : members) {
+                if (m.rfind(pattern, 0) == 0) {
+                    size_t q = m.find('"', pattern.size());
+                    if (q != std::string::npos) {
+                        std::string rawName = m.substr(pattern.size(), q - pattern.size());
+                        std::string completion = rawName + "\")";
+                        if (ctx.prefix.empty() || StartsWithIgnoreCase(rawName, ctx.prefix)) {
+                            candidates.push_back(completion);
+                        } else {
+                            double sim = artpi::utils::LevenshteinSimilarity(ctx.prefix, rawName);
+                            if (sim >= 0.5) {
+                                ranked.push_back({ completion, sim });
+                            }
+                        }
+                    }
+                }
+            }
+            if (candidates.empty() && !ranked.empty()) {
+                std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                    return a.second > b.second;
+                });
+                for (const auto& r : ranked) candidates.push_back(r.first);
+            }
+        }
+        return candidates;
+    }
+
     if (ctx.isMemberAccess) {
         std::vector<std::string> candidates;
+        std::vector<std::pair<std::string, double>> ranked;
         if (!ctx.expr.empty()) {
             auto it = g_exprMembersCache.find(ctx.expr);
             std::vector<std::string> members;
@@ -975,13 +1091,25 @@ static std::vector<std::string> GetCandidatesForContext(const CompletionContext&
             for (const auto& m : members) {
                 if (ctx.prefix.empty() || StartsWithIgnoreCase(m, ctx.prefix)) {
                     candidates.push_back(m);
+                } else {
+                    double sim = artpi::utils::LevenshteinSimilarity(ctx.prefix, m);
+                    if (sim >= 0.5) {
+                        ranked.push_back({ m, sim });
+                    }
                 }
+            }
+            if (candidates.empty() && !ranked.empty()) {
+                std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                    return a.second > b.second;
+                });
+                for (const auto& r : ranked) candidates.push_back(r.first);
             }
         }
         return candidates;
     }
     return GetCandidatesForToken(ctx.prefix);
 }
+
 
 struct RawTermGuard {
     bool active_ = false;

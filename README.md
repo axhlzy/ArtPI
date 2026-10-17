@@ -33,9 +33,10 @@
 | **动态对象反射链** | `artobject(addr)` 持久化提升全局引用，支持链式属性读写、方法调用与 REPL Tab 实时补全 |
 | **界面自动化 (`UI.*`)** | `UI.dump` 打印 View 层级树，`UI.find` 附带祖先链与最近点击目标，`UI.click` / `swipe` / `setText` 免 ADB 直接操作界面 |
 | **ptrace 链式内嵌注入** | 单个 `artpi-cli` 二进制**联合内嵌 Agent SO 与 JADX CLI Jar**，自动解压部署，支持 `-P <pid>` / `-k <pkg>` / `-f <file>` |
-| **硬件断点/观察点** | 现代统一 API（`HW.attach` 代码断点 / `HW.watch` 数据断点 / `HW.watchDlopen` 动态库监控），ARM64 物理调试寄存器驱动，零内存修改、无检测特征、跨线程布控与硬件单步连续触发 |
-| **Unity IL2CPP 分析** | 基于 UnityResolve 的 `dynamic.unity`：程序集/类/字段/方法遍历与调用、通配符 `findclass` / `findmethods`、MethodInfo 断点与 Hook、GameObject / Button 监听器解析、`libil2cpp.so` 导出符号直达 |
-| **内置 QuickJS REPL** | 注入后直接进入交互终端，支持可注册代理域 `dynamic.java` / `dynamic.native` / `dynamic.unity`（`objc` 按运行时条件挂载），免重编动态分析 |
+| **Unity IL2CPP 分析** | 基于 UnityResolve 的 `dynamic.unity`：程序集/类/字段/方法遍历与调用、通配符 `findclass` / `findmethods`、MethodInfo 断点与 Hook、GameObject / Button 监听器解析、`libil2cpp.so` 导出符号直达，支持 Levenshtein 模糊容错与链式代码补全 |
+| **内存特征码扫描与 Patch** | 内嵌 KittyMemory 原生底座：IDA 风格十六进制模式通配扫描 (`Memory.scan`)、可逆内存补丁 (`Memory.patch` / `.restore()`)、`/proc/self/maps` 内存映射分析 (`Memory.maps`) 与 JNI `RegisterNatives` 动态注册表定位 (`Memory.findNative`) |
+| **NativeBox 变参原生调用** | `dynamic.native.<mod>.<sym>` 与 `dynamic.unity.il2cpp.<sym>` 返回的 `NativeBox` 具备原生变参调用能力（支持 `.invoke(...args)` 或直接函数调用 `fn(...args)`），AAPCS64 自动封包字符串、数值与指针 |
+| **内置 QuickJS REPL** | 注入后直接进入交互终端，支持可注册代理域 `dynamic.java` / `dynamic.native` / `dynamic.unity`（`objc` 按运行时条件挂载），REPL 具备基于 Levenshtein 距离的链式语法感知与模糊纠错补全，免重编动态分析 |
 
 ---
 
@@ -393,14 +394,19 @@ dynamic.unity.mi(run.methodInfo);      // 层级信息
 dynamic.unity.B_Button();              // 点击时输出监听方法 MethodInfo
 dynamic.unity.buttons();
 
-// libil2cpp.so 导出符号直达；Tab 可补全全部导出
-dynamic.unity.il2cpp.il2cpp_string_new;
-dynamic.unity.il2cpp.;
+// 链式精准定位与参数/字段直达；REPL Tab 感知双引号内字符串补全与 Levenshtein 模糊纠错
+let method = dynamic.unity.assembly("Assembly-CSharp.dll").class("BallClickLayer").method(".ctor");
+console.log(method.toString()); // namespace, assembly, class, method, rva, return, parameters
+
+// libil2cpp.so 导出符号直达；NativeBox 支持原生变参调用 (.invoke(...args) 或直接作为函数调用)
+let strFn = dynamic.unity.il2cpp.il2cpp_string_new;
+let myStr = strFn.invoke("Hello from ArtPI!"); // 或直接 strFn("Hello from ArtPI!")
+console.log("il2cpp string ptr:", myStr);
 
 D();  // 同时卸载 Java / native / Unity 等全部 hook
 ```
 
-> `m`、`findclass`、`findmethods` 仅挂载在 `dynamic.unity` 下，不暴露为全局函数，避免与 Java 侧同名 API 冲突。
+> `m`、`findclass`、`findmethods` 挂载在 `dynamic.unity` 下，不暴露为全局函数，避免与 Java 侧同名 API 冲突。
 
 ---
 
@@ -408,7 +414,7 @@ D();  // 同时卸载 Java / native / Unity 等全部 hook
 
 | API | 签名 | 返回值 | 说明 |
 |---|---|---|---|
-| `Java.findClass` | `(pattern[, limit])` | `BigInt` / `string` / `null` | 精确类名返回 `jclass` 指针；含 `* ?` 通配符时返回匹配列表（统一 `0xxxx -> name` 格式） |
+| `Java.findClass` | `(pattern[, limit])` | `BigInt` / `string` / `null` | 精确类名返回 `jclass` 指针；含 `* ?` 通配符时返回匹配列表（统一 `0xxxx -> name` 格式）；类名错误时自动基于 Levenshtein 算法提示相似候选类 |
 | `Java.findMethod` | `(clsOrName, name[, sig])` | `BigInt` / `null` | 查找 `ArtMethod*` 指针；自动沿着类继承链向上遍历父类 |
 | `Java.listMethods` | `(clsOrName)` | `string` | 格式化列出当前类声明的所有方法及指针 |
 | `Java.findMethods` | `(classOrPattern[, mPattern])`| `string` | 单类或跨类通配符查找方法 |
@@ -422,11 +428,11 @@ D();  // 同时卸载 Java / native / Unity 等全部 hook
 | `Java.methodInfo` | `(artMethod)` | `object` | 提取方法的修饰符、类名、签名、编译状态及 nativeEntry |
 | `Java.methodBox` | `(artMethod)` | `MethodBox` | 将裸 `ArtMethod*` 包装为 `dynamic.java` 同款 MethodBox；全局别名 `jmethodBox` / `jmethodbox` / `methodBox` / `methodbox` |
 
-> **全局别名**：`findclass`、`findmethod`、`listmethods`、`dumpsmali`、`dumpcode`、`decompile`、`disassembly`、`choose`、`jhook`、`unhook`、`unhookall`、`jmethodbox` 均可直接在全局作用域调用。
+> **全局别名**：`findclass`、`findmethod`、`listmethods`、`dumpsmali`、`dumpcode`、`decompile`组件 `disassembly`、`choose`、`jhook`、`unhook`、`unhookall`、`jmethodbox` 均可直接在全局作用域调用。
 
 ---
 
-### 6.3 `Native.*` 与 `DebugSymbol.*` — 原生二进制与符号域
+### 6.3 `Native.*` 与 `DebugSymbol.*` — 原生二进制、变参调用与符号域
 
 | API | 签名 | 说明 |
 |---|---|---|
@@ -435,15 +441,24 @@ D();  // 同时卸载 Java / native / Unity 等全部 hook
 | `Native.findSymbolsMatching` | `(module, pattern)` | 读取模块 ELF `.dynsym` 极速通配符过滤符号 |
 | `Native.dumpNative` | `(addr[, maxInsn])` | ARM64 原生反汇编（集成符号解析与行内注解） |
 | `Native.hook` | `(addrOrSym, cb)` | Frida-Gum Inline Hook（别名 `nhook`） |
+| `Native.invoke` / `callnative` | `(target, ...args)` | **原生函数通用动态变参调用**（AAPCS64 自动参数打包与栈对齐，支持字符串、数值、BigInt、ArrayBuffer） |
 | `DebugSymbol.findSymbolByName` | `(pattern[, lib])` | 通配符跨模块搜索符号，支持 C++ Name Demangle 双向匹配 |
 | `DebugSymbol.fromAddress` | `(address)` | 内存地址逆向解析为模块名与符号名 |
 
+> **`NativeBox` 变参调用能力**：通过 `dynamic.native.<mod>.<sym>` 或 `dynamic.unity.il2cpp.<sym>` 获得的符号对象即为 `NativeBox`。支持直接作为函数执行 `fn(...args)` 或调用 `.invoke(...args)` / `.call(...args)`。
+
 ---
 
-### 6.4 `Memory.*` — 内存安全读写
+### 6.4 `Memory.*` — 内存特征码扫描、可逆 Patch 与安全读写 (基于 KittyMemory)
 
 | API | 签名 | 说明 |
 |---|---|---|
+| `Memory.scan` / `scanmem` | `(target[, size], pattern[, max])` | **IDA 风格特征码扫描**（支持 `??` 通配符，如 `"48 89 ?? ?? 55"`）；`target` 可为模块名（如 `"libil2cpp.so"`）或起始内存地址 |
+| `Memory.patch` / `patchmem` | `(addrOrModule[, rva], hexString)` | **原子可逆内存补丁**；支持模块名 + RVA 偏移或绝对地址，写入时自动维护可写保护并刷新指令缓存，返回 Patch 对象（含 `.origBytes`、`.patchBytes`、`.currBytes`、`.modify()`、`.restore()`） |
+| `Memory.restoreAll` / `restoreall`| `()` | 一键还原所有通过 `Memory.patch` 应用的内存补丁 |
+| `Memory.maps` / `maps` | `([filter])` | 格式化查看或过滤 `/proc/self/maps` 内存映射（打印起止地址、权限、文件路径） |
+| `Memory.findNative` / `findnative`| `(funcName[, libName])` | 快速扫描并定位 JNI `JNINativeMethod` 动态注册表中的目标函数地址 |
+| `Memory.protect` | `(addr, len, prot)` | 封装 `mprotect`，以页面对齐安全变更内存保护属性（0: NONE, 1: R, 2: W, 4: X 等组合） |
 | `Memory.hexdump` | `(addr[, len])` | 16 字节十六进制 + ASCII 内存 dump（内置 `process_vm_readv` 保护） |
 | `Memory.readByteArray` | `(addr, len)` | 读取原始内存为 `ArrayBuffer` |
 | `Memory.writeByteArray` | `(addr, data)` | 写入数据到内存（自动 `mprotect` RWX 绕过段只读） |

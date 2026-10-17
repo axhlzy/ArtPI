@@ -39,6 +39,12 @@ set(AGENT_SOURCES
     agent_jni.cpp
     jni_trampoline_arm64.S
     agent_js.cpp
+    ../../external/KittyMemory/KittyArm64.cpp
+    ../../external/KittyMemory/KittyMemory.cpp
+    ../../external/KittyMemory/KittyScanner.cpp
+    ../../external/KittyMemory/KittyUtils.cpp
+    ../../external/KittyMemory/MemoryBackup.cpp
+    ../../external/KittyMemory/MemoryPatch.cpp
     ${QUICKJS_SOURCES}
 )
 
@@ -53,6 +59,8 @@ target_include_directories(artpi_agent PRIVATE
     ../../external/xdl/include
     ../../external/qbdi/include
     ../../external/unityresolve
+    ../../external/KittyMemory
+    ../../external/levenshtein
     ../../engine/native
     ../../engine/native/qbdi
 )

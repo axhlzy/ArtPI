@@ -32,6 +32,7 @@ target_link_libraries(artpi-cli PRIVATE dl)
 target_include_directories(artpi-cli PRIVATE
     .
     ../../engine/mpack
+    ../../external/levenshtein
     ${XZ_EMBEDDED_DIR}/userspace
     ${XZ_EMBEDDED_DIR}/linux/include/linux
 )

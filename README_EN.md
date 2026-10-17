@@ -33,9 +33,10 @@ Target Platform: **Android 7.0 ~ 15 (arm64-v8a)**, root privileges required for 
 | **Dynamic Reflective Proxies** | `artobject(addr)` wraps live heap instances into global references with chainable member calls, property access, and interactive REPL Tab completions |
 | **UI Automation (`UI.*`)** | `UI.dump` prints the view hierarchy, `UI.find` returns the ancestor chain and nearest click target, and `UI.click` / `swipe` / `setText` drive the UI directly without ADB |
 | **Self-Contained Multi-Payload Packing** | A single `artpi-cli` binary encapsulates the injector ELF, XZ-compressed `libartpi_agent.so`, and deflated `jadxcli.jar` (~10MB total), auto-extracting upon launch |
-| **Hardware Breakpoint / Watchpoint** | Modern unified API (`HW.attach` code breakpoint / `HW.watch` data watchpoint / `HW.watchDlopen` library monitoring), powered by ARM64 debug registers with zero code patching, zero stealth footprint, cross-thread arming, and seamless step-over state machine |
-| **Unity IL2CPP Analysis** | `dynamic.unity` powered by UnityResolve: assembly/class/field/method traversal and invocation, wildcard `findclass` / `findmethods`, MethodInfo breakpoints and hooks, GameObject / Button listener inspection, and direct `libil2cpp.so` export access |
-| **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with registrable proxy domains (`dynamic.java.*`, `dynamic.native.*`, `dynamic.unity.*`; `objc` mounted by runtime), eliminating script compilation overhead |
+| **Unity IL2CPP Analysis** | `dynamic.unity` powered by UnityResolve: assembly/class/field/method traversal and invocation, wildcard `findclass` / `findmethods`, MethodInfo breakpoints and hooks, GameObject / Button listener inspection, direct `libil2cpp.so` export access, and Levenshtein fuzzy error tolerance |
+| **Memory Scanning & Patching** | Embedded KittyMemory core: IDA-style hex pattern scanning (`Memory.scan`), atomic reversible memory patching (`Memory.patch` / `.restore()`), `/proc/self/maps` inspection (`Memory.maps`), and JNI `RegisterNatives` dynamic symbol scanning (`Memory.findNative`) |
+| **NativeBox Variadic Invocation**| `NativeBox` returned by `dynamic.native.<mod>.<sym>` and `dynamic.unity.il2cpp.<sym>` supports variadic native calls via `.invoke(...args)` or direct callable proxy `fn(...args)` with automatic AAPCS64 packaging |
+| **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with registrable proxy domains (`dynamic.java.*`, `dynamic.native.*`, `dynamic.unity.*`; `objc` mounted by runtime), enhanced with Levenshtein-based chained syntax and fuzzy auto-completion |
 
 ---
 
@@ -365,14 +366,19 @@ dynamic.unity.mi(run.methodInfo);      // hierarchy
 dynamic.unity.B_Button();              // print listener MethodInfo on click
 dynamic.unity.buttons();
 
-// Direct libil2cpp.so exports; Tab completes all exported symbols
-dynamic.unity.il2cpp.il2cpp_string_new;
-dynamic.unity.il2cpp.;
+// Chained discovery with parameter/field inspection; REPL Tab completes quoted strings with Levenshtein fuzzy matching
+let method = dynamic.unity.assembly("Assembly-CSharp.dll").class("BallClickLayer").method(".ctor");
+console.log(method.toString()); // namespace, assembly, class, method, rva, return, parameters
+
+// Direct libil2cpp.so exports; NativeBox supports variadic native invocation (.invoke(...args) or direct call)
+let strFn = dynamic.unity.il2cpp.il2cpp_string_new;
+let myStr = strFn.invoke("Hello from ArtPI!"); // or directly strFn("Hello from ArtPI!")
+console.log("il2cpp string ptr:", myStr);
 
 D();  // detaches Java / native / Unity hooks together
 ```
 
-> `m`, `findclass`, and `findmethods` are mounted only under `dynamic.unity` (not global) to avoid collisions with the Java-side APIs.
+> `m`, `findclass`, and `findmethods` are mounted under `dynamic.unity` (not global) to avoid collisions with the Java-side APIs.
 
 ---
 
@@ -380,7 +386,7 @@ D();  // detaches Java / native / Unity hooks together
 
 | API | Signature | Return Value | Description |
 |---|---|---|---|
-| `Java.findClass` | `(pattern[, limit])` | `BigInt` / `string` / `null` | Returns `jclass` pointer for exact names; returns match list (`0xxxx -> name`) for wildcards (`*`, `?`) |
+| `Java.findClass` | `(pattern[, limit])` | `BigInt` / `string` / `null` | Returns `jclass` pointer for exact names; returns match list (`0xxxx -> name`) for wildcards (`*`, `?`); suggests similar classes via Levenshtein on typo |
 | `Java.findMethod` | `(clsOrName, name[, sig])` | `BigInt` / `null` | Finds `ArtMethod*` pointer; traverses inheritance hierarchy upwards |
 | `Java.listMethods` | `(clsOrName)` | `string` | Lists declared methods, modifiers, signatures, and ArtMethod pointers |
 | `Java.findMethods` | `(classOrPattern[, mPattern])`| `string` | Searches methods matching pattern within a class or across classes |
@@ -398,7 +404,7 @@ D();  // detaches Java / native / Unity hooks together
 
 ---
 
-### 6.3 `Native.*` & `DebugSymbol.*` — Native Binary & Symbols
+### 6.3 `Native.*` & `DebugSymbol.*` — Native Binary, Variadic Calls & Symbols
 
 | API | Signature | Description |
 |---|---|---|
@@ -407,15 +413,24 @@ D();  // detaches Java / native / Unity hooks together
 | `Native.findSymbolsMatching` | `(module, pattern)` | Fast pattern matching against module ELF `.dynsym` |
 | `Native.dumpNative` | `(addr[, maxInsn])` | ARM64 disassembly with symbol resolution and inline annotations |
 | `Native.hook` | `(addrOrSym, cb)` | Frida-Gum Inline Hook (alias `nhook`) |
+| `Native.invoke` / `callnative` | `(target, ...args)` | **Universal variadic native invocation** (AAPCS64 automatic parameter packaging and stack alignment for strings, numbers, BigInts, ArrayBuffers) |
 | `DebugSymbol.findSymbolByName` | `(pattern[, lib])` | Cross-module symbol search with C++ name demangling |
 | `DebugSymbol.fromAddress` | `(address)` | Resolves memory address back to module name and symbol |
 
+> **`NativeBox` Variadic Invocation**: Functions returned by `dynamic.native.<mod>.<sym>` or `dynamic.unity.il2cpp.<sym>` are callable objects (`NativeBox`). You can invoke them directly as functions `fn(...args)` or via `.invoke(...args)` / `.call(...args)`.
+
 ---
 
-### 6.4 `Memory.*` — Safe Memory Access
+### 6.4 `Memory.*` — Pattern Scanning, Reversible Patching & Safe Access (KittyMemory)
 
 | API | Signature | Description |
 |---|---|---|
+| `Memory.scan` / `scanmem` | `(target[, size], pattern[, max])` | **IDA-style hex pattern scanning** with `??` wildcards (e.g. `"48 89 ?? ?? 55"`); `target` can be module name (`"libil2cpp.so"`) or start address |
+| `Memory.patch` / `patchmem` | `(addrOrModule[, rva], hexString)` | **Atomic reversible memory patch**; supports module + RVA or absolute address, handles page protections, flushes cache, and returns patch object (`.origBytes`, `.patchBytes`, `.currBytes`, `.modify()`, `.restore()`) |
+| `Memory.restoreAll` / `restoreall`| `()` | Restores all memory patches applied via `Memory.patch` |
+| `Memory.maps` / `maps` | `([filter])` | Formats and filters `/proc/self/maps` memory regions |
+| `Memory.findNative` / `findnative`| `(funcName[, libName])` | Fast scanner locating functions registered via JNI `RegisterNatives` (`JNINativeMethod`) |
+| `Memory.protect` | `(addr, len, prot)` | Wraps `mprotect` with safe page alignment (0: NONE, 1: R, 2: W, 4: X, etc.) |
 | `Memory.hexdump` | `(addr[, len])` | 16-byte hex + ASCII memory dump with `process_vm_readv` protection |
 | `Memory.readByteArray` | `(addr, len)` | Reads raw memory into an `ArrayBuffer` |
 | `Memory.writeByteArray` | `(addr, data)` | Writes bytes to memory (automatically calls `mprotect` RWX) |

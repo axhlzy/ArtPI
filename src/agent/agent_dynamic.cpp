@@ -631,6 +631,12 @@ const char* kDynamicBootstrapJs = R"JS(
             symbol: symName,
             address: addr,
             ptr: addr,
+            invoke: function(...args) {
+                return Native.invoke(addr, ...args);
+            },
+            call: function(...args) {
+                return Native.invoke(addr, ...args);
+            },
             hook: function(cb) {
                 return nhook(addr, cb);
             },
@@ -660,7 +666,17 @@ const char* kDynamicBootstrapJs = R"JS(
                 return `[NativeBox ${modName}!${symName} @ ${hex}]`;
             }
         };
-        return box;
+        return new Proxy(function(...args) {
+            return Native.invoke(addr, ...args);
+        }, {
+            get(target, prop) {
+                if (prop in box) return box[prop];
+                return target[prop];
+            },
+            apply(target, thisArg, args) {
+                return Native.invoke(addr, ...args);
+            }
+        });
     }
 
     function makeModuleProxy(modName) {

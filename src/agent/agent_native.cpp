@@ -1314,15 +1314,78 @@ static JSValue JsProcessResume(JSContext* ctx, JSValueConst, int, JSValueConst*)
     return JS_NewString(ctx, "[i] Process is not paused");
 }
 
+extern "C" uint64_t artpi_call_native_variadic(void* fn, size_t argc, const uint64_t* argv);
+
+static JSValue JsNativeInvoke(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Usage: invoke(address, ...args)");
+    int64_t addr = ParsePtr(ctx, argv[0]);
+    if (!addr || addr < 0x1000) return JS_ThrowTypeError(ctx, "invoke(): invalid native function address");
+
+    size_t fnArgc = static_cast<size_t>(argc - 1);
+    std::vector<uint64_t> rawArgs(fnArgc, 0);
+    std::vector<std::string> strKeepAlive;
+
+    for (size_t i = 0; i < fnArgc; ++i) {
+        JSValueConst val = argv[i + 1];
+        if (JS_IsString(val)) {
+            const char* s = JS_ToCString(ctx, val);
+            strKeepAlive.emplace_back(s ? s : "");
+            if (s) JS_FreeCString(ctx, s);
+            rawArgs[i] = reinterpret_cast<uint64_t>(strKeepAlive.back().c_str());
+        } else if (JS_IsBigInt(ctx, val)) {
+            int64_t v = 0;
+            JS_ToBigInt64(ctx, &v, val);
+            rawArgs[i] = static_cast<uint64_t>(v);
+        } else if (JS_IsNumber(val)) {
+            int64_t v = 0;
+            JS_ToInt64(ctx, &v, val);
+            rawArgs[i] = static_cast<uint64_t>(v);
+        } else if (JS_IsBool(val)) {
+            rawArgs[i] = JS_ToBool(ctx, val) ? 1 : 0;
+        } else if (JS_IsNull(val) || JS_IsUndefined(val)) {
+            rawArgs[i] = 0;
+        } else if (JS_IsObject(val)) {
+            size_t abLen = 0;
+            uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, val);
+            if (abPtr) {
+                rawArgs[i] = reinterpret_cast<uint64_t>(abPtr);
+            } else {
+                int64_t ptr = ParsePtr(ctx, val);
+                if (!ptr) {
+                    JSValue pVal = JS_GetPropertyStr(ctx, val, "__ptr");
+                    if (!JS_IsUndefined(pVal)) { ptr = ParsePtr(ctx, pVal); }
+                    JS_FreeValue(ctx, pVal);
+                }
+                if (!ptr) {
+                    JSValue pVal = JS_GetPropertyStr(ctx, val, "ptr");
+                    if (!JS_IsUndefined(pVal)) { ptr = ParsePtr(ctx, pVal); }
+                    JS_FreeValue(ctx, pVal);
+                }
+                if (!ptr) {
+                    JSValue pVal = JS_GetPropertyStr(ctx, val, "address");
+                    if (!JS_IsUndefined(pVal)) { ptr = ParsePtr(ctx, pVal); }
+                    JS_FreeValue(ctx, pVal);
+                }
+                rawArgs[i] = static_cast<uint64_t>(ptr);
+            }
+        }
+    }
+
+    uint64_t ret = artpi_call_native_variadic(reinterpret_cast<void*>(addr), fnArgc, rawArgs.data());
+    return NewBigIntOrInt(ctx, ret);
+}
 
 void RegisterNativeApis(JSContext* ctx, JSValue global, JSValue native) {
     // Native namespace
+    JS_SetPropertyStr(ctx, native, "invoke", JS_NewCFunction(ctx, JsNativeInvoke, "invoke", 1));
+    JS_SetPropertyStr(ctx, native, "call", JS_NewCFunction(ctx, JsNativeInvoke, "call", 1));
     JS_SetPropertyStr(ctx, native, "findModule", JS_NewCFunction(ctx, JsFindModule, "findModule", 1));
     JS_SetPropertyStr(ctx, native, "findSymbol", JS_NewCFunction(ctx, JsFindSymbol, "findSymbol", 2));
     JS_SetPropertyStr(ctx, native, "findSymbolsMatching", JS_NewCFunction(ctx, JsFindSymbolsMatching, "findSymbolsMatching", 2));
     JS_SetPropertyStr(ctx, native, "dumpNative", JS_NewCFunction(ctx, JsDumpNative, "dumpNative", 2));
     JS_SetPropertyStr(ctx, native, "hook", JS_NewCFunction(ctx, JsNativeHook, "hook", 2));
     JS_SetPropertyStr(ctx, native, "unhookAll", JS_NewCFunction(ctx, JsNativeUnhookAll, "unhookAll", 0));
+
 
     JSValue debugSymbol = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, debugSymbol, "fromAddress", JS_NewCFunction(ctx, JsDebugSymbolFromAddress, "fromAddress", 1));
@@ -1370,6 +1433,9 @@ void RegisterNativeApis(JSContext* ctx, JSValue global, JSValue native) {
     JS_SetPropertyStr(ctx, global, "nhook", JS_NewCFunction(ctx, JsNativeHook, "nhook", 2));
     JS_SetPropertyStr(ctx, global, "nunhookall", JS_NewCFunction(ctx, JsNativeUnhookAll, "nunhookall", 0));
     JS_SetPropertyStr(ctx, global, "resume", JS_NewCFunction(ctx, JsProcessResume, "resume", 0));
+    JS_SetPropertyStr(ctx, global, "invoke", JS_NewCFunction(ctx, JsNativeInvoke, "invoke", 1));
+    JS_SetPropertyStr(ctx, global, "callnative", JS_NewCFunction(ctx, JsNativeInvoke, "callnative", 1));
 }
+
 
 }} // namespace artpi::agent

@@ -13,6 +13,7 @@
 #include "frida-gum.h"
 
 #include "UnityResolve.hpp"
+#include "levenshtein.h"
 
 #include <android/log.h>
 #include <dlfcn.h>
@@ -1217,10 +1218,27 @@ static JSValue JsClassMethod(JSContext* ctx, JSValueConst this_val, int argc, JS
     std::lock_guard<std::mutex> lk(g_unityMutex);
     auto* c = reinterpret_cast<UnityResolve::Class*>(ThisPtr(ctx, this_val));
     if (!c || argc < 1) return JS_NULL;
+    std::string mName = ArgString(ctx, argv[0]);
     std::vector<std::string> types;
     if (argc >= 2) types = ArgStringArray(ctx, argv[1]);
-    return MakeMethodObject(ctx, c->Get<UnityResolve::Method>(ArgString(ctx, argv[0]), types));
+    auto* m = c->Get<UnityResolve::Method>(mName, types);
+    if (!m) {
+        UnityResolve::Method* bestM = nullptr;
+        double bestSim = 0.0;
+        for (auto* cand : c->methods) {
+            double sim = artpi::utils::LevenshteinSimilarity(mName, cand->name);
+            if (sim > bestSim) {
+                bestSim = sim;
+                bestM = cand;
+            }
+        }
+        if (bestM && bestSim >= 0.75) {
+            m = bestM;
+        }
+    }
+    return MakeMethodObject(ctx, m);
 }
+
 
 static JSValue JsClassNew(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
     std::lock_guard<std::mutex> lk(g_unityMutex);
@@ -1299,10 +1317,27 @@ static JSValue JsAssemblyClass(JSContext* ctx, JSValueConst this_val, int argc, 
     std::lock_guard<std::mutex> lk(g_unityMutex);
     auto* a = reinterpret_cast<UnityResolve::Assembly*>(ThisPtr(ctx, this_val));
     if (!a || argc < 1) return JS_NULL;
+    std::string cName = ArgString(ctx, argv[0]);
     std::string ns = argc >= 2 ? ArgString(ctx, argv[1]) : "*";
     std::string parent = argc >= 3 ? ArgString(ctx, argv[2]) : "*";
-    return MakeClassObject(ctx, a->Get(ArgString(ctx, argv[0]), ns, parent));
+    auto* cls = a->Get(cName, ns, parent);
+    if (!cls) {
+        UnityResolve::Class* bestC = nullptr;
+        double bestSim = 0.0;
+        for (auto* cand : a->classes) {
+            double sim = artpi::utils::LevenshteinSimilarity(cName, cand->name);
+            if (sim > bestSim) {
+                bestSim = sim;
+                bestC = cand;
+            }
+        }
+        if (bestC && bestSim >= 0.75) {
+            cls = bestC;
+        }
+    }
+    return MakeClassObject(ctx, cls);
 }
+
 
 static JSValue MakeAssemblyObject(JSContext* ctx, UnityResolve::Assembly* a) {
     if (!a) return JS_NULL;
@@ -1468,10 +1503,26 @@ static JSValue JsUnityFindClass(JSContext* ctx, JSValueConst, int argc, JSValueC
             JS_SetPropertyUint32(ctx, arr, index++, MakeClassObject(ctx, c));
         }
     }
+
+    if (index == 0 && !pattern.empty() && pattern != "*") {
+        for (auto* a : UnityResolve::assembly) {
+            if (index >= static_cast<uint32_t>(opt.limit)) break;
+            if (!opt.assembly.empty() && !UnityWildcardMatch(opt.assembly, a->name)) continue;
+            for (auto* c : a->classes) {
+                if (index >= static_cast<uint32_t>(opt.limit)) break;
+                double sim = artpi::utils::LevenshteinSimilarity(pattern, c->name);
+                if (sim >= 0.6) {
+                    JS_SetPropertyUint32(ctx, arr, index++, MakeClassObject(ctx, c));
+                }
+            }
+        }
+    }
+
     JS_SetPropertyStr(ctx, arr, "toString",
                       JS_NewCFunction(ctx, JsUnityClassArrayToString, "toString", 0));
     return arr;
 }
+
 
 static JSValue JsUnityFindMethods(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "unity.findmethods(pattern, [options])");
@@ -3157,7 +3208,9 @@ void RegisterUnityApis(JSContext* ctx, JSValue global) {
     JS_SetPropertyStr(ctx, root, "assembly", JS_NewCFunction(ctx, JsUnityAssembly, "assembly", 1));
     JS_SetPropertyStr(ctx, root, "class", JS_NewCFunction(ctx, JsUnityClass, "class", 3));
     JS_SetPropertyStr(ctx, root, "findclass", JS_NewCFunction(ctx, JsUnityFindClass, "findclass", 2));
+    JS_SetPropertyStr(ctx, root, "findClass", JS_NewCFunction(ctx, JsUnityFindClass, "findClass", 2));
     JS_SetPropertyStr(ctx, root, "findmethods", JS_NewCFunction(ctx, JsUnityFindMethods, "findmethods", 2));
+    JS_SetPropertyStr(ctx, root, "findMethods", JS_NewCFunction(ctx, JsUnityFindMethods, "findMethods", 2));
     JS_SetPropertyStr(ctx, root, "m", JS_NewCFunction(ctx, JsUnityM, "m", 3));
     JS_SetPropertyStr(ctx, root, "dump", JS_NewCFunction(ctx, JsUnityDump, "dump", 1));
     JS_SetPropertyStr(ctx, root, "threadAttach", JS_NewCFunction(ctx, JsUnityThreadAttach, "threadAttach", 0));

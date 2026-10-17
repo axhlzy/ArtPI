@@ -192,6 +192,10 @@ static const std::map<std::string, std::string> kApiDocs = {
     {"readstring", "Usage: readstring(address)\n  - Reads null-terminated C string from memory."},
     {"readu32", "Usage: readu32(address)\n  - Reads 32-bit unsigned integer from address."},
     {"writeu32", "Usage: writeu32(address, value)\n  - Writes 32-bit unsigned integer to address with mprotect."},
+    {"scanmem", "Usage: scanmem(moduleOrAddr, [size], pattern, [maxResults])\n  - IDA-style pattern scanning (supports ?? wildcards). Aliased to Memory.scan."},
+    {"patchmem", "Usage: patchmem(addressOrModule, [rva], hexString)\n  - Creates a reversible memory patch. Aliased to Memory.patch."},
+    {"maps", "Usage: maps([filter])\n  - Displays memory mapping table (/proc/self/maps). Aliased to Memory.maps."},
+    {"invoke", "Usage: invoke(address, ...args) / callnative(address, ...args)\n  - Dynamically invokes arbitrary native C/C++ function with arguments."},
 
     {"dynamic",
      "Usage: dynamic.java.<package>.<Class>.<method> | dynamic.native.<lib>.<symbol>\n"

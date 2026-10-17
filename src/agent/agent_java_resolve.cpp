@@ -7,6 +7,7 @@
 #include "../../include/ArtPI.h"
 #include "art/art_method.h"
 #include "dex/pi_dex_resolver.h"
+#include "levenshtein.h"
 
 #include <sstream>
 #include <vector>
@@ -464,6 +465,25 @@ static JSValue JsFindClass(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
 
     jclass localCls = FindClassWithFallback(env, pattern);
     if (!localCls) {
+        auto appClasses = EnumerateAppClassNames(env);
+        std::vector<std::pair<std::string, double>> ranked;
+        for (const auto& cn : appClasses) {
+            double sim = artpi::utils::LevenshteinSimilarity(pattern, cn);
+            if (sim >= 0.55) {
+                ranked.push_back({ cn, sim });
+            }
+        }
+        if (!ranked.empty()) {
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                return a.second > b.second;
+            });
+            std::ostringstream ss;
+            ss << "[!] Class '" << pattern << "' not found. Did you mean:\n";
+            for (size_t i = 0; i < std::min<size_t>(ranked.size(), 3); ++i) {
+                ss << "    -> " << ranked[i].first << " (" << static_cast<int>(ranked[i].second * 100) << "%)\n";
+            }
+            return JS_NewString(ctx, ss.str().c_str());
+        }
         return JS_NULL;
     }
 
