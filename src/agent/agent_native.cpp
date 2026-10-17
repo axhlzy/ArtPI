@@ -9,6 +9,8 @@
 #include "native/hooker/pi_gum_hooker.h"
 #include "native/hooker/pi_hw_hook.h"
 #include "frida-gum.h"
+#include "agent_ffi.h"
+#include "agent_binder.h"
 #include <link.h>
 #include <string>
 #include <vector>
@@ -334,6 +336,42 @@ static uintptr_t FindFirstMatchingInModule(const std::string& module, const std:
     return hit;
 }
 
+// xdl_sym() returns the raw ELF st_value. For STT_GNU_IFUNC symbols (strlen,
+// memcpy, ...) that is the *resolver*, not the implementation selected for
+// this CPU. Calling the resolver as a normal function crashes. Resolve it
+// through the dynamic linker and only accept the result when it still lives in
+// the same module, to avoid accidental symbol interposition.
+static void* ResolveIfuncSymbol(void* candidate, const std::string& moduleName,
+                                const std::string& symbol) {
+    if (!candidate) return nullptr;
+
+    Dl_info candidateInfo = {};
+    bool haveCandidateInfo = dladdr(candidate, &candidateInfo) != 0 &&
+                             candidateInfo.dli_fname != nullptr;
+
+    void* handle = nullptr;
+    if (haveCandidateInfo) {
+        handle = dlopen(candidateInfo.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+    }
+    if (!handle && !moduleName.empty()) {
+        handle = dlopen(moduleName.c_str(), RTLD_NOW | RTLD_NOLOAD);
+    }
+    if (!handle) return candidate;
+
+    void* resolved = dlsym(handle, symbol.c_str());
+    dlclose(handle);
+    if (!resolved) return candidate;
+
+    if (!haveCandidateInfo) return resolved;
+
+    Dl_info resolvedInfo = {};
+    if (dladdr(resolved, &resolvedInfo) &&
+        resolvedInfo.dli_fbase == candidateInfo.dli_fbase) {
+        return resolved;
+    }
+    return candidate;
+}
+
 JSValue JsFindSymbol(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 2) return JS_NewString(ctx, "Usage: findSymbol(moduleName, symbolName)");
     const char* modStr = JS_ToCString(ctx, argv[0]);
@@ -359,6 +397,8 @@ JSValue JsFindSymbol(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValu
         if (!addr) addr = xdl_dsym(handle, symbol.c_str(), &sz);
         xdl_close(handle);
     }
+
+    addr = ResolveIfuncSymbol(addr, module, symbol);
 
     if (addr) {
         return JS_NewBigInt64(ctx, reinterpret_cast<int64_t>(addr));
@@ -1314,65 +1354,165 @@ static JSValue JsProcessResume(JSContext* ctx, JSValueConst, int, JSValueConst*)
     return JS_NewString(ctx, "[i] Process is not paused");
 }
 
-extern "C" uint64_t artpi_call_native_variadic(void* fn, size_t argc, const uint64_t* argv);
+union FfiArgValue {
+    uint8_t u8;
+    int32_t s32;
+    uint32_t u32;
+    int64_t s64;
+    uint64_t u64;
+    float f;
+    double d;
+    void* ptr;
+};
 
 static JSValue JsNativeInvoke(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "Usage: invoke(address, ...args)");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Usage: invoke(address, ...args) or invoke(address, retType, [argTypes], ...args)");
     int64_t addr = ParsePtr(ctx, argv[0]);
     if (!addr || addr < 0x1000) return JS_ThrowTypeError(ctx, "invoke(): invalid native function address");
 
-    size_t fnArgc = static_cast<size_t>(argc - 1);
-    std::vector<uint64_t> rawArgs(fnArgc, 0);
+    bool isTyped = false;
+    std::string retTypeName = "pointer";
+    std::vector<std::string> explicitArgTypes;
+    size_t argStartIndex = 1;
+
+    // Support Frida-style typed call: invoke(addr, 'int', ['int', 'float'], 10, 3.14)
+    if (argc >= 3 && JS_IsString(argv[1]) && JS_IsArray(ctx, argv[2]) > 0) {
+        const char* rStr = JS_ToCString(ctx, argv[1]);
+        if (rStr) {
+            retTypeName = rStr;
+            JS_FreeCString(ctx, rStr);
+        }
+        int64_t typeArrLen = 0;
+        JSValue lenVal = JS_GetPropertyStr(ctx, argv[2], "length");
+        JS_ToInt64(ctx, &typeArrLen, lenVal);
+        JS_FreeValue(ctx, lenVal);
+        for (int64_t i = 0; i < typeArrLen; ++i) {
+            JSValue item = JS_GetPropertyUint32(ctx, argv[2], static_cast<uint32_t>(i));
+            const char* tStr = JS_ToCString(ctx, item);
+            explicitArgTypes.emplace_back(tStr ? tStr : "pointer");
+            if (tStr) JS_FreeCString(ctx, tStr);
+            JS_FreeValue(ctx, item);
+        }
+        isTyped = true;
+        argStartIndex = 3;
+    }
+
+    size_t fnArgc = static_cast<size_t>(argc > static_cast<int>(argStartIndex) ? argc - argStartIndex : 0);
+    std::vector<frida_ffi_type*> ffiArgTypes(fnArgc);
+    std::vector<FfiArgValue> argStorage(fnArgc);
+    std::vector<void*> ffiArgValues(fnArgc);
     std::vector<std::string> strKeepAlive;
+    strKeepAlive.reserve(fnArgc);
 
     for (size_t i = 0; i < fnArgc; ++i) {
-        JSValueConst val = argv[i + 1];
-        if (JS_IsString(val)) {
-            const char* s = JS_ToCString(ctx, val);
-            strKeepAlive.emplace_back(s ? s : "");
-            if (s) JS_FreeCString(ctx, s);
-            rawArgs[i] = reinterpret_cast<uint64_t>(strKeepAlive.back().c_str());
-        } else if (JS_IsBigInt(ctx, val)) {
-            int64_t v = 0;
-            JS_ToBigInt64(ctx, &v, val);
-            rawArgs[i] = static_cast<uint64_t>(v);
-        } else if (JS_IsNumber(val)) {
-            int64_t v = 0;
-            JS_ToInt64(ctx, &v, val);
-            rawArgs[i] = static_cast<uint64_t>(v);
-        } else if (JS_IsBool(val)) {
-            rawArgs[i] = JS_ToBool(ctx, val) ? 1 : 0;
-        } else if (JS_IsNull(val) || JS_IsUndefined(val)) {
-            rawArgs[i] = 0;
-        } else if (JS_IsObject(val)) {
-            size_t abLen = 0;
-            uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, val);
-            if (abPtr) {
-                rawArgs[i] = reinterpret_cast<uint64_t>(abPtr);
+        JSValueConst val = argv[argStartIndex + i];
+        frida_ffi_type* expectedType = nullptr;
+        if (isTyped && i < explicitArgTypes.size()) {
+            expectedType = FfiResolveType(explicitArgTypes[i]);
+        }
+
+        if (expectedType == &_frida_ffi_type_float) {
+            double d = 0;
+            JS_ToFloat64(ctx, &d, val);
+            argStorage[i].f = static_cast<float>(d);
+            ffiArgTypes[i] = &_frida_ffi_type_float;
+            ffiArgValues[i] = &argStorage[i].f;
+        } else if (expectedType == &_frida_ffi_type_double) {
+            double d = 0;
+            JS_ToFloat64(ctx, &d, val);
+            argStorage[i].d = d;
+            ffiArgTypes[i] = &_frida_ffi_type_double;
+            ffiArgValues[i] = &argStorage[i].d;
+        } else if (expectedType == &_frida_ffi_type_sint32) {
+            int32_t v = 0;
+            JS_ToInt32(ctx, &v, val);
+            argStorage[i].s32 = v;
+            ffiArgTypes[i] = &_frida_ffi_type_sint32;
+            ffiArgValues[i] = &argStorage[i].s32;
+        } else if (expectedType == &_frida_ffi_type_uint32) {
+            uint32_t v = 0;
+            JS_ToUint32(ctx, &v, val);
+            argStorage[i].u32 = v;
+            ffiArgTypes[i] = &_frida_ffi_type_uint32;
+            ffiArgValues[i] = &argStorage[i].u32;
+        } else {
+            // Auto-infer or pointer/64-bit
+            if (JS_IsString(val)) {
+                const char* s = JS_ToCString(ctx, val);
+                strKeepAlive.emplace_back(s ? s : "");
+                if (s) JS_FreeCString(ctx, s);
+                argStorage[i].ptr = const_cast<char*>(strKeepAlive.back().c_str());
+                ffiArgTypes[i] = &_frida_ffi_type_pointer;
+            } else if (JS_IsBool(val)) {
+                argStorage[i].u8 = JS_ToBool(ctx, val) ? 1 : 0;
+                ffiArgTypes[i] = &_frida_ffi_type_uint8;
+            } else if (JS_IsNumber(val)) {
+                double d = 0;
+                JS_ToFloat64(ctx, &d, val);
+                if (!isTyped && d != static_cast<double>(static_cast<int64_t>(d))) {
+                    // Fractional float/double auto-detection
+                    argStorage[i].d = d;
+                    ffiArgTypes[i] = &_frida_ffi_type_double;
+                } else {
+                    argStorage[i].s64 = static_cast<int64_t>(d);
+                    ffiArgTypes[i] = expectedType ? expectedType : &_frida_ffi_type_sint64;
+                }
+            } else if (JS_IsBigInt(ctx, val)) {
+                int64_t v = 0;
+                JS_ToBigInt64(ctx, &v, val);
+                argStorage[i].u64 = static_cast<uint64_t>(v);
+                ffiArgTypes[i] = expectedType ? expectedType : &_frida_ffi_type_uint64;
+            } else if (JS_IsObject(val)) {
+                size_t abLen = 0;
+                uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, val);
+                if (abPtr) {
+                    argStorage[i].ptr = abPtr;
+                } else {
+                    argStorage[i].u64 = static_cast<uint64_t>(ParsePtr(ctx, val));
+                }
+                ffiArgTypes[i] = &_frida_ffi_type_pointer;
             } else {
-                int64_t ptr = ParsePtr(ctx, val);
-                if (!ptr) {
-                    JSValue pVal = JS_GetPropertyStr(ctx, val, "__ptr");
-                    if (!JS_IsUndefined(pVal)) { ptr = ParsePtr(ctx, pVal); }
-                    JS_FreeValue(ctx, pVal);
-                }
-                if (!ptr) {
-                    JSValue pVal = JS_GetPropertyStr(ctx, val, "ptr");
-                    if (!JS_IsUndefined(pVal)) { ptr = ParsePtr(ctx, pVal); }
-                    JS_FreeValue(ctx, pVal);
-                }
-                if (!ptr) {
-                    JSValue pVal = JS_GetPropertyStr(ctx, val, "address");
-                    if (!JS_IsUndefined(pVal)) { ptr = ParsePtr(ctx, pVal); }
-                    JS_FreeValue(ctx, pVal);
-                }
-                rawArgs[i] = static_cast<uint64_t>(ptr);
+                argStorage[i].u64 = 0;
+                ffiArgTypes[i] = &_frida_ffi_type_pointer;
             }
+            ffiArgValues[i] = &argStorage[i];
         }
     }
 
-    uint64_t ret = artpi_call_native_variadic(reinterpret_cast<void*>(addr), fnArgc, rawArgs.data());
-    return NewBigIntOrInt(ctx, ret);
+    frida_ffi_type* rtype = isTyped ? FfiResolveType(retTypeName) : &_frida_ffi_type_pointer;
+    frida_ffi_cif cif = {};
+    frida_ffi_status status = _frida_ffi_prep_cif(&cif, FRIDA_FFI_DEFAULT_ABI,
+        static_cast<unsigned int>(fnArgc), rtype,
+        fnArgc > 0 ? ffiArgTypes.data() : nullptr);
+
+    if (status != FRIDA_FFI_OK) {
+        return JS_ThrowInternalError(ctx, "invoke(): ffi_prep_cif failed with status %d", status);
+    }
+
+    FfiArgValue retVal = {};
+    _frida_ffi_call(&cif, reinterpret_cast<void(*)()>(addr), &retVal,
+        fnArgc > 0 ? ffiArgValues.data() : nullptr);
+
+    if (rtype == &_frida_ffi_type_void) {
+        return JS_UNDEFINED;
+    }
+    if (rtype == &_frida_ffi_type_float) {
+        return JS_NewFloat64(ctx, static_cast<double>(retVal.f));
+    }
+    if (rtype == &_frida_ffi_type_double) {
+        return JS_NewFloat64(ctx, retVal.d);
+    }
+    if (rtype == &_frida_ffi_type_sint32) {
+        return JS_NewInt32(ctx, retVal.s32);
+    }
+    if (rtype == &_frida_ffi_type_uint32) {
+        return JS_NewUint32(ctx, retVal.u32);
+    }
+    if (retTypeName == "string" || retTypeName == "str") {
+        return retVal.ptr ? JS_NewString(ctx, reinterpret_cast<const char*>(retVal.ptr)) : JS_NULL;
+    }
+
+    return NewBigIntOrInt(ctx, retVal.u64);
 }
 
 void RegisterNativeApis(JSContext* ctx, JSValue global, JSValue native) {

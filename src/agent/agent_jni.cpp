@@ -32,18 +32,108 @@
 #include <memory>
 #include <cstring>
 #include <cinttypes>
+#include "frida-gum.h"
 
 #define JNI_TAG "ArtPI-JNI"
 
 namespace artpi { namespace agent {
 
+constexpr int kNumJniSlots = 233;
+
 #if defined(__aarch64__)
-extern "C" void* artpi_jni_get_trampoline(int slot);
+extern "C" void artpi_jni_common_entry();
+
+// 32 bytes per slot: ldr x16, #8 (12) + b (4), or the indirect fallback
+// ldr x16, #8 (12) + ldr x17, #8 (12) + br x17 (4) = 28 bytes.
+constexpr size_t kTrampolineSlotSize = 32;
+static void* g_jniTrampolineSlots[kNumJniSlots] = {nullptr};
+static std::once_flag g_jniTrampolineInitOnce;
+static std::once_flag g_gumInitOnce;
+static bool g_jniTrampolinesReady = false;
+
+static bool BuildJniTrampolines() {
+    std::call_once(g_gumInitOnce, []() { gum_init_embedded(); });
+
+    long pageSizeValue = sysconf(_SC_PAGESIZE);
+    size_t pageSize = pageSizeValue > 0 ? static_cast<size_t>(pageSizeValue) : 4096;
+    size_t needed = static_cast<size_t>(kNumJniSlots) * kTrampolineSlotSize;
+    size_t allocSize = (needed + pageSize - 1) & ~(pageSize - 1);
+
+    // Allocate executable memory near artpi_jni_common_entry using Gum.
+    // Gum requires the allocation size to be page-aligned; a non-aligned
+    // size (for example 233 * 16 = 3728) returns NULL on Android.
+    GumAddressSpec spec = {};
+    spec.near_address = reinterpret_cast<void*>(artpi_jni_common_entry);
+    spec.max_distance = 64 * 1024 * 1024; // 64 MB (within ARM64 128MB branch range)
+
+    void* mem = gum_memory_allocate_near(&spec, allocSize, pageSize, GUM_PAGE_RWX);
+    if (!mem) {
+        mem = gum_memory_allocate(nullptr, allocSize, pageSize, GUM_PAGE_RWX);
+    }
+
+    if (!mem) {
+        __android_log_print(ANDROID_LOG_ERROR, JNI_TAG,
+            "Failed to allocate %u bytes for dynamic JNI trampolines",
+            static_cast<unsigned>(allocSize));
+        return false;
+    }
+
+    GumArm64Writer writer;
+    gum_arm64_writer_init(&writer, mem);
+    bool ok = true;
+
+    for (int i = 0; i < kNumJniSlots; ++i) {
+        void* slotAddress = gum_arm64_writer_cur(&writer);
+        // 1. x16 = slot_id
+        if (!gum_arm64_writer_put_ldr_reg_u64(&writer, ARM64_REG_X16, static_cast<guint64>(i))) {
+            ok = false;
+            break;
+        }
+        // 2. b artpi_jni_common_entry
+        if (!gum_arm64_writer_put_b_imm(&writer, reinterpret_cast<GumAddress>(artpi_jni_common_entry))) {
+            // Fallback: indirect branch if out of direct range
+            if (!gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X17,
+                    reinterpret_cast<GumAddress>(artpi_jni_common_entry)) ||
+                !gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X17)) {
+                ok = false;
+                break;
+            }
+        }
+        g_jniTrampolineSlots[i] = slotAddress;
+    }
+
+    if (ok && gum_arm64_writer_offset(&writer) > needed) {
+        ok = false;
+    }
+    if (ok && !gum_arm64_writer_flush(&writer)) {
+        ok = false;
+    }
+    gum_arm64_writer_clear(&writer);
+
+    if (!ok) {
+        for (int i = 0; i < kNumJniSlots; ++i) g_jniTrampolineSlots[i] = nullptr;
+        gum_memory_free(mem, allocSize);
+        __android_log_print(ANDROID_LOG_ERROR, JNI_TAG,
+            "Failed to generate dynamic JNI trampolines");
+        return false;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, JNI_TAG,
+        "Dynamic JNI trampolines generated via GumArm64Writer at %p (%d slots, %u bytes)",
+        mem, kNumJniSlots, static_cast<unsigned>(allocSize));
+    return true;
+}
+
+extern "C" void* artpi_jni_get_trampoline(int slot) {
+    if (slot < 0 || slot >= kNumJniSlots) return nullptr;
+    std::call_once(g_jniTrampolineInitOnce, []() {
+        g_jniTrampolinesReady = BuildJniTrampolines();
+    });
+    return g_jniTrampolinesReady ? g_jniTrampolineSlots[slot] : nullptr;
+}
 #else
 static void* artpi_jni_get_trampoline(int) { return nullptr; }
 #endif
-
-constexpr int kNumJniSlots = 233;
 
 static const char* const kJniSlotNames[kNumJniSlots] = {
     "reserved0", "reserved1", "reserved2", "reserved3",
@@ -474,6 +564,16 @@ static bool InstallVtableHook(JNIEnv* env) {
     void** table = *reinterpret_cast<void***>(env);
     if (!table) return false;
 
+    // Build every stub before touching the live table. If any trampoline is
+    // unavailable, leave the JNI table untouched and report failure.
+    for (int i = 4; i < kNumJniSlots; ++i) {
+        if (!artpi_jni_get_trampoline(i)) {
+            __android_log_print(ANDROID_LOG_ERROR, JNI_TAG,
+                "JNI vtable hook aborted: trampoline slot %d unavailable", i);
+            return false;
+        }
+    }
+
     uintptr_t start = reinterpret_cast<uintptr_t>(table) & ~0xfffULL;
     uintptr_t end = (reinterpret_cast<uintptr_t>(table) + kNumJniSlots * sizeof(void*) + 0xfffULL) & ~0xfffULL;
     size_t len = end - start;
@@ -485,10 +585,7 @@ static bool InstallVtableHook(JNIEnv* env) {
 
     // Overwrite slots 4..232 with our trampoline stubs (each 8 bytes)
     for (int i = 4; i < kNumJniSlots; ++i) {
-        void* stub = artpi_jni_get_trampoline(i);
-        if (stub) {
-            table[i] = stub;
-        }
+        table[i] = artpi_jni_get_trampoline(i);
     }
 
     g_hijacked_table = table;

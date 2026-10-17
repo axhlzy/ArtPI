@@ -6,25 +6,7 @@
 .text
 .align 4
 
-.global artpi_jni_get_trampoline
-.hidden artpi_jni_get_trampoline
-.type artpi_jni_get_trampoline, %function
-artpi_jni_get_trampoline:
-    adrp x1, artpi_jni_trampolines
-    add  x1, x1, :lo12:artpi_jni_trampolines
-    add  x0, x1, w0, uxtw #3
-    ret
 
-.global artpi_jni_trampolines
-.hidden artpi_jni_trampolines
-.type artpi_jni_trampolines, %function
-artpi_jni_trampolines:
-.set slot, 0
-.rept 233
-    mov x16, slot
-    b   artpi_jni_common_entry
-.set slot, slot + 1
-.endr
 
 .global artpi_jni_common_entry
 .hidden artpi_jni_common_entry
@@ -115,74 +97,6 @@ artpi_jni_common_entry:
     // 9. Restore fp, lr, and return
     ldp x29, x30, [sp, #0]
     add sp, sp, #192
-    ret
-
-// ============================================================================
-// Universal Native Call Invoker: uint64_t artpi_call_native_variadic(fn, argc, argv)
-// ============================================================================
-.global artpi_call_native_variadic
-.hidden artpi_call_native_variadic
-.type artpi_call_native_variadic, %function
-artpi_call_native_variadic:
-    stp x29, x30, [sp, #-32]!
-    mov x29, sp
-    stp x19, x20, [sp, #16]
-
-    mov x19, x0        // x19 = target function
-    mov x20, x1        // x20 = argc
-    mov x16, x2        // x16 = argv pointer
-
-    cbz x20, .L_invoke_call
-
-    cmp x20, #8
-    b.ls .L_load_regs
-
-    // Compute aligned stack space for args 8..argc-1
-    sub x9, x20, #8
-    lsl x10, x9, #3
-    add x10, x10, #15
-    and x10, x10, #-16
-    sub sp, sp, x10
-
-    mov x11, #0
-.L_copy_stack:
-    cmp x11, x9
-    b.ge .L_load_regs
-    add x12, x11, #8
-    ldr x13, [x16, x12, lsl #3]
-    str x13, [sp, x11, lsl #3]
-    add x11, x11, #1
-    b .L_copy_stack
-
-.L_load_regs:
-    ldr x0, [x16, #0]
-    cmp x20, #1
-    b.eq .L_invoke_call
-    ldr x1, [x16, #8]
-    cmp x20, #2
-    b.eq .L_invoke_call
-    ldr x2, [x16, #16]
-    cmp x20, #3
-    b.eq .L_invoke_call
-    ldr x3, [x16, #24]
-    cmp x20, #4
-    b.eq .L_invoke_call
-    ldr x4, [x16, #32]
-    cmp x20, #5
-    b.eq .L_invoke_call
-    ldr x5, [x16, #40]
-    cmp x20, #6
-    b.eq .L_invoke_call
-    ldr x6, [x16, #48]
-    cmp x20, #7
-    b.eq .L_invoke_call
-    ldr x7, [x16, #56]
-
-.L_invoke_call:
-    blr x19
-    mov sp, x29
-    ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
     ret
 
 #endif
