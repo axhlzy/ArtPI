@@ -219,14 +219,15 @@ static JSValue JsListAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/
     std::ostringstream ss;
     ss << "====================== ArtPI Active Instrumentations ======================\n";
 
-    // 1. Hardware Breakpoint & Watchpoint Slots
-    ss << "[Hardware Registers]\n";
+    // 1. Hardware Breakpoint & Watchpoint Slots (runtime-probed capacity)
+    ss << "[Hardware Registers] (probed: " << hwStatus.bp_capacity << " BP, "
+       << hwStatus.wp_capacity << " WP)\n";
     ss << "  BP Slots: ";
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < hwStatus.bp_capacity; ++i) {
         ss << "[" << i << ": " << (hwStatus.bp_slots[i] ? "OCCUPIED" : "free") << "] ";
     }
     ss << "\n  WP Slots: ";
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < hwStatus.wp_capacity; ++i) {
         ss << "[" << i << ": " << (hwStatus.wp_slots[i] ? "OCCUPIED" : "free") << "] ";
     }
     ss << "\n\n";

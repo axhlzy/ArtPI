@@ -17,6 +17,11 @@
 
 namespace PI { namespace Native {
 
+// ARM64 exposes DBGBVR/DBGBCR[0..15] and DBGWVR/DBGWCR[0..15], so 16 is the
+// architectural ceiling. The actually usable count is probed at runtime
+// (a given SoC/kernel usually exposes 4..8 of each).
+static constexpr int kMaxHwSlots = 16;
+
 enum class HwHookType {
     BREAKPOINT, // Execution breakpoint (instruction PC)
     WATCHPOINT  // Memory data watchpoint (read/write access)
@@ -65,7 +70,7 @@ struct HwHookConfig {
     size_t size = 4; // for watchpoint: 1, 2, 4, 8 bytes
     HwWatchCondition condition = HwWatchCondition::WRITE;
     pid_t thread_id = 0; // 0 = all threads
-    int slot = -1; // -1 = auto-assign (0..3)
+    int slot = -1; // -1 = auto-assign (0 .. breakpointCapacity()-1)
     bool once = false; // if true, automatically unsets on first hit
     std::string tag;
     HwHookCallback on_hit;
@@ -114,7 +119,26 @@ public:
     // Query active sessions
     std::vector<HwHookSession> listSessions() const;
     bool isSessionActive(uint32_t id) const;
-    void getSlotStatus(bool out_bp[4], bool out_wp[4]) const;
+    void getSlotStatus(bool out_bp[kMaxHwSlots], bool out_wp[kMaxHwSlots],
+                       int* out_bp_capacity = nullptr,
+                       int* out_wp_capacity = nullptr) const;
+
+    // Runtime probed capacity (number of usable hardware comparators)
+    int breakpointCapacity() const;
+    int watchpointCapacity() const;
+
+    // Refresh the cached capacity. Cheap and non-blocking on the startup path:
+    // only probes comparators above the current capacity when hooks are live,
+    // or from 0 when no hook is active. Safe to call at any time (never touches
+    // slots that are already allocated).
+    void refreshCapacity();
+
+    // Re-enumerate live threads and arm any thread missing from an active
+    // session. Needed because a thread may be un-armable at attach time (e.g.
+    // the main thread is still ptraced by the injector during early boot), and
+    // because threads created later are not covered by the initial attach.
+    // Returns the number of newly armed (session, thread) pairs.
+    size_t rearmMissingThreads();
 
     // Internal exception dispatcher called by GumExceptor
     static int HandleException(void* details, void* user_data);
@@ -129,13 +153,18 @@ private:
     bool armOnThread(HwHookSession& session, pid_t tid);
     bool disarmOnThread(HwHookSession& session, pid_t tid);
 
-    mutable std::mutex mutex_;
+    // recursive: HandleException holds the lock while invoking the user
+    // callback, and callbacks may re-enter attach()/detach().
+    mutable std::recursive_mutex mutex_;
     bool initialized_ = false;
     uint32_t next_id_ = 1;
 
-    // Max 4 slots for breakpoint (0..3), max 4 slots for watchpoint (0..3)
-    bool bp_slots_[4] = {false, false, false, false};
-    bool wp_slots_[4] = {false, false, false, false};
+    // Runtime probed usable slot counts; the arrays are sized to the
+    // architectural ceiling so growth only needs a re-probe.
+    int bp_capacity_ = 4;
+    int wp_capacity_ = 4;
+    bool bp_slots_[kMaxHwSlots] = {false};
+    bool wp_slots_[kMaxHwSlots] = {false};
 
     std::vector<std::shared_ptr<HwHookSession>> sessions_;
     void* exceptor_ = nullptr;

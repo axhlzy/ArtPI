@@ -7,6 +7,26 @@
 #include <android/log.h>
 #include <cstring>
 #include <algorithm>
+#include <cerrno>
+#include <csignal>
+
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/uio.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <elf.h>
+#include <asm/ptrace.h>
+
+#ifndef PTRACE_GETREGSET
+#define PTRACE_GETREGSET 0x4204
+#endif
+#ifndef NT_ARM_HW_BREAK
+#define NT_ARM_HW_BREAK 0x402
+#endif
+#ifndef NT_ARM_HW_WATCH
+#define NT_ARM_HW_WATCH 0x403
+#endif
 
 #define HW_LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "PI_HwHook", __VA_ARGS__)
 #define HW_LOGW(...) __android_log_print(ANDROID_LOG_WARN,  "PI_HwHook", __VA_ARGS__)
@@ -34,6 +54,50 @@ static gboolean EnumThreadCallback(const GumThreadDetails* details, gpointer use
     return TRUE;
 }
 
+// Read the true comparator count from the kernel instead of probing with
+// Gum. On arm64 the NT_ARM_HW_BREAK / NT_ARM_HW_WATCH regset starts with
+// `dbg_info = (debug_arch << 8) | num_slots`; Gum itself uses that low byte to
+// size its PTRACE_SETREGSET transfer, so writing slot indices beyond it is
+// silently dropped (which is why probing with gum_thread_set_hardware_* always
+// "succeeds" up to 16). We query it from a short-lived traced child: a thread
+// cannot ptrace a sibling of the same thread group.
+static int ReadHwSlotCount(bool watch) {
+    pid_t child = fork();
+    if (child < 0) return -1;
+
+    if (child == 0) {
+        // Child: become tracee, stop, and stay idle until detached.
+        ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+        kill(getpid(), SIGSTOP);
+        _exit(0);
+    }
+
+    int status = 0;
+    pid_t r;
+    do { r = waitpid(child, &status, 0); } while (r < 0 && errno == EINTR);
+    if (r != child || !WIFSTOPPED(status)) {
+        kill(child, SIGKILL);
+        do { r = waitpid(child, &status, 0); } while (r < 0 && errno == EINTR);
+        return -1;
+    }
+
+    struct user_hwdebug_state state;
+    memset(&state, 0, sizeof(state));
+    struct iovec iov;
+    iov.iov_base = &state;
+    iov.iov_len = sizeof(state);
+
+    int note = watch ? NT_ARM_HW_WATCH : NT_ARM_HW_BREAK;
+    int count = -1;
+    if (ptrace(PTRACE_GETREGSET, child, (void*) (uintptr_t) note, &iov) == 0) {
+        count = static_cast<int>(state.dbg_info & 0xffu);
+    }
+
+    ptrace(PTRACE_DETACH, child, nullptr, nullptr);
+    do { r = waitpid(child, &status, 0); } while (r < 0 && errno == EINTR);
+    return count;
+}
+
 } // namespace
 
 HwHookManager::HwHookManager() = default;
@@ -52,7 +116,7 @@ HwHookManager& HwHookManager::instance() {
 }
 
 bool HwHookManager::init() {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (initialized_) return true;
 
     gum_init_embedded();
@@ -65,26 +129,77 @@ bool HwHookManager::init() {
 
     exceptor_ = ex;
     gum_exceptor_add(ex, OnGumException, this);
+
+    // Query the real comparator count from the kernel (cheap fork + one
+    // PTRACE_GETREGSET; does not touch our own debug registers).
+    bp_capacity_ = ReadHwSlotCount(false);
+    wp_capacity_ = ReadHwSlotCount(true);
+    if (bp_capacity_ <= 0) {
+        HW_LOGW("hardware breakpoint capacity probe failed, assuming 4");
+        bp_capacity_ = 4;
+    }
+    if (wp_capacity_ <= 0) {
+        HW_LOGW("hardware watchpoint capacity probe failed, assuming 4");
+        wp_capacity_ = 4;
+    }
+    if (bp_capacity_ > kMaxHwSlots) bp_capacity_ = kMaxHwSlots;
+    if (wp_capacity_ > kMaxHwSlots) wp_capacity_ = kMaxHwSlots;
+
     initialized_ = true;
-    HW_LOGI("HwHookManager initialized successfully with GumExceptor");
+    HW_LOGI("HwHookManager initialized: %d breakpoint slot(s), %d watchpoint slot(s), "
+            "GumExceptor installed",
+            bp_capacity_, wp_capacity_);
     return true;
 }
 
 bool HwHookManager::isInitialized() const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     return initialized_;
+}
+
+int HwHookManager::breakpointCapacity() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    return bp_capacity_;
+}
+
+int HwHookManager::watchpointCapacity() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    return wp_capacity_;
+}
+
+void HwHookManager::refreshCapacity() {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    if (!initialized_) return;
+
+    int old_bp = bp_capacity_;
+    int old_wp = wp_capacity_;
+
+    // Reading the kernel resource info never touches our own debug registers,
+    // so it is safe even while hooks are live.
+    int bp = ReadHwSlotCount(false);
+    int wp = ReadHwSlotCount(true);
+    if (bp > 0) bp_capacity_ = bp;
+    if (wp > 0) wp_capacity_ = wp;
+    if (bp_capacity_ > kMaxHwSlots) bp_capacity_ = kMaxHwSlots;
+    if (wp_capacity_ > kMaxHwSlots) wp_capacity_ = kMaxHwSlots;
+
+    if (bp_capacity_ != old_bp || wp_capacity_ != old_wp) {
+        HW_LOGI("refreshCapacity: %d breakpoint slot(s), %d watchpoint slot(s)",
+                bp_capacity_, wp_capacity_);
+    }
 }
 
 int HwHookManager::allocateSlot(HwHookType type, int requested_slot) {
     bool* slots = (type == HwHookType::BREAKPOINT) ? bp_slots_ : wp_slots_;
-    if (requested_slot >= 0 && requested_slot < 4) {
-        if (!slots[requested_slot]) {
+    int capacity = (type == HwHookType::BREAKPOINT) ? bp_capacity_ : wp_capacity_;
+    if (requested_slot >= 0) {
+        if (requested_slot < capacity && !slots[requested_slot]) {
             slots[requested_slot] = true;
             return requested_slot;
         }
-        return -1; // Requested slot already in use
+        return -1; // Requested slot already in use or out of range
     }
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < capacity; i++) {
         if (!slots[i]) {
             slots[i] = true;
             return i;
@@ -94,7 +209,7 @@ int HwHookManager::allocateSlot(HwHookType type, int requested_slot) {
 }
 
 void HwHookManager::freeSlot(HwHookType type, int slot) {
-    if (slot >= 0 && slot < 4) {
+    if (slot >= 0 && slot < kMaxHwSlots) {
         bool* slots = (type == HwHookType::BREAKPOINT) ? bp_slots_ : wp_slots_;
         slots[slot] = false;
     }
@@ -187,7 +302,7 @@ uint32_t HwHookManager::attach(const HwHookConfig& config) {
     if (!init()) return 0;
     if (config.address == 0 || !config.on_hit) return 0;
 
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
 
     for (auto& s : sessions_) {
         if (s->active && s->config.address == config.address && s->config.type == config.type) {
@@ -244,7 +359,7 @@ uint32_t HwHookManager::attach(const HwHookConfig& config) {
 }
 
 bool HwHookManager::detach(uint32_t id) {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
         auto& s = *it;
         if (s->id == id) {
@@ -273,7 +388,7 @@ bool HwHookManager::detach(uint32_t id) {
 }
 
 size_t HwHookManager::detachAll() {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     size_t count = 0;
     for (auto& s : sessions_) {
         if (s->step_over_slot >= 0 && s->stepping_thread > 0) {
@@ -299,7 +414,7 @@ size_t HwHookManager::detachAll() {
 }
 
 std::vector<HwHookSession> HwHookManager::listSessions() const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     std::vector<HwHookSession> list;
     for (auto& s : sessions_) {
         list.push_back(*s);
@@ -308,25 +423,52 @@ std::vector<HwHookSession> HwHookManager::listSessions() const {
 }
 
 bool HwHookManager::isSessionActive(uint32_t id) const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     for (auto& s : sessions_) {
         if (s->id == id && s->active) return true;
     }
     return false;
 }
 
-void HwHookManager::getSlotStatus(bool out_bp[4], bool out_wp[4]) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    for (int i = 0; i < 4; i++) {
+void HwHookManager::getSlotStatus(bool out_bp[kMaxHwSlots],
+                                  bool out_wp[kMaxHwSlots],
+                                  int* out_bp_capacity,
+                                  int* out_wp_capacity) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    for (int i = 0; i < kMaxHwSlots; i++) {
         if (out_bp) out_bp[i] = bp_slots_[i];
         if (out_wp) out_wp[i] = wp_slots_[i];
     }
+    if (out_bp_capacity) *out_bp_capacity = bp_capacity_;
+    if (out_wp_capacity) *out_wp_capacity = wp_capacity_;
+}
+
+size_t HwHookManager::rearmMissingThreads() {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    if (!initialized_) return 0;
+
+    ThreadCollector col;
+    gum_process_enumerate_threads(EnumThreadCallback, &col, GUM_THREAD_FLAGS_ALL);
+
+    size_t armed = 0;
+    for (auto& s : sessions_) {
+        if (!s->active) continue;
+        for (pid_t tid : col.tids) {
+            if (s->config.thread_id > 0 && s->config.thread_id != tid) continue;
+            if (s->armed_threads.count(tid)) continue;
+            if (armOnThread(*s, tid)) armed++;
+        }
+    }
+    if (armed) {
+        HW_LOGI("rearmMissingThreads: armed %zu (session,thread) pair(s)", armed);
+    }
+    return armed;
 }
 
 int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
     auto* details = reinterpret_cast<GumExceptionDetails*>(raw_details);
     auto& mgr = HwHookManager::instance();
-    std::lock_guard<std::mutex> lk(mgr.mutex_);
+    std::unique_lock<std::recursive_mutex> lk(mgr.mutex_);
 
     pid_t tid = static_cast<pid_t>(details->thread_id);
     uintptr_t fault_addr = reinterpret_cast<uintptr_t>(details->address);
@@ -416,9 +558,17 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
         ctx.memory_operation = (details->memory.operation == GUM_MEMOP_READ) ? 1 : 2;
     }
 
-    // 4. Invoke user callback
+    // 4. Invoke user callback WITHOUT the manager lock: callbacks may block for
+    //    a long time (e.g. --stop-lib parks the thread) and may re-enter
+    //    attach()/detach(), which would otherwise deadlock against resume().
+    lk.unlock();
     if (matched_session->config.on_hit) {
         matched_session->config.on_hit(ctx);
+    }
+    lk.lock();
+
+    if (!matched_session->active) {
+        return 1; // session was detached by the callback
     }
 
     // Write back modified registers
@@ -449,7 +599,7 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
         gum_thread_unset_hardware_breakpoint(tid, matched_session->assigned_slot, nullptr);
 
         int step_slot = -1;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < mgr.bp_capacity_; i++) {
             if (!mgr.bp_slots_[i] && i != matched_session->assigned_slot) {
                 step_slot = i;
                 break;
@@ -494,7 +644,7 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
         // Watchpoint step-over
         gum_thread_unset_hardware_watchpoint(tid, matched_session->assigned_slot, nullptr);
         int step_slot = -1;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < mgr.bp_capacity_; i++) {
             if (!mgr.bp_slots_[i]) { step_slot = i; break; }
         }
         if (step_slot >= 0) {

@@ -219,6 +219,7 @@ void* AgentThreadEntry(void*) {
     AG_LOGI("AgentThreadEntry: start (tid=%d)", gettid());
 
     // 0. Auto-arm boot dlopen monitor if requested before any app libraries load
+    bool bootAutoResume = false;
     {
         char cmdline[256] = {0};
         int fdCmd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
@@ -244,6 +245,7 @@ void* AgentThreadEntry(void*) {
                 if (n > 0) {
                     std::string c(buf);
                     bool libLog = (c.find("libLog=1") != std::string::npos);
+                    bootAutoResume = (c.find("autoResume=1") != std::string::npos);
                     std::string stopLib;
                     size_t p = c.find("stopLib=");
                     if (p != std::string::npos) {
@@ -273,6 +275,39 @@ void* AgentThreadEntry(void*) {
     const char* unixName = artpi::agent::GetUnixSocketName();
     AG_LOGI("AgentThreadEntry: StartServer -> %d, tcp_port=%d, unix=%s",
             srvOk ? 1 : 0, artpi::agent::GetServerPort(), unixName ? unixName : "(none)");
+
+    // The injector may still hold the main thread under ptrace while the early
+    // boot dlopen monitor is armed (notably with -S auto-gate). Retry in the
+    // background so skipped threads get their hooks once the injector detaches
+    // (and newly created threads get covered too). If the boot cfg requested
+    // autoResume, release the gated main thread as soon as it is armed (with a
+    // timeout fallback so a broken cfg can never leave the app frozen).
+    {
+        void* (*rearm_fn)(void*) = [](void* user) -> void* {
+            bool autoResume = (user != nullptr);
+            for (int i = 0; i < 20; ++i) {
+                usleep(100 * 1000);
+                size_t n = artpi::agent::HwHookRearmMissingThreads();
+                if (n) AG_LOGI("background rearm: armed %zu missed thread(s)", n);
+
+                if (autoResume) {
+                    bool armed = artpi::agent::HwHookMainThreadArmed();
+                    if (armed || i >= 15) {
+                        bool resumed = artpi::agent::ArtPIResumeProcess();
+                        AG_LOGI("background auto-resume: armed=%d resumed=%d",
+                                armed ? 1 : 0, resumed ? 1 : 0);
+                        autoResume = false;
+                    }
+                }
+            }
+            return nullptr;
+        };
+        pthread_t rearmThread;
+        void* rearmArg = bootAutoResume ? reinterpret_cast<void*>(1) : nullptr;
+        if (pthread_create(&rearmThread, nullptr, rearm_fn, rearmArg) == 0) {
+            pthread_detach(rearmThread);
+        }
+    }
 
     // 2. Initialize QuickJS Runtime & Bindings
     AG_LOGI("AgentThreadEntry: InitJs ...");

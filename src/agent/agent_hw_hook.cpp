@@ -645,6 +645,13 @@ static std::string ExtractSoName(uint64_t addr) {
 
 static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (g_dlopenMonitorActive) {
+        // The monitor may have been armed from the agent bootstrap while the
+        // injector still held the main thread under ptrace, in which case that
+        // thread was silently skipped. Retry now that the injector is gone.
+        size_t rearmed = HwHookManager::instance().rearmMissingThreads();
+        if (rearmed) {
+            HW_LOGI("JsHwWatchDlopen: re-armed %zu previously missed thread(s)", rearmed);
+        }
         uint32_t activeId = 1;
         int activeSlot = 0;
         for (const auto& s : HwHookManager::instance().listSessions()) {
@@ -893,12 +900,33 @@ std::vector<HwHookInfo> HwHookListAll() {
 
 HwSlotStatus HwHookGetSlotStatus() {
     HwSlotStatus st{};
-    HwHookManager::instance().getSlotStatus(st.bp_slots, st.wp_slots);
+    // Ensure the manager is initialized (so the capacity is known) as this
+    // also serves the `L()` dashboard when no hardware hook is active yet.
+    HwHookManager::instance().init();
+    HwHookManager::instance().refreshCapacity();
+    HwHookManager::instance().getSlotStatus(st.bp_slots, st.wp_slots,
+                                            &st.bp_capacity, &st.wp_capacity);
     return st;
 }
 
+size_t HwHookRearmMissingThreads() {
+    return HwHookManager::instance().rearmMissingThreads();
+}
+
+bool HwHookMainThreadArmed() {
+    pid_t mainTid = getpid();
+    for (const auto& s : HwHookManager::instance().listSessions()) {
+        if (s.active && s.armed_threads.count(mainTid)) return true;
+    }
+    return false;
+}
+
 bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog) {
-    if (g_dlopenMonitorActive) return true;
+    if (g_dlopenMonitorActive) {
+        // Early boot may have raced with the injector's ptrace attachment.
+        HwHookManager::instance().rearmMissingThreads();
+        return true;
+    }
     uintptr_t targetExt = ResolveDlopenExtAddress();
     uintptr_t targetDl = ResolveDlopenAddress();
     if (!targetExt && !targetDl) {

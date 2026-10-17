@@ -7,6 +7,7 @@
 #include "../../include/ArtPI.h"
 #include "native/pi_native.h"
 #include "native/hooker/pi_gum_hooker.h"
+#include "native/hooker/pi_hw_hook.h"
 #include "frida-gum.h"
 #include <link.h>
 #include <string>
@@ -1297,10 +1298,17 @@ static JSValue JsProcessIsPaused(JSContext* ctx, JSValueConst, int, JSValueConst
 
 static JSValue JsProcessResume(JSContext* ctx, JSValueConst, int, JSValueConst*) {
     uint64_t pc = ArtPIGetGatePc();
+
+    // Re-arm hardware hooks on the still-parked main thread before letting it
+    // run. Threads skipped during early boot (the injector still ptraced them)
+    // must be fixed before the app executes dlopen / constructor code.
+    size_t rearmed = PI::Native::HwHookManager::instance().rearmMissingThreads();
+
     if (ArtPIResumeProcess()) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "[+] Resumed main thread (PID %d) at PC=0x%llx",
-                 (int) getpid(), (unsigned long long) pc);
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "[+] Resumed main thread (PID %d) at PC=0x%llx (re-armed %zu hw thread(s))",
+                 (int) getpid(), (unsigned long long) pc, rearmed);
         return JS_NewString(ctx, buf);
     }
     return JS_NewString(ctx, "[i] Process is not paused");

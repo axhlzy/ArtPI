@@ -88,12 +88,34 @@ namespace {
         }
     }
 
+    // For -S with early-library monitoring we keep the main thread gated until
+    // the dlopen breakpoint is actually armed on it, then resume transparently.
+    // Without this, the Unity startup libraries (libmain/libunity/libil2cpp)
+    // race ahead of the agent and are missed. An explicit --pause still wins.
+    bool ShouldAutoGateSpawn(const Options& opt) {
+        return opt.spawnMode && !opt.pauseMainThread &&
+               (opt.libLog || !opt.stopLib.empty());
+    }
+
     void HandleConnectedSession(const artpi::injector::AgentEndpoint& ep, const Options& opt) {
         if (opt.serverMode) {
             PrintServerMode(ep);
             printf("[+] Server mode: ArtPI Agent is active, exiting.\n");
             exit(0);
         }
+        const bool autoResumeSpawn = ShouldAutoGateSpawn(opt);
+        auto resumeIfAutoGated = [&]() {
+            if (!autoResumeSpawn) return;
+            std::string res, err;
+            if (artpi::injector::EvalScript(ep, "Process.resume()", res, err)) {
+                if (!res.empty() && res != "undefined" && res != "[undefined]") {
+                    printf("%s\n", res.c_str());
+                }
+            } else if (!err.empty()) {
+                fprintf(stderr, "[!] auto-resume failed: %s\n", err.c_str());
+            }
+        };
+
         if (opt.libLog || !opt.stopLib.empty()) {
             std::string js = "HW.watchDlopen({ stopLib: \"" + opt.stopLib + "\", libLog: true });";
             std::string res, err;
@@ -111,11 +133,13 @@ namespace {
                     printf("%s\n", result.c_str());
                 }
                 if (!opt.pauseMainThread) {
+                    resumeIfAutoGated();
                     exit(0);
                 }
             } else {
                 fprintf(stderr, "[!] %s\n", err.c_str());
                 if (!opt.pauseMainThread) {
+                    resumeIfAutoGated();
                     exit(1);
                 }
             }
@@ -123,10 +147,13 @@ namespace {
         if (opt.pauseMainThread) {
             printf("[*] Target main thread (PID %d) is PAUSED. Set your hooks, then type 'resume' to continue!\n",
                    opt.pid);
-        } else if (!opt.stopLib.empty()) {
-            printf("[*] App running. Will PAUSE automatically when '%s' is loaded via dlopen...\n", opt.stopLib.c_str());
-        } else if (opt.libLog) {
-            printf("[*] App running. Monitoring dynamic libraries loaded via dlopen...\n");
+        } else {
+            resumeIfAutoGated();
+            if (!opt.stopLib.empty()) {
+                printf("[*] App running. Will PAUSE automatically when '%s' is loaded via dlopen...\n", opt.stopLib.c_str());
+            } else if (opt.libLog) {
+                printf("[*] App running. Monitoring dynamic libraries loaded via dlopen...\n");
+            }
         }
         printf("[*] Attaching directly to interactive REPL session...\n");
         artpi::injector::RunInteractiveRepl(ep);
@@ -431,7 +458,12 @@ int main(int argc, char **argv) {
                 int fd = open(cfgPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
                 if (fd >= 0) {
                     char buf[256];
-                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\n", opt.libLog ? 1 : 0, opt.stopLib.c_str());
+                    // autoResume lets the agent release the gated main thread by
+                    // itself once the early monitor is armed (covers --server and
+                    // a client that fails to connect).
+                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\nautoResume=%d\n",
+                             opt.libLog ? 1 : 0, opt.stopLib.c_str(),
+                             ShouldAutoGateSpawn(opt) ? 1 : 0);
                     write(fd, buf, strlen(buf));
                     close(fd);
                     struct stat dirSt{};
@@ -567,8 +599,11 @@ int main(int argc, char **argv) {
         printf("[*] injecting libartpi_agent.so via /proc/%d/mem (no-ptrace) ...\n", opt.pid);
         injOk = InjectLibraryNoPtrace(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err);
     } else {
-        bool injectPause = opt.pauseMainThread;
-        printf("[*] injecting libartpi_agent.so via ptrace (SEIZE) into pid %d (gate_pause=%d) ...\n", opt.pid, injectPause ? 1 : 0);
+        bool autoGateSpawn = ShouldAutoGateSpawn(opt);
+        bool injectPause = opt.pauseMainThread || autoGateSpawn;
+        printf("[*] injecting libartpi_agent.so via ptrace (SEIZE) into pid %d (gate_pause=%d%s) ...\n",
+               opt.pid, injectPause ? 1 : 0,
+               autoGateSpawn ? ", auto-resume after early hooks" : "");
         injOk = InjectLibrary(opt.pid, deployedSoPath.c_str(), apkPrefix.c_str(), err, injectPause);
         if (!injOk && err.find("PTRACE_") != std::string::npos) {
             printf("[!] ptrace attach failed (%s), falling back to --no-ptrace (/proc/mem) mode...\n", err.c_str());
