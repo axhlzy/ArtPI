@@ -253,10 +253,25 @@ void* AgentThreadEntry(void*) {
                         size_t end = c.find('\n', p);
                         stopLib = c.substr(p + 8, (end == std::string::npos) ? std::string::npos : (end - (p + 8)));
                     }
-                    if (libLog || ctors || !stopLib.empty()) {
-                        AG_LOGI("AgentThreadEntry: Early boot dlopen monitor armed from %s (stopLib='%s', libLog=%d, ctors=%d)",
-                                path.c_str(), stopLib.c_str(), libLog ? 1 : 0, ctors ? 1 : 0);
-                        artpi::agent::SetupDlopenHwMonitor(stopLib, libLog, ctors);
+                    std::string qbdiFilter;
+                    size_t qp = c.find("qbdiFilter=");
+                    if (qp != std::string::npos) {
+                        size_t end = c.find('\n', qp);
+                        qbdiFilter = c.substr(qp + 11, (end == std::string::npos) ? std::string::npos : (end - (qp + 11)));
+                    }
+                    size_t qbdiMaxLog = 100;
+                    size_t mlp = c.find("qbdiMaxLog=");
+                    if (mlp != std::string::npos) {
+                        size_t end = c.find('\n', mlp);
+                        std::string s = c.substr(mlp + 11, (end == std::string::npos) ? std::string::npos : (end - (mlp + 11)));
+                        if (!s.empty()) {
+                            qbdiMaxLog = std::strtoul(s.c_str(), nullptr, 0);
+                        }
+                    }
+                    if (libLog || ctors || !stopLib.empty() || !qbdiFilter.empty()) {
+                        AG_LOGI("AgentThreadEntry: Early boot dlopen monitor armed from %s (stopLib='%s', libLog=%d, ctors=%d, qbdiFilter='%s', maxLog=%zu)",
+                                path.c_str(), stopLib.c_str(), libLog ? 1 : 0, ctors ? 1 : 0, qbdiFilter.c_str(), qbdiMaxLog);
+                        artpi::agent::SetupDlopenHwMonitor(stopLib, libLog, ctors || !qbdiFilter.empty(), qbdiFilter, qbdiMaxLog);
                     }
                 }
                 break;

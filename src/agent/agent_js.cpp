@@ -655,6 +655,33 @@ std::string EvalJs(const std::string& script, const char* filename) {
                         char hbuf[32];
                         snprintf(hbuf, sizeof(hbuf), "0x%llx", (unsigned long long)bv);
                         itemStr = hbuf;
+                    } else if (JS_IsObject(elem)) {
+                        JSValue nameVal = JS_GetPropertyStr(g_ctx, elem, "name");
+                        JSValue baseVal = JS_GetPropertyStr(g_ctx, elem, "base");
+                        if (JS_IsString(nameVal) && JS_IsString(baseVal)) {
+                            const char* nm = JS_ToCString(g_ctx, nameVal);
+                            const char* bs = JS_ToCString(g_ctx, baseVal);
+                            char sbuf[256];
+                            snprintf(sbuf, sizeof(sbuf), "%s @ %s", nm ? nm : "?", bs ? bs : "?");
+                            itemStr = sbuf;
+                            if (nm) JS_FreeCString(g_ctx, nm);
+                            if (bs) JS_FreeCString(g_ctx, bs);
+                        } else {
+                            JSValue jsonVal = JS_JSONStringify(g_ctx, elem, JS_UNDEFINED, JS_UNDEFINED);
+                            if (!JS_IsUndefined(jsonVal) && !JS_IsNull(jsonVal) && !JS_IsException(jsonVal)) {
+                                const char* s = JS_ToCString(g_ctx, jsonVal);
+                                itemStr = s ? s : "";
+                                if (s) JS_FreeCString(g_ctx, s);
+                                JS_FreeValue(g_ctx, jsonVal);
+                            } else {
+                                if (JS_IsException(jsonVal)) JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+                                const char* s = JS_ToCString(g_ctx, elem);
+                                itemStr = s ? s : "";
+                                if (s) JS_FreeCString(g_ctx, s);
+                            }
+                        }
+                        JS_FreeValue(g_ctx, nameVal);
+                        JS_FreeValue(g_ctx, baseVal);
                     } else {
                         const char* s = JS_ToCString(g_ctx, elem);
                         itemStr = s ? s : "";
@@ -686,6 +713,28 @@ std::string EvalJs(const std::string& script, const char* filename) {
                     }
                     res += "]";
                 }
+            }
+        }
+    } else if (JS_IsObject(val)) {
+        JSValue dtVal = JS_GetPropertyStr(g_ctx, val, "dumpText");
+        if (JS_IsString(dtVal)) {
+            const char* s = JS_ToCString(g_ctx, dtVal);
+            res = s ? s : "";
+            if (s) JS_FreeCString(g_ctx, s);
+            JS_FreeValue(g_ctx, dtVal);
+        } else {
+            JS_FreeValue(g_ctx, dtVal);
+            JSValue jsonVal = JS_JSONStringify(g_ctx, val, JS_UNDEFINED, JS_NewInt32(g_ctx, 2));
+            if (!JS_IsUndefined(jsonVal) && !JS_IsNull(jsonVal) && !JS_IsException(jsonVal)) {
+                const char* s = JS_ToCString(g_ctx, jsonVal);
+                res = s ? s : "";
+                if (s) JS_FreeCString(g_ctx, s);
+                JS_FreeValue(g_ctx, jsonVal);
+            } else {
+                if (JS_IsException(jsonVal)) JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+                const char* str = JS_ToCString(g_ctx, val);
+                res = str ? str : "";
+                if (str) JS_FreeCString(g_ctx, str);
             }
         }
     } else {

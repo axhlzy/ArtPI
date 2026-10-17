@@ -4,8 +4,10 @@
 #include "agent_hw_hook.h"
 #include "agent_common.h"
 #include "agent_net.h"
+#include "agent_qbdi.h"
 #include "native/hooker/pi_hw_hook.h"
 #include "native/hooker/pi_gum_hooker.h"
+#include "native/qbdi/pi_qbdi_engine.h"
 #include "frida-gum.h"
 #include <unistd.h>
 #include <elf.h>
@@ -810,6 +812,20 @@ static bool ExtractConstructorsFromSoinfo(uintptr_t soinfo_ptr, ExtractedConstru
         }
     }
 
+    // Resolve constructor symbols via xdl_addr
+    void* xdlCache = nullptr;
+    for (auto& c : out.ctors) {
+        xdl_info_t dli{};
+        if (xdl_addr(reinterpret_cast<void*>(c.first), &dli, &xdlCache) != 0) {
+            if (dli.dli_sname && dli.dli_sname[0] != '\0') {
+                c.second += std::string(" (") + dli.dli_sname + ")";
+            }
+        }
+    }
+    if (xdlCache) {
+        xdl_addr_clean(&xdlCache);
+    }
+
     return true;
 }
 
@@ -830,6 +846,73 @@ static std::mutex g_ctorMutex;
 static JSValue g_onConstructorCb = JS_UNDEFINED;
 static JSValue g_onCallConstructorsCb = JS_UNDEFINED;
 static std::mutex g_ctorJsMutex;
+static std::string g_qbdiCtorFilter;
+static size_t g_qbdiMaxLog = 100;
+
+static bool MatchesQbdiFilter(const std::string& soName, const std::string& desc,
+                             size_t idx, uintptr_t funcAddr, uintptr_t base,
+                             const std::string& filter) {
+    if (filter.empty()) return false;
+    if (filter == "*" || filter == "all" || filter == "ALL") return true;
+
+    // 1. Check if filter has '@': "<libPart>@<offsetOrAddr>" or "@<offsetOrAddr>"
+    size_t atPos = filter.find('@');
+    if (atPos != std::string::npos) {
+        std::string libPart = filter.substr(0, atPos);
+        std::string targetPart = filter.substr(atPos + 1);
+
+        if (!libPart.empty() && libPart != "*" && soName.find(libPart) == std::string::npos) {
+            return false;
+        }
+
+        if (targetPart.empty() || targetPart == "*") return true;
+
+        uintptr_t targetVal = std::strtoull(targetPart.c_str(), nullptr, 16);
+        uintptr_t offset = (funcAddr >= base) ? (funcAddr - base) : funcAddr;
+
+        if (offset == targetVal || funcAddr == targetVal) {
+            return true;
+        }
+
+        char hexBuf[32];
+        snprintf(hexBuf, sizeof(hexBuf), "%" PRIxPTR, targetVal);
+        if (desc.find(hexBuf) != std::string::npos) {
+            return true;
+        }
+        return false;
+    }
+
+    // 2. Check if filter has colon: "<libPart>:<ctorPart>"
+    size_t colon = filter.find(':');
+    if (colon != std::string::npos) {
+        std::string libPart = filter.substr(0, colon);
+        std::string ctorPart = filter.substr(colon + 1);
+
+        if (!libPart.empty() && libPart != "*" && soName.find(libPart) == std::string::npos) {
+            return false;
+        }
+
+        if (ctorPart.empty() || ctorPart == "*") return true;
+
+        char* endPtr = nullptr;
+        long num = std::strtol(ctorPart.c_str(), &endPtr, 0);
+        if (endPtr && *endPtr == '\0') {
+            return (static_cast<long>(idx) == num || static_cast<long>(idx + 1) == num);
+        }
+
+        return (desc.find(ctorPart) != std::string::npos);
+    }
+
+    if (soName.find(filter) != std::string::npos) {
+        return true;
+    }
+
+    if (desc.find(filter) != std::string::npos) {
+        return true;
+    }
+
+    return false;
+}
 
 static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session);
 
@@ -852,6 +935,7 @@ static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session) {
             session->active_hook_id = 0;
             uint64_t now_ns = GetMonotonicTimeNs();
             size_t idx = session->current_index;
+            const std::string& currentDesc = session->ctors[idx].second;
 
             if (idx > 0 && session->step_start_ns > 0) {
                 double prev_ms = static_cast<double>(now_ns - session->step_start_ns) / 1000000.0;
@@ -870,7 +954,7 @@ static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session) {
             snprintf(enterBuf, sizeof(enterBuf),
                      "[%s] [%zu/%zu] -> calling %s @ 0x%" PRIx64,
                      session->soName.c_str(), idx + 1, session->ctors.size(),
-                     session->ctors[idx].second.c_str(), hwctx.pc);
+                     currentDesc.c_str(), hwctx.pc);
             HW_LOGI("[constructors] %s", enterBuf);
             BroadcastLog("constructors", enterBuf);
 
@@ -886,7 +970,7 @@ static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session) {
                     snprintf(hexFunc, sizeof(hexFunc), "0x%" PRIx64, hwctx.pc);
                     JS_SetPropertyStr(g_ctx, obj, "base", JS_NewString(g_ctx, hexBase));
                     JS_SetPropertyStr(g_ctx, obj, "func", JS_NewString(g_ctx, hexFunc));
-                    JS_SetPropertyStr(g_ctx, obj, "desc", JS_NewString(g_ctx, session->ctors[idx].second.c_str()));
+                    JS_SetPropertyStr(g_ctx, obj, "desc", JS_NewString(g_ctx, currentDesc.c_str()));
                     JS_SetPropertyStr(g_ctx, obj, "index", JS_NewInt32(g_ctx, static_cast<int32_t>(idx + 1)));
                     JS_SetPropertyStr(g_ctx, obj, "total", JS_NewInt32(g_ctx, static_cast<int32_t>(session->ctors.size())));
                     JS_SetPropertyStr(g_ctx, obj, "context", MakeHwContextObject(g_ctx, hwctx, HwHookType::BREAKPOINT));
@@ -899,6 +983,128 @@ static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session) {
                     JS_FreeValue(g_ctx, obj);
                 }
             }
+
+            bool doQbdi = false;
+            if (!bypass && !g_qbdiCtorFilter.empty() &&
+                MatchesQbdiFilter(session->soName, currentDesc, idx, session->ctors[idx].first, session->base, g_qbdiCtorFilter)) {
+                doQbdi = true;
+            }
+
+            if (doQbdi) {
+                char hdrBuf[512];
+                snprintf(hdrBuf, sizeof(hdrBuf),
+                         "[%s] [QBDI TRACE] Emulating constructor %s @ 0x%" PRIx64 " (budget: 500000, maxLog: %s)",
+                         session->soName.c_str(), currentDesc.c_str(), hwctx.pc,
+                         g_qbdiMaxLog == 0 ? "unlimited" : std::to_string(g_qbdiMaxLog).c_str());
+                HW_LOGI("[constructors] %s", hdrBuf);
+                BroadcastLog("constructors", hdrBuf);
+                BroadcastLog("trace", hdrBuf);
+
+                auto* engine = PI::Native::QBDIEngine::current();
+                engine->clearInstrumentedRanges();
+
+                auto ranges = ResolveModuleRangesByName(session->soName);
+                if (ranges.empty()) {
+                    ranges = ResolveModuleRangesByAddr(static_cast<uintptr_t>(hwctx.pc));
+                }
+                if (ranges.empty()) {
+                    engine->addInstrumentedRange(static_cast<uintptr_t>(hwctx.pc), static_cast<uintptr_t>(hwctx.pc) + (1u << 20));
+                } else {
+                    for (const auto& r : ranges) {
+                        engine->addInstrumentedRange(r.first, r.second);
+                    }
+                }
+
+                engine->setInstructionBudget(500000);
+
+                struct PendingTraceLine {
+                    uintptr_t pc = 0;
+                    std::string text;
+                    bool active = false;
+                };
+                auto pending = std::make_shared<PendingTraceLine>();
+
+                size_t loggedInsns = 0;
+                size_t maxLog = g_qbdiMaxLog;
+
+                engine->setInstructionCallback([pending, maxLog, &loggedInsns](
+                        uintptr_t pc, const char* mnem, const char* disasm, int /*depth*/, void* /*rawGpr*/) -> int {
+                    if (maxLog == 0 || loggedInsns < maxLog) {
+                        if (pending->active) {
+                            HW_LOGI("%s", pending->text.c_str());
+                            BroadcastLog("trace", pending->text);
+                            pending->active = false;
+                        }
+
+                        char logLine[256];
+                        snprintf(logLine, sizeof(logLine), "  [QBDI] 0x%" PRIxPTR ": %-8s %-28s",
+                                 pc, mnem ? mnem : "", disasm ? disasm : "");
+                        pending->pc = pc;
+                        pending->text = logLine;
+                        pending->active = true;
+
+                        loggedInsns++;
+                        if (maxLog > 0 && loggedInsns == maxLog) {
+                            BroadcastLog("trace", "  [QBDI] ... (trace logging limit reached, continuing emulation. Use --log for full trace)");
+                        }
+                    }
+                    return 0; // CONTINUE
+                });
+
+                engine->setPostInstructionCallback([pending](uintptr_t pc, void* preGpr, void* postGpr) {
+                    if (pending->active && pending->pc == pc) {
+                        std::string diff = FormatGprDiff(
+                            reinterpret_cast<const QBDI::GPRState*>(preGpr),
+                            reinterpret_cast<const QBDI::GPRState*>(postGpr));
+                        std::string fullLine = pending->text;
+                        if (!diff.empty()) {
+                            fullLine += " ; " + diff;
+                        }
+                        HW_LOGI("%s", fullLine.c_str());
+                        BroadcastLog("trace", fullLine);
+                        pending->active = false;
+                    }
+                });
+
+                std::vector<uint64_t> gprs;
+                for (int i = 0; i < 8; i++) {
+                    gprs.push_back(hwctx.x[i]);
+                }
+                std::vector<double> fprs;
+
+                uint64_t qbdi_start_ns = GetMonotonicTimeNs();
+                PI::Native::NativeRunResult rr = engine->run(reinterpret_cast<void*>(hwctx.pc), gprs, fprs);
+                uint64_t qbdi_end_ns = GetMonotonicTimeNs();
+                double qbdi_ms = static_cast<double>(qbdi_end_ns - qbdi_start_ns) / 1000000.0;
+
+                if (pending->active) {
+                    HW_LOGI("%s", pending->text.c_str());
+                    BroadcastLog("trace", pending->text);
+                    pending->active = false;
+                }
+                engine->clearCallbacks();
+
+                const char* statusStr = "EXECUTION_ERROR";
+                switch (rr.status) {
+                    case PI::Native::NativeRunResult::OK: statusStr = "OK"; break;
+                    case PI::Native::NativeRunResult::MAX_INSTRUCTIONS_REACHED: statusStr = "MAX_INSTRUCTIONS_REACHED"; break;
+                    case PI::Native::NativeRunResult::CRASH_PROTECTED: statusStr = "CRASH_PROTECTED"; break;
+                    default: statusStr = "EXECUTION_ERROR"; break;
+                }
+
+                char resBuf[512];
+                snprintf(resBuf, sizeof(resBuf),
+                         "[%s] [QBDI TRACE] %s finished: status=%s, insns=%" PRIu64 ", ret=0x%" PRIx64 ", time=%.2f ms",
+                         session->soName.c_str(), currentDesc.c_str(), statusStr, rr.instructionsExecuted, rr.gprResult, qbdi_ms);
+                HW_LOGI("[constructors] %s", resBuf);
+                BroadcastLog("constructors", resBuf);
+                BroadcastLog("trace", resBuf);
+
+                bypass = true;
+                hwctx.pc = hwctx.lr;
+                hwctx.setRet(rr.gprResult);
+            }
+
             if (bypass) {
                 hwctx.pc = hwctx.lr;
             }
@@ -908,8 +1114,35 @@ static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session) {
             if (session->current_index < session->ctors.size()) {
                 ArmNextCtor(session);
             } else {
-                session->pending_ret_addr = static_cast<uintptr_t>(hwctx.lr) & ~static_cast<uintptr_t>(1);
-                ArmNextCtor(session);
+                if (bypass) {
+                    uint64_t end_ns = GetMonotonicTimeNs();
+                    double last_ms = static_cast<double>(end_ns - session->step_start_ns) / 1000000.0;
+                    double total_ms = static_cast<double>(end_ns - session->total_start_ns) / 1000000.0;
+                    char finishBuf[512];
+                    snprintf(finishBuf, sizeof(finishBuf),
+                             "[%s] [%zu/%zu] <- %s finished in %.2f ms (all done, total: %.2f ms)",
+                             session->soName.c_str(), session->ctors.size(), session->ctors.size(),
+                             session->ctors.back().second.c_str(), last_ms, total_ms);
+                    HW_LOGI("[constructors] %s", finishBuf);
+                    BroadcastLog("constructors", finishBuf);
+
+                    std::shared_ptr<CtorRelaySession> parentToResume = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lk(g_ctorMutex);
+                        if (!g_ctorStack.empty() && g_ctorStack.back() == session) {
+                            g_ctorStack.pop_back();
+                        }
+                        if (!g_ctorStack.empty()) {
+                            parentToResume = g_ctorStack.back();
+                        }
+                    }
+                    if (parentToResume) {
+                        ArmNextCtor(parentToResume);
+                    }
+                } else {
+                    session->pending_ret_addr = static_cast<uintptr_t>(hwctx.lr) & ~static_cast<uintptr_t>(1);
+                    ArmNextCtor(session);
+                }
             }
         };
 
@@ -1188,6 +1421,42 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
             if (!JS_IsUndefined(ctVal)) constructors = JS_ToBool(ctx, ctVal);
             JS_FreeValue(ctx, ctVal);
 
+            JSValue qVal = JS_GetPropertyStr(ctx, argv[0], "qbdi");
+            if (JS_IsString(qVal)) {
+                const char* s = JS_ToCString(ctx, qVal);
+                if (s) { g_qbdiCtorFilter = s; JS_FreeCString(ctx, s); }
+                constructors = true;
+            }
+            JS_FreeValue(ctx, qVal);
+
+            JSValue tiVal = JS_GetPropertyStr(ctx, argv[0], "traceInit");
+            if (JS_IsString(tiVal)) {
+                const char* s = JS_ToCString(ctx, tiVal);
+                if (s) { g_qbdiCtorFilter = s; JS_FreeCString(ctx, s); }
+                constructors = true;
+            }
+            JS_FreeValue(ctx, tiVal);
+
+            JSValue mlVal = JS_GetPropertyStr(ctx, argv[0], "maxLog");
+            if (JS_IsNumber(mlVal)) {
+                int64_t v = 0;
+                JS_ToInt64(ctx, &v, mlVal);
+                g_qbdiMaxLog = (v >= 0) ? static_cast<size_t>(v) : 0;
+            }
+            JS_FreeValue(ctx, mlVal);
+
+            JSValue flVal = JS_GetPropertyStr(ctx, argv[0], "log");
+            if (!JS_IsUndefined(flVal) && JS_ToBool(ctx, flVal)) {
+                g_qbdiMaxLog = 0;
+            }
+            JS_FreeValue(ctx, flVal);
+
+            JSValue flVal2 = JS_GetPropertyStr(ctx, argv[0], "fullLog");
+            if (!JS_IsUndefined(flVal2) && JS_ToBool(ctx, flVal2)) {
+                g_qbdiMaxLog = 0;
+            }
+            JS_FreeValue(ctx, flVal2);
+
             JSValue cVal = JS_GetPropertyStr(ctx, argv[0], "onLoading");
             if (JS_IsFunction(ctx, cVal)) jsCbLoading = cVal; else JS_FreeValue(ctx, cVal);
 
@@ -1386,6 +1655,8 @@ size_t HwHookDetachAll() {
     {
         std::lock_guard<std::mutex> lk(g_ctorMutex);
         g_ctorStack.clear();
+        g_qbdiCtorFilter.clear();
+        g_qbdiMaxLog = 100;
     }
     {
         std::lock_guard<std::mutex> lk(g_ctorJsMutex);
@@ -1416,6 +1687,7 @@ size_t HwHookDetachAll() {
 std::vector<HwHookInfo> HwHookListAll() {
     std::vector<HwHookInfo> res;
     for (const auto& s : HwHookManager::instance().listSessions()) {
+        if (!s.active) continue;
         std::string typeStr = (s.config.type == HwHookType::BREAKPOINT) ? "BREAKPOINT" : "WATCHPOINT";
         std::string condStr = "";
         if (s.config.type == HwHookType::WATCHPOINT) {
@@ -1482,7 +1754,12 @@ void HwHookRefreshCapacity() {
     HwHookManager::instance().refreshCapacity();
 }
 
-bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog, bool constructors) {
+bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog, bool constructors, const std::string& qbdiFilter, size_t qbdiMaxLog) {
+    if (!qbdiFilter.empty()) {
+        g_qbdiCtorFilter = qbdiFilter;
+        g_qbdiMaxLog = qbdiMaxLog;
+        constructors = true;
+    }
     if (g_dlopenMonitorActive) {
         // Early boot may have raced with the injector's ptrace attachment.
         HwHookManager::instance().rearmMissingThreads();

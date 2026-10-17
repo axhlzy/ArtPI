@@ -37,6 +37,9 @@ namespace {
         std::string stopLib;
         bool libLog = false;
         bool libConstructors = false;
+        std::string qbdiFilter;
+        bool fullLog = false;
+        size_t maxLog = 100;
     };
 
     void Usage(const char *argv0) {
@@ -52,7 +55,15 @@ namespace {
             "  -W, --wait <name>    Wait for a new process matching <name> (e.g. dex2oat), inject & pause\n"
             "  --pause              Keep target main thread paused after injection until 'resume' is entered\n"
             "  -L, --lib-log        Log all libraries loaded via dlopen (hardware breakpoint based)\n"
-            "  -LC, --lib-constructors  Log dlopen & relay-trace each constructor with execution timing\n"
+            "  -LC, --lib-constructors [<filter>]  Log dlopen & relay-trace constructors with timing.\n"
+            "                       Optional <filter>:\n"
+            "                         -LC libfoo.so          (trace all constructors in libfoo.so)\n"
+            "                         -LC libfoo.so:0        (trace constructor index 0)\n"
+            "                         -LC libfoo.so:DT_INIT  (trace DT_INIT)\n"
+            "                         -LC libfoo.so@0x475bc  (trace constructor at offset 0x475bc)\n"
+            "  --trace-init <filter> Alias for -LC <filter> (QBDI constructor trace)\n"
+            "  --log, --full-log    Full instruction trace log (do not truncate at limit)\n"
+            "  --max-log <N>        Maximum instruction log count (default: 100, 0 = unlimited)\n"
             "  --stop-lib <name>    Pause main thread when library matching <name> is loaded via dlopen\n"
             "  -t, --top            Attach to the foreground (top Activity) app\n"
             "  --no-ptrace          Inject via /proc/<pid>/mem without ptrace (auto-enabled if TracerPid != 0)\n"
@@ -361,6 +372,28 @@ int main(int argc, char **argv) {
         else if (a == "-LC" || a == "--lib-constructors" || a == "--init-array") {
             opt.libLog = true;
             opt.libConstructors = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                opt.qbdiFilter = argv[++i];
+            }
+        }
+        else if (a.rfind("-LC=", 0) == 0) {
+            opt.libLog = true;
+            opt.libConstructors = true;
+            opt.qbdiFilter = a.substr(4);
+        }
+        else if (a == "--trace-init" || a == "--qbdi-init") {
+            opt.libLog = true;
+            opt.libConstructors = true;
+            opt.qbdiFilter = needValue(a.c_str());
+        }
+        else if (a == "--log" || a == "--full-log" || a == "--trace-all") {
+            opt.fullLog = true;
+            opt.maxLog = 0;
+        }
+        else if (a == "--max-log") {
+            std::string val = needValue("--max-log");
+            opt.maxLog = std::strtoul(val.c_str(), nullptr, 0);
+            if (opt.maxLog == 0) opt.fullLog = true;
         }
         else if (a == "-C") {
             opt.libConstructors = true;
@@ -476,10 +509,12 @@ int main(int argc, char **argv) {
                     // autoResume lets the agent release the gated main thread by
                     // itself once the early monitor is armed (covers --server and
                     // a client that fails to connect).
-                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\nautoResume=%d\nctors=%d\n",
+                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\nautoResume=%d\nctors=%d\nqbdiFilter=%s\nqbdiMaxLog=%zu\n",
                              opt.libLog ? 1 : 0, opt.stopLib.c_str(),
                              ShouldAutoGateSpawn(opt) ? 1 : 0,
-                             opt.libConstructors ? 1 : 0);
+                             opt.libConstructors ? 1 : 0,
+                             opt.qbdiFilter.c_str(),
+                             opt.fullLog ? 0 : opt.maxLog);
                     write(fd, buf, strlen(buf));
                     close(fd);
                     struct stat dirSt{};

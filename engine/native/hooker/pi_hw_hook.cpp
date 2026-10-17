@@ -450,7 +450,9 @@ std::vector<HwHookSession> HwHookManager::listSessions() const {
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     std::vector<HwHookSession> list;
     for (auto& s : sessions_) {
-        list.push_back(*s);
+        if (s->active) {
+            list.push_back(*s);
+        }
     }
     return list;
 }
@@ -606,6 +608,12 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
         }
         matched_session->active = false;
         mgr.freeSlot(once_type, once_slot);
+        for (auto it = mgr.sessions_.begin(); it != mgr.sessions_.end(); ++it) {
+            if (it->get() == matched_session.get()) {
+                mgr.sessions_.erase(it);
+                break;
+            }
+        }
     }
 
     // 4. Invoke user callback WITHOUT the manager lock: callbacks may block for

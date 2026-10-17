@@ -60,6 +60,15 @@ static void ResolveLinkerSymbols() {
     xdl_close(handle);
 }
 
+struct ElfFuncEntry {
+    uintptr_t func = 0;
+    std::string tag;        // e.g. "DT_INIT", "DT_INIT_ARRAY[0] (+0x475bc)", "DT_FINI", etc.
+    std::string type;       // "DT_INIT", "DT_INIT_ARRAY", "DT_PREINIT_ARRAY", "DT_FINI", "DT_FINI_ARRAY"
+    std::string symbol;     // symbol name if resolved via xdl_addr, otherwise empty
+    std::string desc;       // e.g. "DT_INIT (custom_dt_init)" or "DT_INIT"
+    uintptr_t offset = 0;
+};
+
 struct ParsedElfInfo {
     std::string soName;
     uintptr_t base = 0;
@@ -69,10 +78,15 @@ struct ParsedElfInfo {
     size_t phnum = 0;
     const void* dynamic = nullptr;
     uintptr_t strtab = 0;
+    size_t strtab_size = 0;
     uintptr_t symtab = 0;
     size_t syment_size = 0;
-    size_t strtab_size = 0;
-    std::vector<std::pair<uintptr_t, std::string>> ctors;
+    size_t symtab_count = 0;
+
+    std::vector<std::string> needed;
+    std::vector<ElfFuncEntry> ctors;
+    std::vector<ElfFuncEntry> preinit;
+    std::vector<ElfFuncEntry> dtors;
 };
 
 static bool ParseElfFromBase(uintptr_t base, ParsedElfInfo& out) {
@@ -126,9 +140,15 @@ static bool ParseElfFromBase(uintptr_t base, ParsedElfInfo& out) {
     out.dynamic = dynamic;
 
     uintptr_t soname_idx = 0;
+    std::vector<uintptr_t> needed_offsets;
     uintptr_t init_func = 0;
     uintptr_t init_array = 0;
     size_t init_array_sz = 0;
+    uintptr_t preinit_array = 0;
+    size_t preinit_array_sz = 0;
+    uintptr_t fini_func = 0;
+    uintptr_t fini_array = 0;
+    size_t fini_array_sz = 0;
 
     for (const ElfW(Dyn)* d = dynamic; ; d++) {
         if (!gum_memory_is_readable(d, sizeof(ElfW(Dyn)))) break;
@@ -149,6 +169,9 @@ static bool ParseElfFromBase(uintptr_t base, ParsedElfInfo& out) {
             case DT_SONAME:
                 soname_idx = d->d_un.d_val;
                 break;
+            case DT_NEEDED:
+                needed_offsets.push_back(d->d_un.d_val);
+                break;
             case DT_INIT:
                 init_func = (d->d_un.d_ptr < base) ? (load_bias + d->d_un.d_ptr) : d->d_un.d_ptr;
                 break;
@@ -157,6 +180,21 @@ static bool ParseElfFromBase(uintptr_t base, ParsedElfInfo& out) {
                 break;
             case DT_INIT_ARRAYSZ:
                 init_array_sz = d->d_un.d_val;
+                break;
+            case DT_PREINIT_ARRAY:
+                preinit_array = (d->d_un.d_ptr < base) ? (load_bias + d->d_un.d_ptr) : d->d_un.d_ptr;
+                break;
+            case DT_PREINIT_ARRAYSZ:
+                preinit_array_sz = d->d_un.d_val;
+                break;
+            case DT_FINI:
+                fini_func = (d->d_un.d_ptr < base) ? (load_bias + d->d_un.d_ptr) : d->d_un.d_ptr;
+                break;
+            case DT_FINI_ARRAY:
+                fini_array = (d->d_un.d_ptr < base) ? (load_bias + d->d_un.d_ptr) : d->d_un.d_ptr;
+                break;
+            case DT_FINI_ARRAYSZ:
+                fini_array_sz = d->d_un.d_val;
                 break;
         }
     }
@@ -172,9 +210,30 @@ static bool ParseElfFromBase(uintptr_t base, ParsedElfInfo& out) {
         }
     }
 
-    if (init_func && init_func != static_cast<uintptr_t>(-1)) {
-        out.ctors.push_back({ init_func, "DT_INIT" });
+    // Resolve needed shared libraries
+    for (uintptr_t off : needed_offsets) {
+        if (out.strtab && (off < out.strtab_size || out.strtab_size == 0) &&
+            gum_memory_is_readable(reinterpret_cast<const void*>(out.strtab + off), 1)) {
+            out.needed.push_back(reinterpret_cast<const char*>(out.strtab + off));
+        }
     }
+
+    // Compute symtab count if possible
+    if (out.symtab && out.syment_size > 0 && out.strtab > out.symtab) {
+        out.symtab_count = (out.strtab - out.symtab) / out.syment_size;
+    }
+
+    // Collect DT_INIT
+    if (init_func && init_func != static_cast<uintptr_t>(-1)) {
+        ElfFuncEntry entry;
+        entry.func = init_func;
+        entry.offset = (init_func >= base) ? (init_func - base) : init_func;
+        entry.type = "DT_INIT";
+        entry.tag = "DT_INIT";
+        out.ctors.push_back(entry);
+    }
+
+    // Collect DT_INIT_ARRAY
     if (init_array && init_array_sz > 0) {
         size_t count = init_array_sz / sizeof(void*);
         if (gum_memory_is_readable(reinterpret_cast<const void*>(init_array), init_array_sz)) {
@@ -182,14 +241,96 @@ static bool ParseElfFromBase(uintptr_t base, ParsedElfInfo& out) {
             for (size_t i = 0; i < count; i++) {
                 uintptr_t fn = arr[i];
                 if (fn != 0 && fn != static_cast<uintptr_t>(-1)) {
+                    ElfFuncEntry entry;
+                    entry.func = fn;
+                    entry.offset = (fn >= base) ? (fn - base) : fn;
+                    entry.type = "DT_INIT_ARRAY";
                     char desc[64];
-                    uintptr_t offset = (fn >= base) ? (fn - base) : fn;
-                    snprintf(desc, sizeof(desc), "DT_INIT_ARRAY[%zu] (+0x%" PRIxPTR ")", i, offset);
-                    out.ctors.push_back({ fn, desc });
+                    snprintf(desc, sizeof(desc), "DT_INIT_ARRAY[%zu] (+0x%" PRIxPTR ")", i, entry.offset);
+                    entry.tag = desc;
+                    out.ctors.push_back(entry);
                 }
             }
         }
     }
+
+    // Collect DT_PREINIT_ARRAY
+    if (preinit_array && preinit_array_sz > 0) {
+        size_t count = preinit_array_sz / sizeof(void*);
+        if (gum_memory_is_readable(reinterpret_cast<const void*>(preinit_array), preinit_array_sz)) {
+            const uintptr_t* arr = reinterpret_cast<const uintptr_t*>(preinit_array);
+            for (size_t i = 0; i < count; i++) {
+                uintptr_t fn = arr[i];
+                if (fn != 0 && fn != static_cast<uintptr_t>(-1)) {
+                    ElfFuncEntry entry;
+                    entry.func = fn;
+                    entry.offset = (fn >= base) ? (fn - base) : fn;
+                    entry.type = "DT_PREINIT_ARRAY";
+                    char desc[64];
+                    snprintf(desc, sizeof(desc), "DT_PREINIT_ARRAY[%zu] (+0x%" PRIxPTR ")", i, entry.offset);
+                    entry.tag = desc;
+                    out.preinit.push_back(entry);
+                }
+            }
+        }
+    }
+
+    // Collect DT_FINI
+    if (fini_func && fini_func != static_cast<uintptr_t>(-1)) {
+        ElfFuncEntry entry;
+        entry.func = fini_func;
+        entry.offset = (fini_func >= base) ? (fini_func - base) : fini_func;
+        entry.type = "DT_FINI";
+        entry.tag = "DT_FINI";
+        out.dtors.push_back(entry);
+    }
+
+    // Collect DT_FINI_ARRAY
+    if (fini_array && fini_array_sz > 0) {
+        size_t count = fini_array_sz / sizeof(void*);
+        if (gum_memory_is_readable(reinterpret_cast<const void*>(fini_array), fini_array_sz)) {
+            const uintptr_t* arr = reinterpret_cast<const uintptr_t*>(fini_array);
+            for (size_t i = 0; i < count; i++) {
+                uintptr_t fn = arr[i];
+                if (fn != 0 && fn != static_cast<uintptr_t>(-1)) {
+                    ElfFuncEntry entry;
+                    entry.func = fn;
+                    entry.offset = (fn >= base) ? (fn - base) : fn;
+                    entry.type = "DT_FINI_ARRAY";
+                    char desc[64];
+                    snprintf(desc, sizeof(desc), "DT_FINI_ARRAY[%zu] (+0x%" PRIxPTR ")", i, entry.offset);
+                    entry.tag = desc;
+                    out.dtors.push_back(entry);
+                }
+            }
+        }
+    }
+
+    // Resolve symbols via xdl_addr
+    void* xdlCache = nullptr;
+    auto resolveAndFill = [&xdlCache](ElfFuncEntry& e) {
+        if (e.func < 0x1000) return;
+        xdl_info_t dli{};
+        if (xdl_addr(reinterpret_cast<void*>(e.func), &dli, &xdlCache) != 0) {
+            if (dli.dli_sname && dli.dli_sname[0] != '\0') {
+                e.symbol = dli.dli_sname;
+            }
+        }
+        if (!e.symbol.empty()) {
+            e.desc = e.tag + " (" + e.symbol + ")";
+        } else {
+            e.desc = e.tag;
+        }
+    };
+
+    for (auto& c : out.ctors) resolveAndFill(c);
+    for (auto& p : out.preinit) resolveAndFill(p);
+    for (auto& d : out.dtors) resolveAndFill(d);
+
+    if (xdlCache) {
+        xdl_addr_clean(&xdlCache);
+    }
+
     return true;
 }
 
@@ -273,22 +414,51 @@ static JSValue MakeSoinfoJsObject(JSContext* ctx, uintptr_t soinfo_ptr, uintptr_
     snprintf(hex, sizeof(hex), "0x%" PRIxPTR, next);
     JS_SetPropertyStr(ctx, obj, "next", JS_NewString(ctx, hex));
 
-    // Constructors array
-    JSValue ctorsArr = JS_NewArray(ctx);
-    uint32_t cidx = 0;
-    for (const auto& c : elf.ctors) {
-        JSValue cObj = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, cObj, "desc", JS_NewString(ctx, c.second.c_str()));
-        snprintf(hex, sizeof(hex), "0x%" PRIxPTR, c.first);
-        JS_SetPropertyStr(ctx, cObj, "address", JS_NewString(ctx, hex));
-        JS_SetPropertyStr(ctx, cObj, "func", JS_NewString(ctx, hex));
-        uintptr_t offset = (c.first >= base) ? (c.first - base) : c.first;
-        snprintf(hex, sizeof(hex), "0x%" PRIxPTR, offset);
-        JS_SetPropertyStr(ctx, cObj, "offset", JS_NewString(ctx, hex));
-        JS_SetPropertyStr(ctx, cObj, "type", JS_NewString(ctx, c.second.find("INIT_ARRAY") != std::string::npos ? "DT_INIT_ARRAY" : "DT_INIT"));
-        JS_SetPropertyUint32(ctx, ctorsArr, cidx++, cObj);
+    auto makeFuncListJsArray = [ctx](const std::vector<ElfFuncEntry>& list) -> JSValue {
+        JSValue arr = JS_NewArray(ctx);
+        uint32_t idx = 0;
+        char hexBuf[32];
+        for (const auto& item : list) {
+            JSValue itemObj = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, itemObj, "desc", JS_NewString(ctx, item.desc.c_str()));
+            JS_SetPropertyStr(ctx, itemObj, "tag", JS_NewString(ctx, item.tag.c_str()));
+            JS_SetPropertyStr(ctx, itemObj, "type", JS_NewString(ctx, item.type.c_str()));
+            JS_SetPropertyStr(ctx, itemObj, "symbol", JS_NewString(ctx, item.symbol.c_str()));
+            snprintf(hexBuf, sizeof(hexBuf), "0x%" PRIxPTR, item.func);
+            JS_SetPropertyStr(ctx, itemObj, "address", JS_NewString(ctx, hexBuf));
+            JS_SetPropertyStr(ctx, itemObj, "func", JS_NewString(ctx, hexBuf));
+            snprintf(hexBuf, sizeof(hexBuf), "0x%" PRIxPTR, item.offset);
+            JS_SetPropertyStr(ctx, itemObj, "offset", JS_NewString(ctx, hexBuf));
+            JS_SetPropertyUint32(ctx, arr, idx++, itemObj);
+        }
+        return arr;
+    };
+
+    JS_SetPropertyStr(ctx, obj, "constructors", makeFuncListJsArray(elf.ctors));
+    JS_SetPropertyStr(ctx, obj, "destructors", makeFuncListJsArray(elf.dtors));
+    if (!elf.preinit.empty()) {
+        JS_SetPropertyStr(ctx, obj, "preinit", makeFuncListJsArray(elf.preinit));
     }
-    JS_SetPropertyStr(ctx, obj, "constructors", ctorsArr);
+
+    // needed dependencies
+    JSValue neededArr = JS_NewArray(ctx);
+    for (uint32_t i = 0; i < elf.needed.size(); i++) {
+        JS_SetPropertyUint32(ctx, neededArr, i, JS_NewString(ctx, elf.needed[i].c_str()));
+    }
+    JS_SetPropertyStr(ctx, obj, "needed", neededArr);
+    JS_SetPropertyStr(ctx, obj, "dependencies", JS_DupValue(ctx, neededArr));
+
+    if (elf.strtab) {
+        snprintf(hex, sizeof(hex), "0x%" PRIxPTR, elf.strtab);
+        JS_SetPropertyStr(ctx, obj, "strtab", JS_NewString(ctx, hex));
+        JS_SetPropertyStr(ctx, obj, "strtabSize", JS_NewInt64(ctx, static_cast<int64_t>(elf.strtab_size)));
+    }
+    if (elf.symtab) {
+        snprintf(hex, sizeof(hex), "0x%" PRIxPTR, elf.symtab);
+        JS_SetPropertyStr(ctx, obj, "symtab", JS_NewString(ctx, hex));
+        JS_SetPropertyStr(ctx, obj, "symentSize", JS_NewInt64(ctx, static_cast<int64_t>(elf.syment_size)));
+        JS_SetPropertyStr(ctx, obj, "symtabCount", JS_NewInt64(ctx, static_cast<int64_t>(elf.symtab_count)));
+    }
 
     // dump() method
     std::string dumpStr;
@@ -297,14 +467,45 @@ static JSValue MakeSoinfoJsObject(JSContext* ctx, uintptr_t soinfo_ptr, uintptr_
         ss << "[soinfo @ " << (void*)soinfo_ptr << "] " << elf.soName << "\n"
            << "  base     : 0x" << std::hex << base << " (size: 0x" << elf.size << ", bias: 0x" << elf.load_bias << ")\n"
            << "  phdr     : " << elf.phdr << " (phnum: " << std::dec << elf.phnum << ")\n"
-           << "  dynamic  : " << elf.dynamic << "\n"
-           << "  constructors: " << elf.ctors.size() << " found\n";
+           << "  dynamic  : " << elf.dynamic << "\n";
+        if (elf.strtab) {
+            ss << "  strtab   : 0x" << std::hex << elf.strtab << " (size: 0x" << elf.strtab_size << ")\n";
+        }
+        if (elf.symtab) {
+            ss << "  symtab   : 0x" << std::hex << elf.symtab;
+            if (elf.symtab_count > 0) {
+                ss << " (count: " << std::dec << elf.symtab_count << ", syment: " << elf.syment_size << ")";
+            }
+            ss << "\n";
+        }
+        if (!elf.needed.empty()) {
+            ss << "  needed   : ";
+            for (size_t i = 0; i < elf.needed.size(); i++) {
+                if (i > 0) ss << ", ";
+                ss << elf.needed[i];
+            }
+            ss << "\n";
+        }
+        if (!elf.preinit.empty()) {
+            ss << "  preinit  : " << std::dec << elf.preinit.size() << " found\n";
+            for (size_t i = 0; i < elf.preinit.size(); i++) {
+                ss << "    [" << std::dec << i << "]\t" << elf.preinit[i].desc << " @ 0x" << std::hex << elf.preinit[i].func << "\n";
+            }
+        }
+        ss << "  constructors: " << std::dec << elf.ctors.size() << " found\n";
         for (size_t i = 0; i < elf.ctors.size(); i++) {
-            ss << "    [" << i << "] " << elf.ctors[i].second << " @ 0x" << std::hex << elf.ctors[i].first << "\n";
+            ss << "    [" << std::dec << i << "]\t" << elf.ctors[i].desc << " @ 0x" << std::hex << elf.ctors[i].func << "\n";
+        }
+        ss << "  destructors : " << std::dec << elf.dtors.size() << " found\n";
+        for (size_t i = 0; i < elf.dtors.size(); i++) {
+            ss << "    [" << std::dec << i << "]\t" << elf.dtors[i].desc << " @ 0x" << std::hex << elf.dtors[i].func << "\n";
         }
         dumpStr = ss.str();
     }
     JS_SetPropertyStr(ctx, obj, "dumpText", JS_NewString(ctx, dumpStr.c_str()));
+    JS_SetPropertyStr(ctx, obj, "toString", JS_NewCFunction(ctx, [](JSContext* c, JSValueConst this_val, int, JSValueConst*) -> JSValue {
+        return JS_GetPropertyStr(c, this_val, "dumpText");
+    }, "toString", 0));
 
     return obj;
 }
@@ -501,6 +702,123 @@ static JSValue JsLinkerGetConstructors(JSContext* ctx, JSValueConst /*this_val*/
     return res;
 }
 
+// Linker.getDestructors(nameOrAddr) / linker.getDestructors(...)
+static JSValue JsLinkerGetDestructors(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "Usage: Linker.getDestructors(soNameOrAddr)");
+    }
+    JSValue info = JsLinkerFind(ctx, JS_UNDEFINED, argc, argv);
+    if (JS_IsNull(info) || !JS_IsObject(info)) {
+        return JS_NULL;
+    }
+    JSValue dtors = JS_GetPropertyStr(ctx, info, "destructors");
+    JSValue res = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, res, "name", JS_GetPropertyStr(ctx, info, "name"));
+    JS_SetPropertyStr(ctx, res, "base", JS_GetPropertyStr(ctx, info, "base"));
+    JS_SetPropertyStr(ctx, res, "destructors", dtors);
+    JS_FreeValue(ctx, info);
+    return res;
+}
+
+// Linker.symbols(nameOrAddr, maxCount) / linker.symbols(...)
+static JSValue JsLinkerSymbols(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "Usage: Linker.symbols(soNameOrAddr, [maxCount])");
+    }
+    JSValue info = JsLinkerFind(ctx, JS_UNDEFINED, 1, argv);
+    if (JS_IsNull(info) || !JS_IsObject(info)) {
+        return JS_NULL;
+    }
+
+    JSValue symtabVal = JS_GetPropertyStr(ctx, info, "symtab");
+    const char* symtabStr = JS_ToCString(ctx, symtabVal);
+    uintptr_t symtab = symtabStr ? std::strtoull(symtabStr, nullptr, 0) : 0;
+    if (symtabStr) JS_FreeCString(ctx, symtabStr);
+    JS_FreeValue(ctx, symtabVal);
+
+    JSValue strtabVal = JS_GetPropertyStr(ctx, info, "strtab");
+    const char* strtabStr = JS_ToCString(ctx, strtabVal);
+    uintptr_t strtab = strtabStr ? std::strtoull(strtabStr, nullptr, 0) : 0;
+    if (strtabStr) JS_FreeCString(ctx, strtabStr);
+    JS_FreeValue(ctx, strtabVal);
+
+    JSValue strtabSzVal = JS_GetPropertyStr(ctx, info, "strtabSize");
+    int64_t strtabSize = 0;
+    JS_ToInt64(ctx, &strtabSize, strtabSzVal);
+    JS_FreeValue(ctx, strtabSzVal);
+
+    JSValue symentSzVal = JS_GetPropertyStr(ctx, info, "symentSize");
+    int64_t symentSize = sizeof(ElfW(Sym));
+    if (JS_IsNumber(symentSzVal)) {
+        JS_ToInt64(ctx, &symentSize, symentSzVal);
+    }
+    JS_FreeValue(ctx, symentSzVal);
+
+    JSValue baseVal = JS_GetPropertyStr(ctx, info, "base");
+    const char* baseStr = JS_ToCString(ctx, baseVal);
+    uintptr_t base = baseStr ? std::strtoull(baseStr, nullptr, 0) : 0;
+    if (baseStr) JS_FreeCString(ctx, baseStr);
+    JS_FreeValue(ctx, baseVal);
+
+    JS_FreeValue(ctx, info);
+
+    if (!symtab || !strtab || symentSize <= 0) {
+        return JS_NewArray(ctx);
+    }
+
+    size_t limit = 100;
+    if (argc >= 2) {
+        int32_t userLimit = 0;
+        JS_ToInt32(ctx, &userLimit, argv[1]);
+        if (userLimit > 0) limit = static_cast<size_t>(userLimit);
+        else if (userLimit < 0) limit = 1000000;
+    }
+
+    size_t totalSymbols = (strtab > symtab) ? (strtab - symtab) / symentSize : 0;
+    if (limit > totalSymbols && totalSymbols > 0) limit = totalSymbols;
+
+    JSValue arr = JS_NewArray(ctx);
+    const ElfW(Sym)* syms = reinterpret_cast<const ElfW(Sym)*>(symtab);
+    char hex[32];
+
+    for (size_t i = 0; i < limit; i++) {
+        if (!gum_memory_is_readable(&syms[i], sizeof(ElfW(Sym)))) break;
+        const ElfW(Sym)& s = syms[i];
+        const char* name = "";
+        if (s.st_name < static_cast<size_t>(strtabSize) &&
+            gum_memory_is_readable(reinterpret_cast<const void*>(strtab + s.st_name), 1)) {
+            name = reinterpret_cast<const char*>(strtab + s.st_name);
+        }
+
+        unsigned char bind = ELF_ST_BIND(s.st_info);
+        unsigned char type = ELF_ST_TYPE(s.st_info);
+        const char* bindStr = (bind == STB_LOCAL) ? "LOCAL" :
+                              (bind == STB_GLOBAL) ? "GLOBAL" :
+                              (bind == STB_WEAK) ? "WEAK" : "OTHER";
+        const char* typeStr = (type == STT_NOTYPE) ? "NOTYPE" :
+                              (type == STT_OBJECT) ? "OBJECT" :
+                              (type == STT_FUNC) ? "FUNC" :
+                              (type == STT_SECTION) ? "SECTION" :
+                              (type == STT_FILE) ? "FILE" : "OTHER";
+
+        JSValue item = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, item, "index", JS_NewInt32(ctx, static_cast<int32_t>(i)));
+        JS_SetPropertyStr(ctx, item, "name", JS_NewString(ctx, name));
+        snprintf(hex, sizeof(hex), "0x%" PRIxPTR, static_cast<uintptr_t>(s.st_value));
+        JS_SetPropertyStr(ctx, item, "value", JS_NewString(ctx, hex));
+        uintptr_t addr = s.st_value ? (base + s.st_value) : 0;
+        snprintf(hex, sizeof(hex), "0x%" PRIxPTR, addr);
+        JS_SetPropertyStr(ctx, item, "address", JS_NewString(ctx, hex));
+        JS_SetPropertyStr(ctx, item, "size", JS_NewInt64(ctx, static_cast<int64_t>(s.st_size)));
+        JS_SetPropertyStr(ctx, item, "bind", JS_NewString(ctx, bindStr));
+        JS_SetPropertyStr(ctx, item, "type", JS_NewString(ctx, typeStr));
+
+        JS_SetPropertyUint32(ctx, arr, static_cast<uint32_t>(i), item);
+    }
+
+    return arr;
+}
+
 // Linker.load(libName) / linker.load(...)
 static JSValue JsLinkerLoad(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 1 || !JS_IsString(argv[0])) {
@@ -561,6 +879,9 @@ static void PopulateLinkerObject(JSContext* ctx, JSValue obj) {
     JS_SetPropertyStr(ctx, obj, "findSoinfo", JS_NewCFunction(ctx, JsLinkerFind, "findSoinfo", 1));
     JS_SetPropertyStr(ctx, obj, "linkMap", JS_NewCFunction(ctx, JsLinkerLinkMap, "linkMap", 0));
     JS_SetPropertyStr(ctx, obj, "getConstructors", JS_NewCFunction(ctx, JsLinkerGetConstructors, "getConstructors", 1));
+    JS_SetPropertyStr(ctx, obj, "getDestructors", JS_NewCFunction(ctx, JsLinkerGetDestructors, "getDestructors", 1));
+    JS_SetPropertyStr(ctx, obj, "symbols", JS_NewCFunction(ctx, JsLinkerSymbols, "symbols", 1));
+    JS_SetPropertyStr(ctx, obj, "symtab", JS_NewCFunction(ctx, JsLinkerSymbols, "symtab", 1));
     JS_SetPropertyStr(ctx, obj, "load", JS_NewCFunction(ctx, JsLinkerLoad, "load", 1));
     JS_SetPropertyStr(ctx, obj, "dump", JS_NewCFunction(ctx, JsLinkerDump, "dump", 1));
 }

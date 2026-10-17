@@ -24,11 +24,9 @@
 
 namespace artpi { namespace agent {
 
-namespace {
-
 // Safely resolve executable ranges for the module enclosing `addr` from /proc/self/maps.
 // Avoids SEGV_ACCERR on XOM (execute-only memory) segments.
-static std::vector<std::pair<uintptr_t, uintptr_t>> ResolveModuleRangesByAddr(uintptr_t addr) {
+std::vector<std::pair<uintptr_t, uintptr_t>> ResolveModuleRangesByAddr(uintptr_t addr) {
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return ranges;
@@ -77,12 +75,13 @@ static std::vector<std::pair<uintptr_t, uintptr_t>> ResolveModuleRangesByAddr(ui
 }
 
 // Safely resolve executable ranges for a module given its name or substring from /proc/self/maps.
-static std::vector<std::pair<uintptr_t, uintptr_t>> ResolveModuleRangesByName(const std::string& name) {
+std::vector<std::pair<uintptr_t, uintptr_t>> ResolveModuleRangesByName(const std::string& name) {
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return ranges;
 
     char line[1024];
+
     while (fgets(line, sizeof(line), f)) {
         uintptr_t start, end;
         char perms[8] = {};
@@ -103,6 +102,8 @@ static std::vector<std::pair<uintptr_t, uintptr_t>> ResolveModuleRangesByName(co
     fclose(f);
     return ranges;
 }
+
+namespace {
 
 static uintptr_t ParseTargetAddress(JSContext* ctx, JSValue val) {
     if (JS_IsBigInt(ctx, val)) {
@@ -450,16 +451,31 @@ static JSValue JsQbdiTrace(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
 
     size_t loggedInsns = 0;
 
-    engine->setInstructionCallback([ctx, insnGuard, enableLog, maxLog, &loggedInsns](
+    struct PendingTraceLine {
+        uintptr_t pc = 0;
+        std::string text;
+        bool active = false;
+    };
+    auto pending = std::make_shared<PendingTraceLine>();
+
+    engine->setInstructionCallback([ctx, insnGuard, enableLog, maxLog, &loggedInsns, pending](
             uintptr_t pc, const char* mnem, const char* disasm, int /*depth*/, void* rawGpr) -> int {
-        if (enableLog && loggedInsns < maxLog) {
+        if (enableLog && (maxLog == 0 || loggedInsns < maxLog)) {
+            if (pending->active) {
+                AGENT_QBDI_LOGI("%s", pending->text.c_str());
+                BroadcastLog("trace", pending->text);
+                pending->active = false;
+            }
+
             char logLine[256];
-            snprintf(logLine, sizeof(logLine), "[QBDI] 0x%" PRIxPTR ": %-8s %s",
+            snprintf(logLine, sizeof(logLine), "[QBDI] 0x%" PRIxPTR ": %-8s %-28s",
                      pc, mnem ? mnem : "", disasm ? disasm : "");
-            AGENT_QBDI_LOGI("%s", logLine);
-            BroadcastLog("trace", logLine);
+            pending->pc = pc;
+            pending->text = logLine;
+            pending->active = true;
+
             loggedInsns++;
-            if (loggedInsns == maxLog) {
+            if (maxLog > 0 && loggedInsns == maxLog) {
                 BroadcastLog("trace", "[QBDI] ... (trace logging limit reached)");
             }
         }
@@ -495,6 +511,23 @@ static JSValue JsQbdiTrace(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
         return 0; // CONTINUE
     });
 
+    if (enableLog) {
+        engine->setPostInstructionCallback([pending](uintptr_t pc, void* preGpr, void* postGpr) {
+            if (pending->active && pending->pc == pc) {
+                std::string diff = FormatGprDiff(
+                    reinterpret_cast<const QBDI::GPRState*>(preGpr),
+                    reinterpret_cast<const QBDI::GPRState*>(postGpr));
+                std::string fullLine = pending->text;
+                if (!diff.empty()) {
+                    fullLine += " ; " + diff;
+                }
+                AGENT_QBDI_LOGI("%s", fullLine.c_str());
+                BroadcastLog("trace", fullLine);
+                pending->active = false;
+            }
+        });
+    }
+
     if (!JS_IsUndefined(*memGuard)) {
         engine->setMemoryAccessCallback([ctx, memGuard](uintptr_t insnPc, uintptr_t addr, size_t size, bool isWrite, uint64_t val) {
             bool needLock = (t_jsReentrancyDepth == 0);
@@ -516,6 +549,11 @@ static JSValue JsQbdiTrace(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
 
     PI::Native::NativeRunResult res = engine->run(reinterpret_cast<void*>(target), gprs, fprs);
 
+    if (pending->active) {
+        AGENT_QBDI_LOGI("%s", pending->text.c_str());
+        BroadcastLog("trace", pending->text);
+        pending->active = false;
+    }
     engine->clearCallbacks();
 
     JSValue out = JS_NewObject(ctx);
