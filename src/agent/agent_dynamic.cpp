@@ -798,8 +798,6 @@ const char* kDynamicBootstrapJs = R"JS(
         pxy = new Proxy(clsObj, {
             get(target, prop) {
                 if (typeof prop !== 'string') return target[prop];
-                if (prop in target) return target[prop];
-                if (prop === '__unity_kind') return 'class';
                 if (prop.charCodeAt(0) === 95 && prop.length > 1 && prop.charAt(1) === '_') {
                     return target[prop];
                 }
@@ -811,14 +809,20 @@ const char* kDynamicBootstrapJs = R"JS(
                     mName = ".cctor";
                 }
 
-                let m = target.method(mName);
-                if (m) {
-                    return makeUnityMethodProxy(m, target);
+                // Prefer exact Unity members over helper properties such as
+                // name/address/type. No fuzzy fallback here: a typo must not
+                // silently resolve to an unrelated method.
+                if (typeof target.__lookup === 'function') {
+                    let member = target.__lookup(mName);
+                    if (member) {
+                        if (member.__unity_kind === 'method') {
+                            return makeUnityMethodProxy(member, target);
+                        }
+                        return member;
+                    }
                 }
 
-                let f = target.field(prop);
-                if (f) return f;
-
+                if (prop in target) return target[prop];
                 return undefined;
             }
         });
@@ -831,20 +835,30 @@ const char* kDynamicBootstrapJs = R"JS(
         pxy = new Proxy(asmObj, {
             get(target, prop) {
                 if (typeof prop !== 'string') return target[prop];
-                if (prop in target) return target[prop];
-                if (prop === '__unity_kind') return 'assembly';
                 if (prop.charCodeAt(0) === 95 && prop.length > 1 && prop.charAt(1) === '_') {
                     return target[prop];
                 }
 
-                let cls = target.class(prop);
-                if (!cls) {
-                    let dotted = prop.replace(/_/g, '.');
-                    cls = target.class(dotted);
+                // Exact class lookup first, so a class named "name"/"class" is
+                // not shadowed by the helper properties on the assembly object.
+                if (typeof target.__lookupClass === 'function') {
+                    let cls = target.__lookupClass(prop);
+                    if (!cls && prop.indexOf('_') >= 0) {
+                        let dotted = prop.replace(/_/g, '.');
+                        if (dotted !== prop) cls = target.__lookupClass(dotted);
+                    }
+                    if (!cls && prop.indexOf('_') >= 0) {
+                        let slashed = prop.replace(/_/g, '/');
+                        if (slashed !== prop) cls = target.__lookupClass(slashed);
+                    }
+                    if (!cls && prop.indexOf('_') >= 0) {
+                        let dashed = prop.replace(/_/g, '-');
+                        if (dashed !== prop) cls = target.__lookupClass(dashed);
+                    }
+                    if (cls) return makeClassProxy(cls);
                 }
-                if (cls) {
-                    return makeClassProxy(cls);
-                }
+
+                if (prop in target) return target[prop];
                 return undefined;
             }
         });
@@ -857,24 +871,37 @@ const char* kDynamicBootstrapJs = R"JS(
             return asm ? makeAssemblyProxy(asm) : null;
         };
 
+        function normalizeAsmName(name) {
+            return name.toLowerCase().replace(/[-.]/g, '_');
+        }
+
         function findAssembly(prop) {
             let asm = nativeAssemblyFn(prop);
             if (asm) return asm;
             asm = nativeAssemblyFn(prop + ".dll");
             if (asm) return asm;
+
+            // Dot-chain identifiers cannot contain '.', so completions rewrite
+            // both '-' and '.' to '_'. Try both interpretations here.
             let dashed = prop.replace(/_/g, '-');
             asm = nativeAssemblyFn(dashed);
             if (asm) return asm;
             asm = nativeAssemblyFn(dashed + ".dll");
             if (asm) return asm;
 
+            let dotted = prop.replace(/_/g, '.');
+            asm = nativeAssemblyFn(dotted);
+            if (asm) return asm;
+            asm = nativeAssemblyFn(dotted + ".dll");
+            if (asm) return asm;
+
             try {
                 let list = root.assemblies();
-                let pLower = prop.toLowerCase().replace(/_/g, '-');
+                let pNorm = normalizeAsmName(prop);
                 for (let i = 0; i < list.length; i++) {
                     let aName = list[i];
                     let aStem = aName.endsWith('.dll') ? aName.slice(0, -4) : aName;
-                    if (aStem.toLowerCase() === pLower || aName.toLowerCase() === pLower) {
+                    if (normalizeAsmName(aStem) === pNorm || normalizeAsmName(aName) === pNorm) {
                         return nativeAssemblyFn(aName);
                     }
                 }
@@ -886,13 +913,13 @@ const char* kDynamicBootstrapJs = R"JS(
         pxy = new Proxy(fnWrapper, {
             get(target, prop) {
                 if (typeof prop !== 'string') return target[prop];
-                if (prop in target) return target[prop];
                 if (prop === '__unity_kind') return 'assembly_root';
                 if (prop === '__ptr') return 0;
                 if (prop === 'toString') return function() { return "[UnityAssemblyRoot]"; };
                 if (prop.charCodeAt(0) === 95 && prop.length > 1 && prop.charAt(1) === '_') {
                     return target[prop];
                 }
+                if (prop in target) return target[prop];
 
                 let asm = findAssembly(prop);
                 if (asm) {

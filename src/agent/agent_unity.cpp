@@ -1239,6 +1239,22 @@ static JSValue JsClassMethod(JSContext* ctx, JSValueConst this_val, int argc, JS
     return MakeMethodObject(ctx, m);
 }
 
+// Exact member lookup used by the dot-chain proxy. Unlike method()/field(),
+// this never falls back to an approximate match, so a typo cannot silently
+// resolve to an unrelated method and shadow a field or built-in property.
+static JSValue JsClassLookupExact(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    std::lock_guard<std::mutex> lk(g_unityMutex);
+    auto* c = reinterpret_cast<UnityResolve::Class*>(ThisPtr(ctx, this_val));
+    if (!c || argc < 1) return JS_NULL;
+    std::string name = ArgString(ctx, argv[0]);
+    if (auto* m = c->Get<UnityResolve::Method>(name)) {
+        return MakeMethodObject(ctx, m);
+    }
+    if (auto* f = c->Get<UnityResolve::Field>(name)) {
+        return MakeFieldObject(ctx, f);
+    }
+    return JS_NULL;
+}
 
 static JSValue JsClassNew(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
     std::lock_guard<std::mutex> lk(g_unityMutex);
@@ -1293,6 +1309,7 @@ static JSValue MakeClassObject(JSContext* ctx, UnityResolve::Class* c) {
     JS_SetPropertyStr(ctx, o, "m", JS_NewCFunction(ctx, JsUnityM, "m", 3));
     JS_SetPropertyStr(ctx, o, "field", JS_NewCFunction(ctx, JsClassField, "field", 1));
     JS_SetPropertyStr(ctx, o, "method", JS_NewCFunction(ctx, JsClassMethod, "method", 2));
+    JS_SetPropertyStr(ctx, o, "__lookup", JS_NewCFunction(ctx, JsClassLookupExact, "__lookup", 1));
     JS_SetPropertyStr(ctx, o, "new", JS_NewCFunction(ctx, JsClassNew, "new", 0));
     JS_SetPropertyStr(ctx, o, "type", JS_NewCFunction(ctx, JsClassType, "type", 0));
     JS_SetPropertyStr(ctx, o, "findObjects", JS_NewCFunction(ctx, JsClassFindObjects, "findObjects", 0));
@@ -1338,6 +1355,13 @@ static JSValue JsAssemblyClass(JSContext* ctx, JSValueConst this_val, int argc, 
     return MakeClassObject(ctx, cls);
 }
 
+// Exact class lookup for the assembly dot-chain proxy (no fuzzy fallback).
+static JSValue JsAssemblyLookupClass(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    std::lock_guard<std::mutex> lk(g_unityMutex);
+    auto* a = reinterpret_cast<UnityResolve::Assembly*>(ThisPtr(ctx, this_val));
+    if (!a || argc < 1) return JS_NULL;
+    return MakeClassObject(ctx, a->Get(ArgString(ctx, argv[0]), "*", "*"));
+}
 
 static JSValue MakeAssemblyObject(JSContext* ctx, UnityResolve::Assembly* a) {
     if (!a) return JS_NULL;
@@ -1350,6 +1374,7 @@ static JSValue MakeAssemblyObject(JSContext* ctx, UnityResolve::Assembly* a) {
     JS_SetPropertyStr(ctx, o, "classes", JS_NewCFunction(ctx, JsAssemblyClasses, "classes", 0));
     JS_SetPropertyStr(ctx, o, "class", JS_NewCFunction(ctx, JsAssemblyClass, "class", 3));
     JS_SetPropertyStr(ctx, o, "get", JS_NewCFunction(ctx, JsAssemblyClass, "get", 3));
+    JS_SetPropertyStr(ctx, o, "__lookupClass", JS_NewCFunction(ctx, JsAssemblyLookupClass, "__lookupClass", 1));
     return o;
 }
 
@@ -1811,6 +1836,27 @@ static JSValue JsUnityToString(JSContext* ctx, JSValueConst, int argc, JSValueCo
 // Completion provider for dynamic.unity wrappers. The CLI's generic
 // __getCompletions(expr) evaluates the expression and asks this helper for the
 // dynamic member list (assemblies / classes / fields+methods).
+static bool IsJsIdentifier(const std::string& s) {
+    if (s.empty()) return false;
+    unsigned char first = static_cast<unsigned char>(s[0]);
+    if (!(std::isalpha(first) || first == '_' || first == '$')) return false;
+    for (size_t i = 1; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (!(std::isalnum(c) || c == '_' || c == '$')) return false;
+    }
+    return true;
+}
+
+// Dot-chain identifiers cannot contain '.', '-' or '/'; assembly/class names
+// are normalized to '_' and the runtime proxy maps them back.
+static std::string SanitizeDotChainName(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        if (c == '-' || c == '.' || c == '/') c = '_';
+    }
+    return out;
+}
+
 static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     JSValue arr = JS_NewArray(ctx);
     if (argc < 2) return arr;
@@ -1842,10 +1888,13 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
                 if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".dll") {
                     stem = stem.substr(0, stem.size() - 4);
                 }
-                std::string sanitized = stem;
-                for (char& ch : sanitized) if (ch == '-') ch = '_';
+                std::string sanitized = SanitizeDotChainName(stem);
                 add(std::string("assembly.") + sanitized);
-                if (sanitized != stem) add(std::string("assembly.") + stem);
+                // A raw hyphenated stem is still usable through the
+                // preprocessor; a dotted stem is not a valid property chain.
+                if (sanitized != stem && stem.find('.') == std::string::npos) {
+                    add(std::string("assembly.") + stem);
+                }
                 add(std::string("assembly(\"") + a->name + "\")");
             }
         }
@@ -1857,10 +1906,11 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
                 if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".dll") {
                     stem = stem.substr(0, stem.size() - 4);
                 }
-                std::string sanitized = stem;
-                for (char& ch : sanitized) if (ch == '-') ch = '_';
+                std::string sanitized = SanitizeDotChainName(stem);
                 add(sanitized);
-                if (sanitized != stem) add(stem);
+                if (sanitized != stem && stem.find('.') == std::string::npos) {
+                    add(stem);
+                }
             }
         }
     } else if (kind == "il2cpp") {
@@ -1877,7 +1927,8 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
         if (a) {
             for (const char* h : {"name", "file", "classes()", "class(", "get("}) add(h);
             for (auto* c : a->classes) {
-                add(c->name);
+                std::string ident = SanitizeDotChainName(c->name);
+                if (IsJsIdentifier(ident)) add(ident);
                 add(std::string("class(\"") + c->name + "\")");
             }
         }
@@ -1891,14 +1942,14 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
             }
             add("_ctor");
             for (auto* f : c->fields) {
-                add(f->name);
+                if (IsJsIdentifier(f->name)) add(f->name);
                 add(std::string("field(\"") + f->name + "\")");
             }
             for (auto* m : c->methods) {
                 std::string mName = m->name;
                 if (mName == ".ctor") add("_ctor");
                 else if (mName == ".cctor") add("_cctor");
-                else add(mName);
+                else if (IsJsIdentifier(mName)) add(mName);
                 add(std::string("method(\"") + m->name + "\")");
             }
         }
@@ -1915,6 +1966,7 @@ static JSValue JsUnityHelp(JSContext* ctx, JSValueConst, int, JSValueConst*) {
         "dynamic.unity (UnityResolve.hpp)\n"
         "  unity.init() / available() / assemblies()\n"
         "  unity.assembly(name)            -> {name, file, classes(), class(name, [ns])}\n"
+        "  unity.assembly.<Asm>.<Class>.<Member> // dot-chain; '-' and '.' -> '_', .ctor -> _ctor\n"
         "  unity.class(asm, name, [ns])    -> {name, namespace, parent, fields(), methods(), field(), method(), new(), findObjects(), type()}\n"
         "  field.get(inst) / set(inst,v) / getStatic() / setStatic(v)\n"
         "  method.invoke(inst, ...args)    // static methods: invoke(...args)\n"

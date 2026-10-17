@@ -53,9 +53,7 @@ target_include_directories(artpi_agent PRIVATE
     ../../engine/mpack
     ../../external/xdl/include
     ../../external/qbdi/include
-    ../../external/unityresolve
     ../../external/KittyMemory
-    ../../external/levenshtein
     ../../external/magic_enum/include
     ../../engine/native
     ../../engine/native/qbdi
@@ -72,6 +70,8 @@ find_library(log-lib log)
 target_link_libraries(artpi_agent PRIVATE
     artpi_static
     artpi_kittymemory
+    artpi_unityresolve
+    artpi_levenshtein
     ${log-lib}
     dl
 )

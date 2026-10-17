@@ -16,13 +16,13 @@ add_executable(artpi-cli ${INJECTOR_SOURCES})
 
 target_link_libraries(artpi-cli PRIVATE
     artpi_xz_cli
+    artpi_levenshtein
     dl
 )
 
 target_include_directories(artpi-cli PRIVATE
     .
     ../../engine/mpack
-    ../../external/levenshtein
 )
 
 # ==============================================================================
