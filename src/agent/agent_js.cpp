@@ -14,6 +14,7 @@
 #include "agent_net.h"
 #include "agent_linker.h"
 #include "agent_qbdi.h"
+#include "agent_jni.h"
 #include "sandbox/pi_interp_tracer.h"
 
 #include <map>
@@ -205,13 +206,34 @@ static const std::map<std::string, std::string> kApiDocs = {
     {"untrace", "Usage: untrace([id])\n  - Stops all active traces, or one by id. (handle.stop() also works.)"},
     {"D", "Usage: D()\n  - Detach everything: all Java hooks + native hooks + traces. (alias: detach)"},
     {"detach", "Alias for D(): detach all Java hooks + native hooks + traces."},
-    {"L", "Usage: L()  (alias: list, hooks)\n  - Lists all active instrumentations: Hardware BP/WP slots, Gum fallbacks, Native hooks, Java hooks, Traces, Debug breakpoints."},
+    {"L", "Usage: L()  (alias: list, lists, hooks)\n  - Lists all active instrumentations: Hardware BP/WP slots, Gum fallbacks, Native hooks, Java hooks, Traces, Debug breakpoints, JNI tracing."},
     {"list", "Alias for L()"},
+    {"lists", "Alias for L()"},
     {"hooks", "Alias for L()"},
     {"Linker", "Usage: Linker.main() | Linker.list() | Linker.find(nameOrAddr) | Linker.linkMap() | Linker.getConstructors(nameOrAddr) | Linker.load(libName) | Linker.dump(target)"},
     {"linker", "Alias for Linker (case-insensitive)"},
     {"QBDI", "Usage: QBDI.run(fn, [args], [opts]) | QBDI.trace(fn, [args], [opts]) | QBDI.addInstrumentedModule(name) | QBDI.addInstrumentedRange(start, end) | QBDI.clearInstrumentedRanges()"},
-    {"qbdi", "Alias for QBDI (case-insensitive)"}
+    {"qbdi", "Alias for QBDI (case-insensitive)"},
+    {"jnitrace",
+     "Usage: jnitrace([filter])\n"
+     "  - Global JNI Vtable tracing with lazy on-demand activation (pure in-process, zero injection footprint when stopped).\n"
+     "  - Examples:\n"
+     "      jnitrace()                 // trace all JNI calls\n"
+     "      jnitrace(\"liboattest.so\") // filter by caller .so\n"
+     "      jnitrace(\"FindClass\")      // filter by JNI slot\n"
+     "      jnitrace(\"Call*\")          // filter by wildcard\n"
+     "      jnitrace({ from: \"libx.so\", only: \"Call*\", stack: true })\n"
+     "  - To stop & restore vtable: jnistop() or jni.stop()"},
+    {"jnihw",
+     "Usage: jnihw(funcName, [callbackOrOpts])\n"
+     "  - Hardware breakpoint JNI tracing (zero memory modification, bypasses memory CRC/checksums).\n"
+     "  - Must specify a concrete JNI function name (e.g. \"RegisterNatives\", \"FindClass\", \"NewStringUTF\").\n"
+     "  - Examples:\n"
+     "      jnihw(\"RegisterNatives\")  // automatically decodes registered Java methods, signatures & native pointers\n"
+     "      jnihw(\"FindClass\", (ctx) => { console.log(\"Class:\", ctx.readCString(ctx.x1)); })"},
+    {"jnistop", "Usage: jnistop()\n  - Stops JNI Vtable tracing and restores original JNINativeInterface table."},
+    {"JNI", "Usage: JNI.trace(filter) | JNI.stop() | JNI.hwtrace(funcName, [cb]) | JNI.hwstop() | JNI.status()"},
+    {"jni", "Alias for JNI (case-insensitive)"}
 };
 
 static JSValue JsListAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
@@ -331,6 +353,33 @@ static JSValue JsListAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/
             ss << "\n";
         }
     }
+    ss << "\n";
+
+    // 8. JNI Tracing (Vtable Hijacking & Hardware Breakpoints)
+    auto jniInfo = artpi::agent::JniGetStatusInfo();
+    ss << "[JNI Tracing] ";
+    if (!jniInfo.vtableTracing && jniInfo.hwSessions.empty()) {
+        ss << "(inactive)\n  (none)\n";
+    } else {
+        if (jniInfo.vtableTracing) {
+            ss << "(Vtable Hijack: ACTIVE)\n";
+            ss << "  Filter: from=\"" << (jniInfo.from.empty() ? "<any>" : jniInfo.from) << "\"";
+            if (!jniInfo.only.empty()) ss << ", only=\"" << jniInfo.only << "\"";
+            if (!jniInfo.exclude.empty()) ss << ", exclude=\"" << jniInfo.exclude << "\"";
+            if (!jniInfo.className.empty()) ss << ", class=\"" << jniInfo.className << "\"";
+            if (!jniInfo.grep.empty()) ss << ", grep=\"" << jniInfo.grep << "\"";
+            ss << "\n";
+        } else {
+            ss << "(Vtable Hijack: inactive)\n";
+        }
+        if (!jniInfo.hwSessions.empty()) {
+            ss << "  Hardware Breakpoints (" << jniInfo.hwSessions.size() << " active):\n";
+            for (const auto& s : jniInfo.hwSessions) {
+                char abuf[32]; snprintf(abuf, sizeof(abuf), "0x%lx", (unsigned long)s.target_addr);
+                ss << "    #" << s.id << " JNI " << s.func_name << " @ " << abuf << "\n";
+            }
+        }
+    }
 
     ss << "===========================================================================";
     return JS_NewString(ctx, ss.str().c_str());
@@ -342,11 +391,12 @@ static JSValue JsDetachAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc
     size_t n = NativeUnhookAllCount();
     size_t t = TraceStopAll();
     size_t hw = HwHookDetachAll();
+    JniStopTrace();
     std::string msg = "Detached: " + std::to_string(j) + " java hook(s), "
                     + std::to_string(n) + " native hook(s), "
                     + std::to_string(t) + " trace(s), "
                     + std::to_string(d) + " debug breakpoint(s), "
-                    + std::to_string(hw) + " hardware hook(s)";
+                    + std::to_string(hw) + " hardware hook(s), JNI vtable restored";
     return JS_NewString(ctx, msg.c_str());
 }
 
@@ -359,6 +409,7 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     JSValue memory = JS_NewObject(ctx);
     JSValue trace = JS_NewObject(ctx);
     JSValue debug = JS_NewObject(ctx);
+    JSValue jni = JS_NewObject(ctx);
 
     // 2. Register domain-specific and flat global APIs
     RegisterJavaApis(ctx, global, java);
@@ -369,6 +420,7 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     RegisterHwHookApis(ctx, global);
     RegisterLinkerApis(ctx, global);
     RegisterQbdiApis(ctx, global);
+    RegisterJniApis(ctx, global, jni);
 
     // 3. Mount domain namespaces on global
     JS_SetPropertyStr(ctx, global, "Java", java);
@@ -376,10 +428,12 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     JS_SetPropertyStr(ctx, global, "Memory", memory);
     JS_SetPropertyStr(ctx, global, "Trace", trace);
     JS_SetPropertyStr(ctx, global, "Debug", debug);
+    JS_SetPropertyStr(ctx, global, "JNI", jni);
     // Lowercase aliases for convenience
     JS_SetPropertyStr(ctx, global, "debug", JS_DupValue(ctx, debug));
     JS_SetPropertyStr(ctx, global, "memory", JS_DupValue(ctx, memory));
     JS_SetPropertyStr(ctx, global, "trace", JS_DupValue(ctx, trace));
+    JS_SetPropertyStr(ctx, global, "jni", JS_DupValue(ctx, jni));
 
     // 4. Register dynamic proxy tree (dynamic.java & dynamic.native)
     RegisterDynamicApis(ctx);
@@ -389,6 +443,7 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     JS_SetPropertyStr(ctx, global, "detach", JS_NewCFunction(ctx, JsDetachAll, "detach", 0));
     JS_SetPropertyStr(ctx, global, "L", JS_NewCFunction(ctx, JsListAll, "L", 0));
     JS_SetPropertyStr(ctx, global, "list", JS_NewCFunction(ctx, JsListAll, "list", 0));
+    JS_SetPropertyStr(ctx, global, "lists", JS_NewCFunction(ctx, JsListAll, "lists", 0));
     JS_SetPropertyStr(ctx, global, "hooks", JS_NewCFunction(ctx, JsListAll, "hooks", 0));
 
     // 6. Install console.log redirector

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(artpi_agent LANGUAGES C CXX)
+project(artpi_agent LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -35,6 +35,8 @@ set(AGENT_SOURCES
     agent_hw_hook.cpp
     agent_linker.cpp
     agent_qbdi.cpp
+    agent_jni.cpp
+    jni_trampoline_arm64.S
     agent_js.cpp
     ${QUICKJS_SOURCES}
 )

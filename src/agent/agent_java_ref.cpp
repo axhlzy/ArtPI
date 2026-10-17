@@ -268,7 +268,9 @@ static const ClassMembers* LookupMembers(const std::string& cname) {
 }
 
 std::string JavaClassName(JNIEnv* env, jclass cls) {
-    if (!cls || !g_c_Class) return "";
+    if (!cls) return "";
+    if (!g_c_Class && env) InitJRefClassCache(env);
+    if (!g_c_Class) return "";
     jmethodID getName = env->GetMethodID(g_c_Class, "getName", "()Ljava/lang/String;");
     std::string n;
     if (getName) {

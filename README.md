@@ -29,6 +29,7 @@
 | **堆实例扫描 (`choose`)** | 类似 Frida `Java.choose`，支持纯 Native GC 物理扫描与 JVMTI 极速遍历双模式，实时捕获并操作存活对象 |
 | **字节码解释沙箱** | 内嵌 nmmvm 解释器重放方法体，支持指令级单步、`StepIn` 递归解释、`Mock` 返回值打桩、异常拦截 |
 | **全栈混合追踪** | Java 解释执行遇到 JNI 方法自动交接给 QBDI/Gum，Native 执行完无缝切回，输出连贯的跨层树形调用栈 |
+| **双轨 JNI 追踪** | 支持零内存修改的硬件断点追踪 (`jnihw`) 与极速全局 Vtable 虚表劫持 (`jnitrace`)，单行紧凑输出调用参数、真实返回值、耗时与 caller 模块偏移，自动反解 `RegisterNatives` 动态注册方法 |
 | **动态对象反射链** | `artobject(addr)` 持久化提升全局引用，支持链式属性读写、方法调用与 REPL Tab 实时补全 |
 | **界面自动化 (`UI.*`)** | `UI.dump` 打印 View 层级树，`UI.find` 附带祖先链与最近点击目标，`UI.click` / `swipe` / `setText` 免 ADB 直接操作界面 |
 | **ptrace 链式内嵌注入** | 单个 `artpi-cli` 二进制**联合内嵌 Agent SO 与 JADX CLI Jar**，自动解压部署，支持 `-P <pid>` / `-k <pkg>` / `-f <file>` |
@@ -727,6 +728,130 @@ qbdi.trace({
     dumpRegs: true
 });
 ```
+
+---
+
+### 6.10 `JNI.*` / `jnitrace` / `jnihw` — 双轨 JNI 追踪 (Vtable 全局劫持 & 硬件断点精确定位)
+
+针对逆向分析中频繁出现的 Native JNI 调用（如动态注册、反射调用、字符串转换、对象构造），ArtPI 提供了创新的**双轨 JNI 追踪引擎**。
+
+#### 1. 双轨技术架构与选型对比
+
+| 追踪维度 | Vtable 全局虚表劫持 (`jnitrace`) | 硬件断点追踪 (`jnihw`) |
+|---|---|---|
+| **核心机制** | 按需接管 `JNIEnv` 的 `JNINativeInterface` 函数表（233 个槽位） | 利用 ARM64 硬件调试寄存器，对目标 JNI 函数下硬件断点 |
+| **内存修改** | 仅改写数据段函数表指针，**不修改任何代码段指令** | **0 内存修改**（连数据段虚表都不碰，物理级只读） |
+| **反调试绕过**| 停止追踪后 100% 恢复原虚表，无任何内存残留 | **完全免疫内存 Integrity 校验与代码段 CRC 检测** |
+| **追踪范围** | 全局覆盖全部 233 个 JNI 函数，支持丰富规则过滤 | 精确定位到具体关注的单个或多个核心 JNI 函数 |
+| **返回值捕获**| 汇编跳板在调用后无损保留返回值寄存器与耗时 | 通过在返回地址（`LR`）挂载单次（`once`）硬件断点实时拦截返回值 |
+
+#### 2. 核心 API
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `jnitrace` / `JNI.trace` | `([filter])` | 启动 JNI 全局虚表追踪。支持字符串或对象过滤配置 |
+| `jnistop` / `JNI.stop` | `()` | 停止 JNI 虚表追踪并立即将 `JNINativeInterface` 表 100% 恢复为原始状态 |
+| `jnihw` / `JNI.hwtrace` | `(funcName[, callback])` | 对指定 JNI 函数（如 `"RegisterNatives"` 或 `"CallIntMethod"`）挂载硬件执行断点与返回拦截（自动关联 C++ `V` 变体槽位） |
+| `jnihwstop` / `JNI.hwstop` / `jnihwdetachAll` | `()` | 卸载所有已激活的 JNI 硬件断点 |
+| `JNI.status()` | `()` | 查询当前 JNI 虚表追踪状态与活动的硬件断点列表 |
+| `lists()` / `L()` / `list()` | `()` | 列出包括硬件断点寄存器分配、JNI 追踪状态在内的所有活跃 Instrumentations |
+
+#### 3. 过滤器与参数格式化能力
+
+`jnitrace` 支持非常灵活的过滤配置：
+- **简写调用**：
+  - `jnitrace()`：追踪所有 JNI 调用。
+  - `jnitrace("liboattest.so")`：仅追踪调用方为 `liboattest.so` 的 JNI 调用。
+  - `jnitrace("FindClass,Call*")`：仅追踪包含指定函数名的调用。
+  - `jnitrace("!GetVersion")`：以 `!` 开头表示排除该函数。
+- **对象配置**：
+  ```javascript
+  jnitrace({
+      from: "libnative.so",            // 限制调用来源模块
+      only: ["NewStringUTF", "Call*"], // 白名单函数
+      exclude: ["GetVersion"],          // 黑名单函数
+      class: "com.example.app",        // 目标类过滤
+      grep: "token"                    // 渲染文本包含过滤
+  });
+  ```
+
+#### 4. 单行紧凑输出与 RegisterNatives / ART 对象深度反解
+
+所有追踪结果均在函数返回时输出**整洁单行日志**，包含参数、返回值、精确毫秒耗时以及调用方模块与相对偏移。
+
+同时，ArtPI 内置了深度的 **ART 运行时对象与符号反解引擎**：
+- **`jobject` 实例反解**：自动反解并打印运行时类名与地址，如 `<MainActivity@0x7fd716b538>`。同时**自动注册为全局观察对象**，可以直接在 REPL 中使用 `artobject(0x7fd716b538)` 进行交互式调用与属性探测！
+- **`jclass` 反解**：直接解析为完全限定类名，如 `<class com.axhlzy.oattest.MainActivity>`。
+- **`jmethodID` / `jfieldID` 反解**：自动将晦涩的指针反解为人类可读的类名与方法签名，如 `mid=MainActivity.instanceMultiply(II)I` 或 `fid=MainActivity.mCount:I`。
+- **`jstring` / 数组解析**：自动打印字符串内容 `"Hello from C++!"` 或数组类型与长度 `<int[4]@0x...>`。
+- **双槽自动下断（Dual-Slot Arming）**：针对 NDK C++ 源码中普遍调用内联展开为 `Call*MethodV` 变体槽位的特点，`jnihw("CallIntMethod")` 会自动同时布控基础槽位与 `V` 变体槽位，无需用户探究 NDK 底层差异即可精准捕获。
+
+```text
+[JNI] FindClass("com/axhlzy/oattest/MainActivity") = <class com.axhlzy.oattest.MainActivity> (0.010 ms)  [liboattest.so+0x2389c]
+[JNI] GetMethodID(class=<class com.axhlzy.oattest.MainActivity>, "instanceMultiply", "(II)I") = mid:MainActivity.instanceMultiply(II)I (0.019 ms)  [liboattest.so+0x23970]
+[JNI] CallIntMethodV(obj=<MainActivity@0x7fd716b538>, mid=MainActivity.instanceMultiply(II)I) = 56 (0.019 ms)  [liboattest.so+0x23a3c]
+[JNI] GetStringUTFChars(jstring="sum=40") = "sum=40" (0.003 ms)  [liboattest.so+0x23be8]
+[JNI] GetIntField(obj=<MainActivity@0x7fd716b538>, fid=MainActivity.mCount:I) = 42 (0.007 ms)  [liboattest.so+0x23ca4]
+[JNI] ExceptionCheck() = false (0.002 ms)  [liboattest.so+0x23de0]
+```
+
+对于动态注册函数 `RegisterNatives`，ArtPI 会自动解析其绑定的所有 Java 方法名、参数签名以及对应的 Native 函数指针与模块偏移：
+```text
+[JNI] RegisterNatives(class=<class com.axhlzy.oattest.MainActivity>, n=1)
+      #0 dynamicNativeMethod(I)I -> liboattest.so+0x238a8 (0x7b6684d8a8) = 0 (0.111 ms)  [liboattest.so+0x2392c]
+```
+
+对于硬件断点追踪 `jnihw`，同样享受全套 ART 对象与方法反解，并自动拦截捕获返回值：
+```text
+[HW-JNI] CallIntMethodV(obj=<MainActivity@0x7fd716b538>, mid=MainActivity.instanceMultiply(II)I) = 56 (5.002 ms)  [libartpi_agent.so+0xc38238]
+[HW-JNI] FindClass("com/axhlzy/oattest/MainActivity") = <class com.axhlzy.oattest.MainActivity> (5.455 ms)  [liboattest.so+0x2389c]
+[HW-JNI] NewStringUTF("Hello from C++!") = "Hello from C++!" (4.911 ms)  [liboattest.so+0x23524]
+```
+
+#### 5. 堆栈回溯与自定义回调（`{ stack: true }` 与 `ctx.stack`）
+
+当逆向分析需要追查“**到底是 Native 哪段业务逻辑或哪个 SO 调用的该 JNI 函数**”时，可直接启用全自动堆栈回溯：
+
+- **声明式配置（自动在日志下方展开完整 Native/ART 回溯栈）**：
+  ```javascript
+  jnihw("CallStaticObjectMethod", { stack: true });
+  ```
+  输出样例：
+  ```text
+  [HW-JNI] CallStaticObjectMethodV(class=0x1e06, mid=android.view.MotionEvent.obtain()) = 0x7ec2efb04d (78.704 ms)  [libandroid_runtime.so+0x12eaec]
+      #00 0x7ec2eff878 [vdso]!__kernel_rt_sigreturn+0x0
+      #01 0x7c00a023d8 libart.so!art::CheckJNI::CallStaticObjectMethodV+0x0
+      #02 0x7ea0aca040 libandroid_runtime.so!android_view_MotionEvent_obtainAsCopy+0x30
+      #03 0x7ea0ac1ee0 libandroid_runtime.so!NativeInputEventReceiver::consumeEvents+0x230
+      #04 0x7e9dca417c libutils.so!android::Looper::pollOnce+0x32c
+      #05 0x7ea0af8420 libandroid_runtime.so!android_os_MessageQueue_nativePollOnce+0x30
+  ```
+
+- **编程式自定义回调（通过 `ctx.stack` 自由处理堆栈文本）**：
+  ```javascript
+  jnihw("CallIntMethod", (ctx) => {
+      console.log(`[+] ${ctx.func} returned ${ctx.retStr} from ${ctx.caller}`);
+      console.log("[+] Caller Stack:\n" + ctx.stack);
+  });
+  ```
+
+- **分段精细控制（`onEnter` / `onLeave`）**：
+  ```javascript
+  jnihw("CallStaticObjectMethod", {
+      onEnter(ctx) {
+          console.log("[Enter] " + ctx.func + " caller=" + ctx.caller);
+          console.log(ctx.stack); // 在入口第一时间捕获现场堆栈
+      },
+      onLeave(ctx) {
+          console.log("[Leave] retval=" + ctx.retStr + " cost=" + ctx.duration_ms + "ms");
+      }
+  });
+  ```
+
+- **在全局虚表追踪中同样支持堆栈开关**：
+  ```javascript
+  jnitrace({ only: "CallStaticObjectMethod", stack: true });
+  ```
 
 ---
 

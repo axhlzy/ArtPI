@@ -29,6 +29,7 @@ Target Platform: **Android 7.0 ~ 15 (arm64-v8a)**, root privileges required for 
 | **Heap Instance Enumeration (`choose`)** | Similar to Frida's `Java.choose`: dual-mode scanning supporting high-speed JVMTI iteration with fallback to pure native ART heap space physical memory sweeping |
 | **Bytecode Sandbox & Emulation** | Embedded nmmvm interpreter for bytecode replay, supporting single-stepping, `StepIn` recursive interpretation, return value mocking, and exception interception |
 | **Unified Cross-Layer Tracing** | Full-stack tracing: Dalvik bytecode execution seamlessly delegates to Frida-Gum and QBDI when hitting JNI boundaries, rendering a continuous cross-layer call tree |
+| **Dual-Track JNI Tracing** | Zero-patch hardware breakpoint tracing (`jnihw`) paired with fast global Vtable hijacking (`jnitrace`); concise single-line logging of arguments, return values, elapsed ms, and caller offset, with automatic `RegisterNatives` dynamic symbol decoding |
 | **Dynamic Reflective Proxies** | `artobject(addr)` wraps live heap instances into global references with chainable member calls, property access, and interactive REPL Tab completions |
 | **UI Automation (`UI.*`)** | `UI.dump` prints the view hierarchy, `UI.find` returns the ancestor chain and nearest click target, and `UI.click` / `swipe` / `setText` drive the UI directly without ADB |
 | **Self-Contained Multi-Payload Packing** | A single `artpi-cli` binary encapsulates the injector ELF, XZ-compressed `libartpi_agent.so`, and deflated `jadxcli.jar` (~10MB total), auto-extracting upon launch |
@@ -614,6 +615,133 @@ Integrates Quarkslab's Native Dynamic Binary Instrumentation (QBDI) engine into 
 - `dumpRegs`: Enable real-time GPR register diff logging (e.g. ` ; x0=0x4, sp=0x...`)
 - `onInstruction`: Per-instruction callback `function(inst)`
 - `onBasicBlock`: Per-basic-block callback `function(bb)`
+
+---
+
+### 6.10 `JNI.*` / `jnitrace` / `jnihw` — Dual-Track JNI Tracing (Global Vtable Hijack & Hardware Breakpoint)
+
+To dissect high-frequency native JNI interactions (dynamic registrations, reflection, field lookups, array copies, string allocations), ArtPI provides an innovative **Dual-Track JNI Tracing Engine**.
+
+#### 1. Architecture & Trade-Off Comparison
+
+| Dimension | Global Vtable Hijack (`jnitrace`) | Hardware Breakpoint Trace (`jnihw`) |
+|---|---|---|
+| **Mechanism** | On-demand takeover of the 233-slot `JNINativeInterface` vtable in `JNIEnv` | ARM64 hardware debug registers set directly on target JNI function entry |
+| **Memory Modification** | Rewrites only data-section function pointers; **zero code patching** | **0 memory modification** (read-only execution breakpoint, untouched vtable) |
+| **Anti-Hook Evasion** | Cleanly restored on stop; pure in-process trampolines | **Immune to memory integrity/checksum and code-segment CRC scans** |
+| **Coverage** | Intercepts all 233 JNI APIs globally with rich filter rules | Pinpoint precision on targeted JNI functions of interest |
+| **Return Value Capture**| Stack frame preserves return value registers and measures duration | Arms a transient `once = true` return address (`LR`) breakpoint upon entry |
+
+#### 2. Core APIs
+
+| API | Signature | Description |
+|---|---|---|
+| `jnitrace` / `JNI.trace` | `([filter])` | Activate global JNI vtable tracing with optional filter options |
+| `jnistop` / `JNI.stop` | `()` | Stop JNI vtable tracing and cleanly restore original `JNINativeInterface` table |
+| `jnihw` / `JNI.hwtrace` | `(funcName[, callback])` | Arm hardware execution and return breakpoints on target JNI API (auto-binds C++ `V` variant slot) |
+| `jnihwstop` / `JNI.hwstop` / `jnihwdetachAll` | `()` | Detach all active JNI hardware breakpoints |
+| `JNI.status()` | `()` | Query JNI tracing status and active hardware breakpoints |
+| `lists()` / `L()` / `list()` | `()` | List all active instrumentations, including hardware debug registers and JNI status |
+
+#### 3. Filtering Capabilities
+
+`jnitrace` offers flexible filtering options:
+```javascript
+// Simple shorthand:
+jnitrace();                    // Trace all JNI calls
+jnitrace("liboattest.so");     // Filter by caller shared library
+jnitrace("FindClass,Call*");   // Filter by function name pattern
+jnitrace("!GetVersion");       // Exclude specific function
+
+// Structured object config:
+jnitrace({
+    from: "libnative.so",            // Caller module
+    only: ["NewStringUTF", "Call*"], // Whitelist functions
+    exclude: ["GetVersion"],          // Blacklist functions
+    class: "com.example.app",        // Class filter
+    grep: "token"                    // Text search filter
+});
+```
+
+#### 4. Single-Line Output & RegisterNatives / ART Object Deep Resolution
+
+Traced calls emit **compact single-line logs** upon return, highlighting parameters, return values, elapsed milliseconds, and caller offset.
+
+ArtPI features a built-in **ART runtime object and symbol resolution engine**:
+- **`jobject` Resolution**: Automatically extracts and prints runtime class name and memory address, e.g. `<MainActivity@0x7fd716b538>`. Objects are **automatically registered as global observed objects**, ready for instant interactive method invocation and property probing via `artobject(0x7fd716b538)` in the REPL!
+- **`jclass` Resolution**: Directly formatted as fully-qualified class names, e.g. `<class com.axhlzy.oattest.MainActivity>`.
+- **`jmethodID` / `jfieldID` Resolution**: Translates opaque IDs into human-readable class names and signatures, e.g. `mid=MainActivity.instanceMultiply(II)I` or `fid=MainActivity.mCount:I`.
+- **`jstring` / Array Resolution**: Formats string literals as `"..."` and arrays with element type and count, e.g. `<int[4]@0x...>`.
+- **Dual-Slot Arming**: Because NDK C++ headers inline `env->Call*Method` into `functions->Call*MethodV`, `jnihw("CallIntMethod")` seamlessly arms both the base slot and the `V` variant slot, ensuring C and C++ callers are trapped reliably without missing events.
+
+```text
+[JNI] FindClass("com/axhlzy/oattest/MainActivity") = <class com.axhlzy.oattest.MainActivity> (0.010 ms)  [liboattest.so+0x2389c]
+[JNI] GetMethodID(class=<class com.axhlzy.oattest.MainActivity>, "instanceMultiply", "(II)I") = mid:MainActivity.instanceMultiply(II)I (0.019 ms)  [liboattest.so+0x23970]
+[JNI] CallIntMethodV(obj=<MainActivity@0x7fd716b538>, mid=MainActivity.instanceMultiply(II)I) = 56 (0.019 ms)  [liboattest.so+0x23a3c]
+[JNI] GetStringUTFChars(jstring="sum=40") = "sum=40" (0.003 ms)  [liboattest.so+0x23be8]
+[JNI] GetIntField(obj=<MainActivity@0x7fd716b538>, fid=MainActivity.mCount:I) = 42 (0.007 ms)  [liboattest.so+0x23ca4]
+[JNI] ExceptionCheck() = false (0.002 ms)  [liboattest.so+0x23de0]
+```
+
+Dynamic registration via `RegisterNatives` recursively decodes method names, signatures, and target native pointers:
+```text
+[JNI] RegisterNatives(class=<class com.axhlzy.oattest.MainActivity>, n=1)
+      #0 dynamicNativeMethod(I)I -> liboattest.so+0x238a8 (0x7b6684d8a8) = 0 (0.111 ms)  [liboattest.so+0x2392c]
+```
+
+Hardware breakpoint tracing `jnihw` shares the exact same ART object resolution and return value interception:
+```text
+[HW-JNI] CallIntMethodV(obj=<MainActivity@0x7fd716b538>, mid=MainActivity.instanceMultiply(II)I) = 56 (5.002 ms)  [libartpi_agent.so+0xc38238]
+[HW-JNI] FindClass("com/axhlzy/oattest/MainActivity") = <class com.axhlzy.oattest.MainActivity> (5.455 ms)  [liboattest.so+0x2389c]
+[HW-JNI] NewStringUTF("Hello from C++!") = "Hello from C++!" (4.911 ms)  [liboattest.so+0x23524]
+```
+
+#### 5. Stack Unwinding & Custom Callbacks (`{ stack: true }` & `ctx.stack`)
+
+To reveal **which native routine or shared library initiated the JNI call**, full native/ART backtracing can be activated effortlessly:
+
+- **Declarative Configuration (auto-appends formatted backtrace under the single-line log)**:
+  ```javascript
+  jnihw("CallStaticObjectMethod", { stack: true });
+  ```
+  Example output:
+  ```text
+  [HW-JNI] CallStaticObjectMethodV(class=0x1e06, mid=android.view.MotionEvent.obtain()) = 0x7ec2efb04d (78.704 ms)  [libandroid_runtime.so+0x12eaec]
+      #00 0x7ec2eff878 [vdso]!__kernel_rt_sigreturn+0x0
+      #01 0x7c00a023d8 libart.so!art::CheckJNI::CallStaticObjectMethodV+0x0
+      #02 0x7ea0aca040 libandroid_runtime.so!android_view_MotionEvent_obtainAsCopy+0x30
+      #03 0x7ea0ac1ee0 libandroid_runtime.so!NativeInputEventReceiver::consumeEvents+0x230
+      #04 0x7e9dca417c libutils.so!android::Looper::pollOnce+0x32c
+      #05 0x7ea0af8420 libandroid_runtime.so!android_os_MessageQueue_nativePollOnce+0x30
+  ```
+
+- **Programmatic Custom Callback (inspect or log `ctx.stack` freely)**:
+  ```javascript
+  jnihw("CallIntMethod", (ctx) => {
+      console.log(`[+] ${ctx.func} returned ${ctx.retStr} from ${ctx.caller}`);
+      console.log("[+] Caller Stack:\n" + ctx.stack);
+  });
+  ```
+
+- **Phased Callbacks (`onEnter` / `onLeave`)**:
+  ```javascript
+  jnihw("CallStaticObjectMethod", {
+      onEnter(ctx) {
+          console.log("[Enter] " + ctx.func + " caller=" + ctx.caller);
+          console.log(ctx.stack); // Pristine stack captured directly upon entry
+      },
+      onLeave(ctx) {
+          console.log("[Leave] retval=" + ctx.retStr + " cost=" + ctx.duration_ms + "ms");
+      }
+  });
+  ```
+
+- **Also Supported in Global Vtable Tracing**:
+  ```javascript
+  jnitrace({ only: "CallStaticObjectMethod", stack: true });
+  ```
+
+---
 
 ## 7. Dependencies & Acknowledgments
 
