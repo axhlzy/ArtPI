@@ -36,6 +36,7 @@ namespace {
         bool serverMode = false;
         std::string stopLib;
         bool libLog = false;
+        bool libConstructors = false;
     };
 
     void Usage(const char *argv0) {
@@ -51,6 +52,7 @@ namespace {
             "  -W, --wait <name>    Wait for a new process matching <name> (e.g. dex2oat), inject & pause\n"
             "  --pause              Keep target main thread paused after injection until 'resume' is entered\n"
             "  -L, --lib-log        Log all libraries loaded via dlopen (hardware breakpoint based)\n"
+            "  -LC, --lib-constructors  Log dlopen & relay-trace each constructor with execution timing\n"
             "  --stop-lib <name>    Pause main thread when library matching <name> is loaded via dlopen\n"
             "  -t, --top            Attach to the foreground (top Activity) app\n"
             "  --no-ptrace          Inject via /proc/<pid>/mem without ptrace (auto-enabled if TracerPid != 0)\n"
@@ -94,7 +96,7 @@ namespace {
     // race ahead of the agent and are missed. An explicit --pause still wins.
     bool ShouldAutoGateSpawn(const Options& opt) {
         return opt.spawnMode && !opt.pauseMainThread &&
-               (opt.libLog || !opt.stopLib.empty());
+               (opt.libLog || opt.libConstructors || !opt.stopLib.empty());
     }
 
     void HandleConnectedSession(const artpi::injector::AgentEndpoint& ep, const Options& opt) {
@@ -116,12 +118,16 @@ namespace {
             }
         };
 
-        if (opt.libLog || !opt.stopLib.empty()) {
-            std::string js = "HW.watchDlopen({ stopLib: \"" + opt.stopLib + "\", libLog: true });";
+        if (opt.libLog || opt.libConstructors || !opt.stopLib.empty()) {
+            std::string js = "HW.watchDlopen({ stopLib: \"" + opt.stopLib +
+                             "\", libLog: " + (opt.libLog ? "true" : "false") +
+                             ", constructors: " + (opt.libConstructors ? "true" : "false") + " });";
             std::string res, err;
             if (artpi::injector::EvalScript(ep, js, res, err)) {
-                printf("[+] Armed hardware breakpoint on dlopen (stopLib='%s', libLog=%d)\n",
-                       opt.stopLib.empty() ? "(none)" : opt.stopLib.c_str(), opt.libLog ? 1 : 0);
+                printf("[+] Armed hardware breakpoint on dlopen%s (stopLib='%s', libLog=%d, ctors=%d)\n",
+                       opt.libConstructors ? " & constructors" : "",
+                       opt.stopLib.empty() ? "(none)" : opt.stopLib.c_str(),
+                       opt.libLog ? 1 : 0, opt.libConstructors ? 1 : 0);
             } else {
                 fprintf(stderr, "[!] Failed to arm dlopen hardware breakpoint: %s\n", err.c_str());
             }
@@ -151,6 +157,8 @@ namespace {
             resumeIfAutoGated();
             if (!opt.stopLib.empty()) {
                 printf("[*] App running. Will PAUSE automatically when '%s' is loaded via dlopen...\n", opt.stopLib.c_str());
+            } else if (opt.libConstructors) {
+                printf("[*] App running. Monitoring dlopen and relay-tracing constructors with execution timing...\n");
             } else if (opt.libLog) {
                 printf("[*] App running. Monitoring dynamic libraries loaded via dlopen...\n");
             }
@@ -350,6 +358,13 @@ int main(int argc, char **argv) {
             opt.pauseMainThread = true;
         }
         else if (a == "--pause") opt.pauseMainThread = true;
+        else if (a == "-LC" || a == "--lib-constructors" || a == "--init-array") {
+            opt.libLog = true;
+            opt.libConstructors = true;
+        }
+        else if (a == "-C") {
+            opt.libConstructors = true;
+        }
         else if (a == "-L" || a == "--lib-log") opt.libLog = true;
         else if (a == "--stop-lib") {
             opt.stopLib = needValue("--stop-lib");
@@ -453,7 +468,7 @@ int main(int argc, char **argv) {
                 printf("[+] pre-deployed payload -> %s (%zu bytes)\n",
                        preDeployedSoPath.c_str(), preExtractedPayload.size());
             }
-            if (opt.libLog || !opt.stopLib.empty()) {
+            if (opt.libLog || opt.libConstructors || !opt.stopLib.empty()) {
                 std::string cfgPath = dataDir + "/artpi_boot.cfg";
                 int fd = open(cfgPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
                 if (fd >= 0) {
@@ -461,9 +476,10 @@ int main(int argc, char **argv) {
                     // autoResume lets the agent release the gated main thread by
                     // itself once the early monitor is armed (covers --server and
                     // a client that fails to connect).
-                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\nautoResume=%d\n",
+                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\nautoResume=%d\nctors=%d\n",
                              opt.libLog ? 1 : 0, opt.stopLib.c_str(),
-                             ShouldAutoGateSpawn(opt) ? 1 : 0);
+                             ShouldAutoGateSpawn(opt) ? 1 : 0,
+                             opt.libConstructors ? 1 : 0);
                     write(fd, buf, strlen(buf));
                     close(fd);
                     struct stat dirSt{};

@@ -513,7 +513,8 @@ HW.watchDlopen({
     },
     onLoaded: function(name, handle) {
         console.log("[dlopen] Loaded SO: " + name + " handle=0x" + handle.toString(16));
-    }
+    },
+    constructors: true // Relay-trace each DT_INIT/DT_INIT_ARRAY constructor with execution timing
 });
 
 // List all active hardware sessions
@@ -523,6 +524,12 @@ console.log(JSON.stringify(HW.list()));
 bp.detach();
 HW.detachAll();
 ```
+
+#### CLI Early Spawn Monitoring & Constructor Tracing (`-S` with `-L` / `-LC` / `--stop-lib`)
+When spawning an app with `-S`:
+- `-L, --lib-log`: Trace all dynamic library loading events via hardware breakpoint on `dlopen`/`android_dlopen_ext`.
+- `-LC, --lib-constructors`: In addition to dlopen logging, hooks Linker's `soinfo::call_constructors`, parses `DT_INIT` and `DT_INIT_ARRAY` from memory, and daisy-chains one-shot hardware breakpoints to trace each constructor with millisecond execution timing using strictly 1 hardware breakpoint slot.
+- `--stop-lib <name>`: Pause the main thread upon loading the specified library.
 
 ---
 

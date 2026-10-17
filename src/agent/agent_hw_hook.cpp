@@ -8,6 +8,9 @@
 #include "native/hooker/pi_gum_hooker.h"
 #include "frida-gum.h"
 #include <unistd.h>
+#include <elf.h>
+#include <time.h>
+#include <dlfcn.h>
 #include "xdl.h"
 
 #include <string>
@@ -398,9 +401,9 @@ static JSValue JsHwBreakpointDetach(JSContext* ctx, JSValueConst /*this_val*/, i
 
 // HWBreakpoint.detachAll()
 static JSValue JsHwBreakpointDetachAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
-    size_t count = HwHookManager::instance().detachAll();
+    size_t count = HwHookDetachAll();
     char buf[64];
-    snprintf(buf, sizeof(buf), "Detached %zu hardware breakpoint(s)", count);
+    snprintf(buf, sizeof(buf), "Detached %zu hardware hook(s)", count);
     return JS_NewString(ctx, buf);
 }
 
@@ -575,6 +578,376 @@ static uintptr_t ResolveDlopenAddress() {
     return addr;
 }
 
+static inline uint64_t GetMonotonicTimeNs() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+static uintptr_t ResolveCallConstructorsAddress() {
+    uintptr_t addr = 0;
+#if defined(__aarch64__) || defined(__x86_64__)
+    const char* linker_name = "linker64";
+#else
+    const char* linker_name = "linker";
+#endif
+    void* handle = xdl_open(linker_name, XDL_DEFAULT);
+    if (handle) {
+        addr = reinterpret_cast<uintptr_t>(xdl_dsym(handle, "__dl__ZN6soinfo17call_constructorsEv", nullptr));
+        if (!addr) {
+            addr = reinterpret_cast<uintptr_t>(xdl_sym(handle, "__dl__ZN6soinfo17call_constructorsEv", nullptr));
+        }
+        if (!addr) {
+            addr = reinterpret_cast<uintptr_t>(xdl_dsym(handle, "_ZN6soinfo17call_constructorsEv", nullptr));
+        }
+        if (!addr) {
+            addr = reinterpret_cast<uintptr_t>(xdl_sym(handle, "_ZN6soinfo17call_constructorsEv", nullptr));
+        }
+        xdl_close(handle);
+    }
+    return addr;
+}
+
+static size_t DetectConstructorsCalledOffset(uintptr_t call_ctors_addr) {
+    if (!call_ctors_addr || !gum_memory_is_readable(reinterpret_cast<const void*>(call_ctors_addr), 64)) {
+        return sizeof(void*) == 8 ? 248 : 160;
+    }
+    const uint32_t* insns = reinterpret_cast<const uint32_t*>(call_ctors_addr);
+    for (size_t i = 0; i < 16; i++) {
+        uint32_t insn = insns[i];
+        if ((insn & 0xffc00000) == 0x39400000) {
+            uint32_t rn = (insn >> 5) & 0x1f;
+            if (rn == 0) { // x0 is `this`
+                size_t imm = (insn >> 10) & 0xfff;
+                if (imm >= 0x80 && imm <= 0x300) {
+                    return imm;
+                }
+            }
+        }
+    }
+    return sizeof(void*) == 8 ? 248 : 160;
+}
+
+struct ExtractedConstructors {
+    std::string soName;
+    uintptr_t base = 0;
+    std::vector<std::pair<uintptr_t, std::string>> ctors; // address, desc
+};
+
+static bool ExtractConstructorsFromSoinfo(uintptr_t soinfo_ptr, ExtractedConstructors& out) {
+    if (soinfo_ptr < 0x1000) return false;
+    if (!gum_memory_is_readable(reinterpret_cast<const void*>(soinfo_ptr), 0x50)) return false;
+
+    // Scan pointer-sized slots of soinfo for a page-aligned base pointing to ELFMAG ("\x7fELF")
+    uintptr_t base = 0;
+    for (size_t off = 0; off <= 0x120; off += sizeof(void*)) {
+        uintptr_t candidate = 0;
+        if (!gum_memory_is_readable(reinterpret_cast<const void*>(soinfo_ptr + off), sizeof(void*))) {
+            break;
+        }
+        std::memcpy(&candidate, reinterpret_cast<const void*>(soinfo_ptr + off), sizeof(void*));
+        if (candidate >= 0x1000 && (candidate & 0xfff) == 0) {
+            if (gum_memory_is_readable(reinterpret_cast<const void*>(candidate), 4)) {
+                if (*reinterpret_cast<const uint32_t*>(candidate) == 0x464c457f) { // ELFMAG
+                    base = candidate;
+                    break;
+                }
+            }
+        }
+    }
+    if (!base) return false;
+    out.base = base;
+
+    const ElfW(Ehdr)* ehdr = reinterpret_cast<const ElfW(Ehdr)*>(base);
+    if (!gum_memory_is_readable(ehdr, sizeof(ElfW(Ehdr)))) return false;
+    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) return false;
+
+    uintptr_t phdr_addr = base + ehdr->e_phoff;
+    if (!gum_memory_is_readable(reinterpret_cast<const void*>(phdr_addr), sizeof(ElfW(Phdr)) * ehdr->e_phnum)) {
+        return false;
+    }
+    const ElfW(Phdr)* phdr = reinterpret_cast<const ElfW(Phdr)*>(phdr_addr);
+
+    // Compute load_bias (base - first PT_LOAD p_vaddr)
+    uintptr_t load_bias = base;
+    for (size_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            load_bias = base - phdr[i].p_vaddr;
+            break;
+        }
+    }
+
+    // Find PT_DYNAMIC
+    const ElfW(Dyn)* dynamic = nullptr;
+    for (size_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dynamic = reinterpret_cast<const ElfW(Dyn)*>(load_bias + phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dynamic || !gum_memory_is_readable(dynamic, sizeof(ElfW(Dyn)))) return false;
+
+    uintptr_t strtab = 0;
+    uintptr_t soname_idx = 0;
+    uintptr_t init_func = 0;
+    uintptr_t init_array = 0;
+    size_t init_array_sz = 0;
+
+    for (const ElfW(Dyn)* d = dynamic; ; d++) {
+        if (!gum_memory_is_readable(d, sizeof(ElfW(Dyn)))) break;
+        if (d->d_tag == DT_NULL) break;
+
+        switch (d->d_tag) {
+            case DT_STRTAB:
+                strtab = (d->d_un.d_ptr < base) ? (load_bias + d->d_un.d_ptr) : d->d_un.d_ptr;
+                break;
+            case DT_SONAME:
+                soname_idx = d->d_un.d_val;
+                break;
+            case DT_INIT:
+                init_func = (d->d_un.d_ptr < base) ? (load_bias + d->d_un.d_ptr) : d->d_un.d_ptr;
+                break;
+            case DT_INIT_ARRAY:
+                init_array = (d->d_un.d_ptr < base) ? (load_bias + d->d_un.d_ptr) : d->d_un.d_ptr;
+                break;
+            case DT_INIT_ARRAYSZ:
+                init_array_sz = d->d_un.d_val;
+                break;
+        }
+    }
+
+    // Resolve SO Name
+    if (strtab && soname_idx && gum_memory_is_readable(reinterpret_cast<const void*>(strtab + soname_idx), 1)) {
+        out.soName = reinterpret_cast<const char*>(strtab + soname_idx);
+    }
+    if (out.soName.empty()) {
+        Dl_info dli{};
+        if (dladdr(reinterpret_cast<const void*>(base), &dli) && dli.dli_fname) {
+            const char* slash = std::strrchr(dli.dli_fname, '/');
+            out.soName = slash ? (slash + 1) : dli.dli_fname;
+        }
+    }
+    if (out.soName.empty()) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "lib@0x%" PRIxPTR, base);
+        out.soName = tmp;
+    }
+
+    // Collect DT_INIT
+    if (init_func && init_func != static_cast<uintptr_t>(-1)) {
+        out.ctors.push_back({ init_func, "DT_INIT" });
+    }
+
+    // Collect DT_INIT_ARRAY
+    if (init_array && init_array_sz > 0) {
+        size_t count = init_array_sz / sizeof(void*);
+        if (gum_memory_is_readable(reinterpret_cast<const void*>(init_array), init_array_sz)) {
+            const uintptr_t* arr = reinterpret_cast<const uintptr_t*>(init_array);
+            for (size_t i = 0; i < count; i++) {
+                uintptr_t fn = arr[i];
+                if (fn != 0 && fn != static_cast<uintptr_t>(-1)) {
+                    char desc[64];
+                    uintptr_t offset = (fn >= base) ? (fn - base) : fn;
+                    snprintf(desc, sizeof(desc), "DT_INIT_ARRAY[%zu] (+0x%" PRIxPTR ")", i, offset);
+                    out.ctors.push_back({ fn, desc });
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+struct CtorRelaySession {
+    std::string soName;
+    uintptr_t base = 0;
+    pid_t thread_id = 0;
+    std::vector<std::pair<uintptr_t, std::string>> ctors;
+    size_t current_index = 0;
+    uintptr_t pending_ret_addr = 0;
+    uint32_t active_hook_id = 0;
+    uint64_t total_start_ns = 0;
+    uint64_t step_start_ns = 0;
+};
+
+static std::vector<std::shared_ptr<CtorRelaySession>> g_ctorStack;
+static std::mutex g_ctorMutex;
+
+static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session);
+
+static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session) {
+    if (!session) return;
+
+    if (session->current_index < session->ctors.size()) {
+        size_t idx = session->current_index;
+        uintptr_t target_addr = session->ctors[idx].first & ~static_cast<uintptr_t>(1);
+        std::string desc = session->ctors[idx].second;
+
+        HwHookConfig cfg;
+        cfg.type = HwHookType::BREAKPOINT;
+        cfg.address = target_addr;
+        cfg.thread_id = session->thread_id;
+        cfg.once = true; // One shot! Automatically disarms on hit
+        cfg.tag = session->soName + "!" + desc;
+
+        cfg.on_hit = [session](HwCpuContext& hwctx) {
+            session->active_hook_id = 0;
+            uint64_t now_ns = GetMonotonicTimeNs();
+            size_t idx = session->current_index;
+
+            if (idx > 0 && session->step_start_ns > 0) {
+                double prev_ms = static_cast<double>(now_ns - session->step_start_ns) / 1000000.0;
+                char doneBuf[512];
+                snprintf(doneBuf, sizeof(doneBuf),
+                         "[%s] [%zu/%zu] <- %s finished in %.2f ms",
+                         session->soName.c_str(), idx, session->ctors.size(),
+                         session->ctors[idx - 1].second.c_str(), prev_ms);
+                HW_LOGI("[constructors] %s", doneBuf);
+                BroadcastLog("constructors", doneBuf);
+            }
+
+            session->step_start_ns = now_ns;
+
+            char enterBuf[512];
+            snprintf(enterBuf, sizeof(enterBuf),
+                     "[%s] [%zu/%zu] -> calling %s @ 0x%" PRIx64,
+                     session->soName.c_str(), idx + 1, session->ctors.size(),
+                     session->ctors[idx].second.c_str(), hwctx.pc);
+            HW_LOGI("[constructors] %s", enterBuf);
+            BroadcastLog("constructors", enterBuf);
+
+            session->current_index++;
+
+            if (session->current_index < session->ctors.size()) {
+                ArmNextCtor(session);
+            } else {
+                session->pending_ret_addr = static_cast<uintptr_t>(hwctx.lr) & ~static_cast<uintptr_t>(1);
+                ArmNextCtor(session);
+            }
+        };
+
+        uint32_t id = HwHookManager::instance().attach(cfg);
+        session->active_hook_id = id;
+        if (id == 0) {
+            HW_LOGW("ArmNextCtor: failed to arm hardware breakpoint on %s (0x%" PRIxPTR ")",
+                    cfg.tag.c_str(), target_addr);
+        }
+    } else if (session->pending_ret_addr >= 0x1000) {
+        uintptr_t retAddr = session->pending_ret_addr;
+        HwHookConfig retCfg;
+        retCfg.type = HwHookType::BREAKPOINT;
+        retCfg.address = retAddr;
+        retCfg.thread_id = session->thread_id;
+        retCfg.once = true;
+        retCfg.tag = session->soName + "!ret";
+        retCfg.on_hit = [session](HwCpuContext& /*retCtx*/) {
+            session->active_hook_id = 0;
+            uint64_t end_ns = GetMonotonicTimeNs();
+            double last_ms = static_cast<double>(end_ns - session->step_start_ns) / 1000000.0;
+            double total_ms = static_cast<double>(end_ns - session->total_start_ns) / 1000000.0;
+            char finishBuf[512];
+            snprintf(finishBuf, sizeof(finishBuf),
+                     "[%s] [%zu/%zu] <- %s finished in %.2f ms (all done, total: %.2f ms)",
+                     session->soName.c_str(), session->ctors.size(), session->ctors.size(),
+                     session->ctors.back().second.c_str(), last_ms, total_ms);
+            HW_LOGI("[constructors] %s", finishBuf);
+            BroadcastLog("constructors", finishBuf);
+
+            std::shared_ptr<CtorRelaySession> parentToResume = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_ctorMutex);
+                if (!g_ctorStack.empty() && g_ctorStack.back() == session) {
+                    g_ctorStack.pop_back();
+                }
+                if (!g_ctorStack.empty()) {
+                    parentToResume = g_ctorStack.back();
+                }
+            }
+            if (parentToResume) {
+                ArmNextCtor(parentToResume);
+            }
+        };
+        session->active_hook_id = HwHookManager::instance().attach(retCfg);
+        if (session->active_hook_id == 0) {
+            HW_LOGW("ArmNextCtor: failed to arm return hook on 0x%" PRIxPTR " for %s",
+                    retAddr, session->soName.c_str());
+            std::shared_ptr<CtorRelaySession> parentToResume = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_ctorMutex);
+                if (!g_ctorStack.empty() && g_ctorStack.back() == session) {
+                    g_ctorStack.pop_back();
+                }
+                if (!g_ctorStack.empty()) {
+                    parentToResume = g_ctorStack.back();
+                }
+            }
+            if (parentToResume) {
+                ArmNextCtor(parentToResume);
+            }
+        }
+    }
+}
+
+static void HandleCallConstructorsHit(HwCpuContext& hwctx) {
+    uintptr_t soinfo_ptr = static_cast<uintptr_t>(hwctx.x[0]);
+    if (soinfo_ptr < 0x1000) return;
+
+    static size_t s_ctorsCalledOffset = DetectConstructorsCalledOffset(ResolveCallConstructorsAddress());
+    if (s_ctorsCalledOffset > 0 && gum_memory_is_readable(reinterpret_cast<const void*>(soinfo_ptr + s_ctorsCalledOffset), 1)) {
+        uint8_t called = *reinterpret_cast<const uint8_t*>(soinfo_ptr + s_ctorsCalledOffset);
+        if (called != 0) {
+            // Already initialized previously, Bionic will return early without calling constructors
+            return;
+        }
+    }
+
+    ExtractedConstructors ec;
+    if (!ExtractConstructorsFromSoinfo(soinfo_ptr, ec)) {
+        return;
+    }
+
+    if (ec.ctors.empty()) {
+        char logBuf[512];
+        snprintf(logBuf, sizeof(logBuf),
+                 "[%s] (base=0x%" PRIxPTR ") calling constructors: 0 found",
+                 ec.soName.c_str(), ec.base);
+        HW_LOGI("[constructors] %s", logBuf);
+        BroadcastLog("constructors", logBuf);
+        return;
+    }
+
+    char logBuf[512];
+    snprintf(logBuf, sizeof(logBuf),
+             "[%s] (base=0x%" PRIxPTR ") calling constructors: %zu found",
+             ec.soName.c_str(), ec.base, ec.ctors.size());
+    HW_LOGI("[constructors] %s", logBuf);
+    BroadcastLog("constructors", logBuf);
+
+    auto session = std::make_shared<CtorRelaySession>();
+    session->soName = ec.soName;
+    session->base = ec.base;
+    session->thread_id = hwctx.thread_id;
+    session->ctors = std::move(ec.ctors);
+    session->current_index = 0;
+    session->total_start_ns = GetMonotonicTimeNs();
+    session->step_start_ns = 0;
+    session->active_hook_id = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_ctorMutex);
+        if (!g_ctorStack.empty()) {
+            auto top = g_ctorStack.back();
+            if (top && top->active_hook_id != 0) {
+                HwHookManager::instance().detach(top->active_hook_id);
+                top->active_hook_id = 0;
+            }
+        }
+        g_ctorStack.push_back(session);
+    }
+
+    ArmNextCtor(session);
+}
+
 static uint32_t ArmBreakpointOrFallback(uintptr_t target, const std::string& tag, const HwHookCallback& cb) {
     HwHookConfig cfg;
     cfg.type = HwHookType::BREAKPOINT;
@@ -665,6 +1038,7 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
     }
     std::string stopLib;
     bool libLog = true;
+    bool constructors = false;
     JSValue jsCbLoading = JS_UNDEFINED;
     JSValue jsCbLoaded = JS_UNDEFINED;
 
@@ -683,6 +1057,10 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
             JSValue lVal = JS_GetPropertyStr(ctx, argv[0], "libLog");
             if (!JS_IsUndefined(lVal)) libLog = JS_ToBool(ctx, lVal);
             JS_FreeValue(ctx, lVal);
+
+            JSValue ctVal = JS_GetPropertyStr(ctx, argv[0], "constructors");
+            if (!JS_IsUndefined(ctVal)) constructors = JS_ToBool(ctx, ctVal);
+            JS_FreeValue(ctx, ctVal);
 
             JSValue cVal = JS_GetPropertyStr(ctx, argv[0], "onLoading");
             if (JS_IsFunction(ctx, cVal)) jsCbLoading = cVal; else JS_FreeValue(ctx, cVal);
@@ -791,6 +1169,16 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
         id2 = ArmBreakpointOrFallback(targetDl, "dlopen", hitCb);
     }
 
+    if (constructors) {
+        uintptr_t targetCtors = ResolveCallConstructorsAddress();
+        if (targetCtors) {
+            uint32_t cid = ArmBreakpointOrFallback(targetCtors, "call_constructors", HandleCallConstructorsHit);
+            if (cid > 0) {
+                HW_LOGI("JsHwWatchDlopen: armed soinfo::call_constructors hook (id #%u)", cid);
+            }
+        }
+    }
+
     if (id1 == 0 && id2 == 0) {
         return JS_ThrowInternalError(ctx, "[!] Failed to attach hardware breakpoint or fallback on dlopen");
     }
@@ -843,6 +1231,10 @@ void RegisterHwHookApis(JSContext* ctx, JSValue global) {
 
 size_t HwHookDetachAll() {
     size_t count = HwHookManager::instance().detachAll();
+    {
+        std::lock_guard<std::mutex> lk(g_ctorMutex);
+        g_ctorStack.clear();
+    }
     {
         std::lock_guard<std::mutex> lk(g_fallbackMutex);
         for (auto& f : g_fallbackHooks) {
@@ -925,7 +1317,7 @@ void HwHookRefreshCapacity() {
     HwHookManager::instance().refreshCapacity();
 }
 
-bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog) {
+bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog, bool constructors) {
     if (g_dlopenMonitorActive) {
         // Early boot may have raced with the injector's ptrace attachment.
         HwHookManager::instance().rearmMissingThreads();
@@ -977,6 +1369,19 @@ bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog) {
             ok = true;
         }
     }
+
+    if (constructors) {
+        uintptr_t targetCtors = ResolveCallConstructorsAddress();
+        if (targetCtors) {
+            uint32_t cid = ArmBreakpointOrFallback(targetCtors, "call_constructors", HandleCallConstructorsHit);
+            if (cid > 0) {
+                HW_LOGI("SetupDlopenHwMonitor: armed soinfo::call_constructors hook (id #%u)", cid);
+            }
+        } else {
+            HW_LOGW("SetupDlopenHwMonitor: could not resolve soinfo::call_constructors in linker");
+        }
+    }
+
     if (ok) g_dlopenMonitorActive = true;
     return ok;
 }

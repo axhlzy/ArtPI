@@ -245,6 +245,7 @@ void* AgentThreadEntry(void*) {
                 if (n > 0) {
                     std::string c(buf);
                     bool libLog = (c.find("libLog=1") != std::string::npos);
+                    bool ctors = (c.find("ctors=1") != std::string::npos);
                     bootAutoResume = (c.find("autoResume=1") != std::string::npos);
                     std::string stopLib;
                     size_t p = c.find("stopLib=");
@@ -252,10 +253,10 @@ void* AgentThreadEntry(void*) {
                         size_t end = c.find('\n', p);
                         stopLib = c.substr(p + 8, (end == std::string::npos) ? std::string::npos : (end - (p + 8)));
                     }
-                    if (libLog || !stopLib.empty()) {
-                        AG_LOGI("AgentThreadEntry: Early boot dlopen monitor armed from %s (stopLib='%s', libLog=%d)",
-                                path.c_str(), stopLib.c_str(), libLog ? 1 : 0);
-                        artpi::agent::SetupDlopenHwMonitor(stopLib, libLog);
+                    if (libLog || ctors || !stopLib.empty()) {
+                        AG_LOGI("AgentThreadEntry: Early boot dlopen monitor armed from %s (stopLib='%s', libLog=%d, ctors=%d)",
+                                path.c_str(), stopLib.c_str(), libLog ? 1 : 0, ctors ? 1 : 0);
+                        artpi::agent::SetupDlopenHwMonitor(stopLib, libLog, ctors);
                     }
                 }
                 break;

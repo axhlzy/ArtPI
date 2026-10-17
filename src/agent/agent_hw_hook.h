@@ -30,7 +30,7 @@ struct HwSlotStatus {
 
 void RegisterHwHookApis(JSContext* ctx, JSValue global);
 size_t HwHookDetachAll();
-bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog);
+bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog, bool constructors = false);
 
 // Retry arming live threads that were missed (e.g. the gated main thread was
 // still ptraced by the injector during the early-boot attach).

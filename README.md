@@ -592,10 +592,14 @@ HW.detachAll();
 2. **设备/内核不支持硬件断点**：在模拟器、云手机或部分内核未开放硬件调试寄存器访问的特殊机型上，自动平滑退回到 Gum Inline Hook。
 3. **全景状态可观测**：通过回退机制生成的 Hook 会分配统一的会话标识并在 `L()` 仪表盘的 `[Gum Inline Fallbacks]` 分区中高亮展示，同样可通过返回句柄的 `handle.detach()` 或全局 `D()` 一键解挂。
 
-#### 5. CLI 早期启动动态库监控与断点（`-S` 与 `-L` / `--stop-lib`）
+#### 5. CLI 早期启动动态库监控与构造函数接力追踪（`-S` 与 `-L` / `-LC` / `--stop-lib`）
 
-使用 `-S` 参数以孵化（Spawn）模式启动目标 App 时，配合 `-L` 或 `--stop-lib <name>`：
+使用 `-S` 参数以孵化（Spawn）模式启动目标 App 时，配合 `-L`、`-LC` 或 `--stop-lib <name>`：
 - **零延迟拦截**：在 Zygote specialize 完成瞬间立即在 `android_dlopen_ext` 与 `dlopen` 双入口装载硬件断点，确保从第 1 毫秒起捕获 App 加载的每一个 SO 库（例如 Unity 引擎的 `libmain.so`、`libunity.so`、`libil2cpp.so`）。
+- **构造函数接力追踪（`-LC` / `--lib-constructors`）**：
+  - 自动在 Linker 的 `soinfo::call_constructors` 下硬件断点，动态解析目标 SO 库内存中的 ELF Header 和 `PT_DYNAMIC` 段，提取 `DT_INIT` 及所有 `DT_INIT_ARRAY` 构造函数。
+  - **单槽接力下断机制（Daisy-Chaining）**：每个构造函数命中后立即就地回收断点槽位并下断下一个构造函数，利用 LIFO 依赖栈结合 `constructors_called` 动态探测处理 Bionic 依赖嵌套递归，无论依赖树多深均**恒定仅消耗 1 个硬件断点槽位**。
+  - **毫秒级执行耗时打点**：实时打印每个构造函数调用的相对偏移（`+0x...`）与执行耗时，并在该库所有初始化完成后输出整体耗时，助力快速定位加固壳逻辑、加解密过程或耗时最长的核心业务代码。
 - **条件挂起**：若传入 `--stop-lib libil2cpp.so`，当该库被加载时，主线程将在 dlopen 入口被自动挂起（进入 futex wait），便于在 REPL 中布控早期初始化函数，输入 `resume` 即可继续执行。
 
 ---

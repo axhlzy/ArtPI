@@ -172,9 +172,10 @@ bool HwHookManager::init() {
 
     // Do NOT fork here: init() sits on the early-boot critical path and
     // hardened apps (libDexHelper etc.) can make fork/waitpid hang forever.
-    // Start with the common default; refreshCapacity() queries the real
-    // kernel value later (interactive/exhaustion path, with a bounded wait).
-    bp_capacity_ = 4;
+    // Modern ARM64 (Cortex-A7x, X-series, Tensor, Kryo) provides 6 hardware
+    // breakpoint comparators; refreshCapacity() queries the real kernel value
+    // later (interactive/exhaustion path, with a bounded wait).
+    bp_capacity_ = 6;
     wp_capacity_ = 4;
 
     initialized_ = true;
@@ -590,6 +591,23 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
         ctx.memory_operation = (details->memory.operation == GUM_MEMOP_READ) ? 1 : 2;
     }
 
+    bool is_once = matched_session->config.once;
+    int once_slot = matched_session->assigned_slot;
+    HwHookType once_type = matched_session->config.type;
+
+    if (is_once) {
+        // One-shot: disarm and free the slot immediately so user callback can
+        // immediately re-use the exact same hardware slot (e.g. daisy-chaining).
+        mgr.disarmOnThread(*matched_session, tid);
+        if (matched_session->config.thread_id == 0) {
+            for (auto t : matched_session->armed_threads) {
+                if (t != tid) mgr.disarmOnThread(*matched_session, t);
+            }
+        }
+        matched_session->active = false;
+        mgr.freeSlot(once_type, once_slot);
+    }
+
     // 4. Invoke user callback WITHOUT the manager lock: callbacks may block for
     //    a long time (e.g. --stop-lib parks the thread) and may re-enter
     //    attach()/detach(), which would otherwise deadlock against resume().
@@ -598,10 +616,6 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
         matched_session->config.on_hit(ctx);
     }
     lk.lock();
-
-    if (!matched_session->active) {
-        return 1; // session was detached by the callback
-    }
 
     // Write back modified registers
 #if defined(__aarch64__)
@@ -612,18 +626,12 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
     std::memcpy(details->context.x, ctx.x, sizeof(ctx.x));
 #endif
 
-    // 5. Handle resuming execution
-    if (matched_session->config.once) {
-        // One-shot: disarm and deactivate
-        mgr.disarmOnThread(*matched_session, tid);
-        if (matched_session->config.thread_id == 0) {
-            for (auto t : matched_session->armed_threads) {
-                if (t != tid) mgr.disarmOnThread(*matched_session, t);
-            }
-        }
-        matched_session->active = false;
-        mgr.freeSlot(matched_session->config.type, matched_session->assigned_slot);
+    if (is_once) {
         return 1;
+    }
+
+    if (!matched_session->active) {
+        return 1; // session was detached by the callback
     }
 
     // Recurring: Step-over handling to avoid infinite loop
@@ -639,10 +647,11 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
         }
 
         if (step_slot >= 0) {
-            uintptr_t next_pc = fault_addr + 4;
+            uintptr_t cur_pc = (fault_addr >= 0x1000) ? fault_addr : pc_addr;
+            uintptr_t next_pc = cur_pc + 4;
 #if defined(__aarch64__)
-            if (fault_addr >= 0x1000) {
-                uint32_t insn = *reinterpret_cast<const uint32_t*>(fault_addr);
+            if (cur_pc >= 0x1000) {
+                uint32_t insn = *reinterpret_cast<const uint32_t*>(cur_pc);
                 // RET (d65f03c0)
                 if ((insn & 0xfffffc1f) == 0xd65f0000) {
                     next_pc = static_cast<uintptr_t>(details->context.lr);
@@ -651,7 +660,7 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
                 else if ((insn & 0x7c000000) == 0x14000000) {
                     int32_t imm26 = static_cast<int32_t>(insn & 0x03ffffff);
                     if (imm26 & 0x02000000) imm26 |= 0xfc000000;
-                    next_pc = fault_addr + (imm26 << 2);
+                    next_pc = cur_pc + (imm26 << 2);
                 }
                 // BR / BLR
                 else if ((insn & 0xfffffc1f) == 0xd61f0000 || (insn & 0xfffffc1f) == 0xd63f0000) {
@@ -668,8 +677,8 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
             matched_session->stepping_thread = tid;
             gum_thread_set_hardware_breakpoint(tid, step_slot, reinterpret_cast<GumAddress>(next_pc), nullptr);
         } else {
-            matched_session->active = false;
-            mgr.freeSlot(matched_session->config.type, matched_session->assigned_slot);
+            HW_LOGW("Step-over slot exhausted for session #%u on tid %d; keeping session active",
+                    matched_session->id, tid);
         }
         return 1;
     } else {
@@ -680,7 +689,7 @@ int HwHookManager::HandleException(void* raw_details, void* /*user_data*/) {
             if (!mgr.bp_slots_[i]) { step_slot = i; break; }
         }
         if (step_slot >= 0) {
-            uintptr_t next_pc = fault_addr + 4;
+            uintptr_t next_pc = pc_addr + 4;
             mgr.bp_slots_[step_slot] = true;
             matched_session->step_over_slot = step_slot;
             matched_session->step_over_pc = next_pc;
