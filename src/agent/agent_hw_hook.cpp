@@ -197,6 +197,58 @@ static JSValue JsHwSetRet(JSContext* ctx, JSValueConst, int argc, JSValueConst* 
     return JS_UNDEFINED;
 }
 
+// CFunctionData callback for ctx.setPc(val)
+static JSValue JsHwSetPc(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* func_data) {
+    if (argc < 1) return JS_UNDEFINED;
+    int64_t raw_ptr = 0;
+    if (JS_IsBigInt(ctx, func_data[0])) JS_ToBigInt64(ctx, &raw_ptr, func_data[0]);
+    else JS_ToInt64(ctx, &raw_ptr, func_data[0]);
+    if (!raw_ptr) return JS_UNDEFINED;
+
+    auto* hwctx = reinterpret_cast<HwCpuContext*>(raw_ptr);
+    int64_t val = 0;
+    if (JS_IsBigInt(ctx, argv[0])) JS_ToBigInt64(ctx, &val, argv[0]);
+    else JS_ToInt64(ctx, &val, argv[0]);
+
+    hwctx->pc = static_cast<uint64_t>(val);
+    return JS_UNDEFINED;
+}
+
+// CFunctionData callback for ctx.setLr(val)
+static JSValue JsHwSetLr(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* func_data) {
+    if (argc < 1) return JS_UNDEFINED;
+    int64_t raw_ptr = 0;
+    if (JS_IsBigInt(ctx, func_data[0])) JS_ToBigInt64(ctx, &raw_ptr, func_data[0]);
+    else JS_ToInt64(ctx, &raw_ptr, func_data[0]);
+    if (!raw_ptr) return JS_UNDEFINED;
+
+    auto* hwctx = reinterpret_cast<HwCpuContext*>(raw_ptr);
+    int64_t val = 0;
+    if (JS_IsBigInt(ctx, argv[0])) JS_ToBigInt64(ctx, &val, argv[0]);
+    else JS_ToInt64(ctx, &val, argv[0]);
+
+    hwctx->lr = static_cast<uint64_t>(val);
+    return JS_UNDEFINED;
+}
+
+// CFunctionData callback for ctx.skip([retVal])
+static JSValue JsHwSkip(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* func_data) {
+    int64_t raw_ptr = 0;
+    if (JS_IsBigInt(ctx, func_data[0])) JS_ToBigInt64(ctx, &raw_ptr, func_data[0]);
+    else JS_ToInt64(ctx, &raw_ptr, func_data[0]);
+    if (!raw_ptr) return JS_UNDEFINED;
+
+    auto* hwctx = reinterpret_cast<HwCpuContext*>(raw_ptr);
+    hwctx->pc = hwctx->lr;
+    if (argc >= 1) {
+        int64_t val = 0;
+        if (JS_IsBigInt(ctx, argv[0])) JS_ToBigInt64(ctx, &val, argv[0]);
+        else JS_ToInt64(ctx, &val, argv[0]);
+        hwctx->setRet(static_cast<uint64_t>(val));
+    }
+    return JS_UNDEFINED;
+}
+
 static JSValue MakeHwContextObject(JSContext* ctx, HwCpuContext& hwctx, HwHookType type) {
     JSValue o = JS_NewObject(ctx);
 
@@ -225,6 +277,9 @@ static JSValue MakeHwContextObject(JSContext* ctx, HwCpuContext& hwctx, HwHookTy
     JSValue data[1] = { dataPtr };
     JS_SetPropertyStr(ctx, o, "setArg", JS_NewCFunctionData(ctx, JsHwSetArg, 2, 0, 1, data));
     JS_SetPropertyStr(ctx, o, "setRet", JS_NewCFunctionData(ctx, JsHwSetRet, 1, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "setPc", JS_NewCFunctionData(ctx, JsHwSetPc, 1, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "setLr", JS_NewCFunctionData(ctx, JsHwSetLr, 1, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "skip", JS_NewCFunctionData(ctx, JsHwSkip, 1, 0, 1, data));
     JS_SetPropertyStr(ctx, o, "readCString", JS_NewCFunction(ctx, JsCtxReadCString, "readCString", 1));
     JS_SetPropertyStr(ctx, o, "readU32", JS_NewCFunction(ctx, JsCtxReadU32, "readU32", 1));
     JS_SetPropertyStr(ctx, o, "readU64", JS_NewCFunction(ctx, JsCtxReadU64, "readU64", 1));
@@ -772,6 +827,9 @@ struct CtorRelaySession {
 
 static std::vector<std::shared_ptr<CtorRelaySession>> g_ctorStack;
 static std::mutex g_ctorMutex;
+static JSValue g_onConstructorCb = JS_UNDEFINED;
+static JSValue g_onCallConstructorsCb = JS_UNDEFINED;
+static std::mutex g_ctorJsMutex;
 
 static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session);
 
@@ -815,6 +873,35 @@ static void ArmNextCtor(std::shared_ptr<CtorRelaySession> session) {
                      session->ctors[idx].second.c_str(), hwctx.pc);
             HW_LOGI("[constructors] %s", enterBuf);
             BroadcastLog("constructors", enterBuf);
+
+            bool bypass = false;
+            {
+                std::lock_guard<std::mutex> lkCtor(g_ctorJsMutex);
+                if (g_ctx && !JS_IsUndefined(g_onConstructorCb) && t_jsReentrancyDepth == 0) {
+                    std::lock_guard<std::mutex> lk(g_jsMutex);
+                    JSValue obj = JS_NewObject(g_ctx);
+                    JS_SetPropertyStr(g_ctx, obj, "name", JS_NewString(g_ctx, session->soName.c_str()));
+                    char hexBase[32], hexFunc[32];
+                    snprintf(hexBase, sizeof(hexBase), "0x%" PRIxPTR, session->base);
+                    snprintf(hexFunc, sizeof(hexFunc), "0x%" PRIx64, hwctx.pc);
+                    JS_SetPropertyStr(g_ctx, obj, "base", JS_NewString(g_ctx, hexBase));
+                    JS_SetPropertyStr(g_ctx, obj, "func", JS_NewString(g_ctx, hexFunc));
+                    JS_SetPropertyStr(g_ctx, obj, "desc", JS_NewString(g_ctx, session->ctors[idx].second.c_str()));
+                    JS_SetPropertyStr(g_ctx, obj, "index", JS_NewInt32(g_ctx, static_cast<int32_t>(idx + 1)));
+                    JS_SetPropertyStr(g_ctx, obj, "total", JS_NewInt32(g_ctx, static_cast<int32_t>(session->ctors.size())));
+                    JS_SetPropertyStr(g_ctx, obj, "context", MakeHwContextObject(g_ctx, hwctx, HwHookType::BREAKPOINT));
+
+                    JSValue r = JS_Call(g_ctx, g_onConstructorCb, JS_UNDEFINED, 1, &obj);
+                    if (JS_IsBool(r) && !JS_ToBool(g_ctx, r)) {
+                        bypass = true;
+                    }
+                    JS_FreeValue(g_ctx, r);
+                    JS_FreeValue(g_ctx, obj);
+                }
+            }
+            if (bypass) {
+                hwctx.pc = hwctx.lr;
+            }
 
             session->current_index++;
 
@@ -904,6 +991,45 @@ static void HandleCallConstructorsHit(HwCpuContext& hwctx) {
     ExtractedConstructors ec;
     if (!ExtractConstructorsFromSoinfo(soinfo_ptr, ec)) {
         return;
+    }
+
+    // JS onCallConstructors callback
+    {
+        std::lock_guard<std::mutex> lkCtor(g_ctorJsMutex);
+        if (g_ctx && !JS_IsUndefined(g_onCallConstructorsCb) && t_jsReentrancyDepth == 0) {
+            std::lock_guard<std::mutex> lk(g_jsMutex);
+            JSValue obj = JS_NewObject(g_ctx);
+            char hexSoinfo[32], hexBase[32];
+            snprintf(hexSoinfo, sizeof(hexSoinfo), "0x%" PRIxPTR, soinfo_ptr);
+            snprintf(hexBase, sizeof(hexBase), "0x%" PRIxPTR, ec.base);
+            JS_SetPropertyStr(g_ctx, obj, "soinfo", JS_NewString(g_ctx, hexSoinfo));
+            JS_SetPropertyStr(g_ctx, obj, "name", JS_NewString(g_ctx, ec.soName.c_str()));
+            JS_SetPropertyStr(g_ctx, obj, "base", JS_NewString(g_ctx, hexBase));
+            JS_SetPropertyStr(g_ctx, obj, "context", MakeHwContextObject(g_ctx, hwctx, HwHookType::BREAKPOINT));
+
+            JSValue arr = JS_NewArray(g_ctx);
+            for (uint32_t i = 0; i < ec.ctors.size(); i++) {
+                JSValue item = JS_NewObject(g_ctx);
+                char hexCtor[32];
+                snprintf(hexCtor, sizeof(hexCtor), "0x%" PRIxPTR, ec.ctors[i].first);
+                JS_SetPropertyStr(g_ctx, item, "func", JS_NewString(g_ctx, hexCtor));
+                JS_SetPropertyStr(g_ctx, item, "desc", JS_NewString(g_ctx, ec.ctors[i].second.c_str()));
+                JS_SetPropertyUint32(g_ctx, arr, i, item);
+            }
+            JS_SetPropertyStr(g_ctx, obj, "constructors", arr);
+
+            JSValue r = JS_Call(g_ctx, g_onCallConstructorsCb, JS_UNDEFINED, 1, &obj);
+            bool bypass = false;
+            if (JS_IsBool(r) && !JS_ToBool(g_ctx, r)) {
+                bypass = true;
+            }
+            JS_FreeValue(g_ctx, r);
+            JS_FreeValue(g_ctx, obj);
+            if (bypass) {
+                hwctx.pc = hwctx.lr;
+                return;
+            }
+        }
     }
 
     if (ec.ctors.empty()) {
@@ -1067,6 +1193,32 @@ static JSValue JsHwWatchDlopen(JSContext* ctx, JSValueConst /*this_val*/, int ar
 
             JSValue dVal = JS_GetPropertyStr(ctx, argv[0], "onLoaded");
             if (JS_IsFunction(ctx, dVal)) jsCbLoaded = dVal; else JS_FreeValue(ctx, dVal);
+
+            JSValue ctorVal = JS_GetPropertyStr(ctx, argv[0], "onConstructor");
+            if (JS_IsFunction(ctx, ctorVal)) {
+                constructors = true;
+                std::lock_guard<std::mutex> lk(g_ctorJsMutex);
+                if (g_ctx && !JS_IsUndefined(g_onConstructorCb)) JS_FreeValue(g_ctx, g_onConstructorCb);
+                g_onConstructorCb = ctorVal;
+            } else {
+                JS_FreeValue(ctx, ctorVal);
+            }
+
+            JSValue callCtorsVal = JS_GetPropertyStr(ctx, argv[0], "onCallConstructors");
+            if (JS_IsFunction(ctx, callCtorsVal)) {
+                constructors = true;
+                std::lock_guard<std::mutex> lk(g_ctorJsMutex);
+                if (g_ctx && !JS_IsUndefined(g_onCallConstructorsCb)) JS_FreeValue(g_ctx, g_onCallConstructorsCb);
+                g_onCallConstructorsCb = callCtorsVal;
+            } else {
+                JS_FreeValue(ctx, callCtorsVal);
+            }
+        }
+        if (argc >= 2 && JS_IsFunction(ctx, argv[1])) {
+            constructors = true;
+            std::lock_guard<std::mutex> lk(g_ctorJsMutex);
+            if (g_ctx && !JS_IsUndefined(g_onConstructorCb)) JS_FreeValue(g_ctx, g_onConstructorCb);
+            g_onConstructorCb = JS_DupValue(ctx, argv[1]);
         }
     }
 
@@ -1234,6 +1386,19 @@ size_t HwHookDetachAll() {
     {
         std::lock_guard<std::mutex> lk(g_ctorMutex);
         g_ctorStack.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_ctorJsMutex);
+        if (g_ctx) {
+            if (!JS_IsUndefined(g_onConstructorCb)) {
+                JS_FreeValue(g_ctx, g_onConstructorCb);
+                g_onConstructorCb = JS_UNDEFINED;
+            }
+            if (!JS_IsUndefined(g_onCallConstructorsCb)) {
+                JS_FreeValue(g_ctx, g_onCallConstructorsCb);
+                g_onCallConstructorsCb = JS_UNDEFINED;
+            }
+        }
     }
     {
         std::lock_guard<std::mutex> lk(g_fallbackMutex);

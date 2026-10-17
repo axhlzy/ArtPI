@@ -12,6 +12,8 @@
 #include "agent_hw_hook.h"
 #include "agent_dynamic.h"
 #include "agent_net.h"
+#include "agent_linker.h"
+#include "agent_qbdi.h"
 #include "sandbox/pi_interp_tracer.h"
 
 #include <map>
@@ -205,7 +207,11 @@ static const std::map<std::string, std::string> kApiDocs = {
     {"detach", "Alias for D(): detach all Java hooks + native hooks + traces."},
     {"L", "Usage: L()  (alias: list, hooks)\n  - Lists all active instrumentations: Hardware BP/WP slots, Gum fallbacks, Native hooks, Java hooks, Traces, Debug breakpoints."},
     {"list", "Alias for L()"},
-    {"hooks", "Alias for L()"}
+    {"hooks", "Alias for L()"},
+    {"Linker", "Usage: Linker.main() | Linker.list() | Linker.find(nameOrAddr) | Linker.linkMap() | Linker.getConstructors(nameOrAddr) | Linker.load(libName) | Linker.dump(target)"},
+    {"linker", "Alias for Linker (case-insensitive)"},
+    {"QBDI", "Usage: QBDI.run(fn, [args], [opts]) | QBDI.trace(fn, [args], [opts]) | QBDI.addInstrumentedModule(name) | QBDI.addInstrumentedRange(start, end) | QBDI.clearInstrumentedRanges()"},
+    {"qbdi", "Alias for QBDI (case-insensitive)"}
 };
 
 static JSValue JsListAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
@@ -361,6 +367,8 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     RegisterTraceApis(ctx, global, trace);
     RegisterDebugApis(ctx, global, debug);
     RegisterHwHookApis(ctx, global);
+    RegisterLinkerApis(ctx, global);
+    RegisterQbdiApis(ctx, global);
 
     // 3. Mount domain namespaces on global
     JS_SetPropertyStr(ctx, global, "Java", java);
@@ -537,6 +545,10 @@ std::string EvalJs(const std::string& script, const char* filename) {
     std::string effectiveScript = script;
     if (trimmed == "resume" || trimmed == "resum") {
         effectiveScript = "Process.resume()";
+    } else if (trimmed == "L" || trimmed == "list" || trimmed == "hooks") {
+        effectiveScript = "L()";
+    } else if (trimmed == "D" || trimmed == "detach") {
+        effectiveScript = "D()";
     }
 
     JSValue val = JS_Eval(g_ctx, effectiveScript.c_str(), effectiveScript.size(), filename, JS_EVAL_TYPE_GLOBAL);

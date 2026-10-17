@@ -33,6 +33,8 @@ set(AGENT_SOURCES
     agent_debug.cpp
     agent_dynamic.cpp
     agent_hw_hook.cpp
+    agent_linker.cpp
+    agent_qbdi.cpp
     agent_js.cpp
     ${QUICKJS_SOURCES}
 )
