@@ -808,5 +808,5 @@ To reveal **which native routine or shared library initiated the JNI call**, ful
 - [QBDI](https://github.com/quarkslab/QBDI) — Native Dynamic Binary Instrumentation (DBI) engine
 - [QuickJS](https://bellard.org/quickjs/) — Lightweight embeddable JavaScript engine
 - [xDL](https://github.com/hexhacking/xDL) — Android 7.0+ linker namespace bypass
-- UnityResolve.hpp — Unity IL2CPP metadata resolution and invocation (MIT, vendored under `external/unityresolve`)
+- [UnityResolve.hpp](https://github.com/issuimo/UnityResolve.hpp) — Unity IL2CPP metadata resolution and invocation (MIT, vendored under `external/unityresolve`)
 - [xz-embedded](https://github.com/torvalds/linux/tree/master/lib/xz) — Embedded LZMA2/XZ decompression

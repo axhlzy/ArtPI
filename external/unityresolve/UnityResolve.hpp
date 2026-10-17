@@ -1,6 +1,9 @@
 #ifndef UNITYRESOLVE_HPP
 #define UNITYRESOLVE_HPP
 
+// Upstream: https://github.com/issuimo/UnityResolve.hpp
+// Vendored for ArtPI; Android resolves il2cpp_* through xDL (see below).
+
 // ============================== 自动检测当前环境 ==============================
 
 #if defined(_WIN32) || defined(_WIN64)

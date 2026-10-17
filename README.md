@@ -920,5 +920,5 @@ qbdi.trace({
 - [QBDI](https://github.com/quarkslab/QBDI) —— Native 动态二进制插桩（DBI）执行器
 - [QuickJS](https://bellard.org/quickjs/) —— 嵌入式轻量 JavaScript 引擎
 - [xDL](https://github.com/hexhacking/xDL) —— Android 7.0+ linker namespace 绕过
-- UnityResolve.hpp —— Unity IL2CPP 元数据解析与调用（MIT，vendored 于 `external/unityresolve`）
+- [UnityResolve.hpp](https://github.com/issuimo/UnityResolve.hpp) —— Unity IL2CPP 元数据解析与调用（MIT，vendored 于 `external/unityresolve`）
 - [xz-embedded](https://github.com/torvalds/linux/tree/master/lib/xz) —— LZMA 解压缩
