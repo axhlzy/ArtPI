@@ -6,6 +6,7 @@
 #include "agent_js.h"
 #include "agent_common.h"
 #include "agent_hw_hook.h"
+#include "agent_unity.h"
 #include "../../include/ArtPI.h"
 
 #include <pthread.h>
@@ -252,6 +253,20 @@ void* AgentThreadEntry(void*) {
                     if (p != std::string::npos) {
                         size_t end = c.find('\n', p);
                         stopLib = c.substr(p + 8, (end == std::string::npos) ? std::string::npos : (end - (p + 8)));
+                    }
+                    std::string unityLibDir;
+                    size_t udp = c.find("unityLibDir=");
+                    if (udp != std::string::npos) {
+                        size_t end = c.find('\n', udp);
+                        unityLibDir = c.substr(udp + 12, (end == std::string::npos) ? std::string::npos : (end - (udp + 12)));
+                        while (!unityLibDir.empty() &&
+                               (unityLibDir.back() == '\r' || unityLibDir.back() == ' ')) {
+                            unityLibDir.pop_back();
+                        }
+                        if (!unityLibDir.empty()) {
+                            artpi::agent::UnitySetLibDirHint(unityLibDir);
+                            AG_LOGI("AgentThreadEntry: unity lib dir hint = %s", unityLibDir.c_str());
+                        }
                     }
                     std::string qbdiFilter;
                     size_t qp = c.find("qbdiFilter=");

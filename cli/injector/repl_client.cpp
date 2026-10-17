@@ -228,6 +228,7 @@ const std::vector<std::string> kCompletions = {
 
     "dynamic.java.",
     "dynamic.native.",
+    "dynamic.unity.",
 
     "findclass(\"",
     "findmethod(",
@@ -417,6 +418,66 @@ int g_selectedMenuIndex = 0;
 std::vector<std::string> g_menuItems;
 size_t g_menuTokenStart = 0;
 
+static std::string JsonUnescape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c != '\\' || i + 1 >= s.size()) {
+            out.push_back(c);
+            continue;
+        }
+        char n = s[++i];
+        switch (n) {
+        case '"': out.push_back('"'); break;
+        case '\\': out.push_back('\\'); break;
+        case '/': out.push_back('/'); break;
+        case 'b': out.push_back('\b'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'r': out.push_back('\r'); break;
+        case 't': out.push_back('\t'); break;
+        case 'u': {
+            if (i + 4 < s.size()) {
+                unsigned cp = 0;
+                bool ok = true;
+                for (int k = 1; k <= 4; ++k) {
+                    char h = s[i + k];
+                    int v;
+                    if (h >= '0' && h <= '9') v = h - '0';
+                    else if (h >= 'a' && h <= 'f') v = h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') v = h - 'A' + 10;
+                    else { ok = false; break; }
+                    cp = (cp << 4) | static_cast<unsigned>(v);
+                }
+                if (ok) {
+                    i += 4;
+                    if (cp < 0x80) {
+                        out.push_back(static_cast<char>(cp));
+                    } else if (cp < 0x800) {
+                        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                    } else {
+                        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                    }
+                    break;
+                }
+            }
+            out.push_back('\\');
+            out.push_back('u');
+            break;
+        }
+        default:
+            out.push_back('\\');
+            out.push_back(n);
+            break;
+        }
+    }
+    return out;
+}
+
 static std::vector<std::string> ExtractJsonStringArray(const std::string& json, const std::string& key = "") {
     std::vector<std::string> res;
     size_t start = 0;
@@ -464,7 +525,7 @@ static std::vector<std::string> ExtractJsonStringArray(const std::string& json, 
             }
         }
         if (q2 == std::string::npos) break;
-        res.push_back(json.substr(q1 + 1, q2 - q1 - 1));
+        res.push_back(JsonUnescape(json.substr(q1 + 1, q2 - q1 - 1)));
         cur = q2 + 1;
     }
     return res;
@@ -576,6 +637,8 @@ static void FetchDynamicCompletions(int fd, const AgentEndpoint& ep) {
         g_dynamicModules = ExtractJsonStringArray(res, "modules");
     }
 }
+
+static std::vector<std::string> FetchExprMembers(const std::string& expr);
 
 static std::vector<std::string> GetCandidatesForToken(const std::string& token) {
     std::vector<std::string> results;
@@ -735,6 +798,33 @@ static std::vector<std::string> GetCandidatesForToken(const std::string& token) 
                             results.push_back(cand);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // 4. Dynamic Unity completions: dynamic.unity.<assembly>.<class>.<member>
+    //    Deeper expressions (quotes/parentheses) take the member-access path
+    //    below and are served by __getCompletions()/__native_unity_completions.
+    if (token.rfind("dynamic.unity.", 0) == 0 || std::string("dynamic.unity.").rfind(token, 0) == 0) {
+        if (token == "dynamic." || token == "dynamic.u" || token == "dynamic.un" ||
+            token == "dynamic.uni" || token == "dynamic.unit" || token == "dynamic.unity") {
+            results.push_back("dynamic.unity.");
+        } else {
+            std::string rest = token.size() > 14 ? token.substr(14) : "";
+            // Nested plain objects (dynamic.unity.hooks., dynamic.unity.il2cpp.)
+            // are evaluated directly; otherwise complete the domain root.
+            std::string expr = "dynamic.unity";
+            std::string after = rest;
+            size_t lastDot = rest.rfind('.');
+            if (lastDot != std::string::npos) {
+                expr += "." + rest.substr(0, lastDot);
+                after = rest.substr(lastDot + 1);
+            }
+            auto members = FetchExprMembers(expr);
+            for (const auto& m : members) {
+                if (after.empty() || StartsWithIgnoreCase(m, after)) {
+                    results.push_back(expr + "." + m);
                 }
             }
         }
@@ -1071,7 +1161,7 @@ void HandleTabCompletion() {
 
     if (ctx.prefix.empty() && !ctx.isMemberAccess) {
         std::vector<std::string> basics = {
-            "dynamic.java.", "dynamic.native.", "Java.", "Native.", "Trace.", "Debug.", "Memory.", "findclass(\"", "artobject(", "exit"
+            "dynamic.java.", "dynamic.native.", "dynamic.unity.", "Java.", "Native.", "Trace.", "Debug.", "Memory.", "findclass(\"", "artobject(", "exit"
         };
         RenderDropdownMenuLocked(basics, 0);
         return;

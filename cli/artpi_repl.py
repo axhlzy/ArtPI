@@ -94,6 +94,7 @@ COMPLETIONS = [
 
     "dynamic.java.",
     "dynamic.native.",
+    "dynamic.unity.",
 
     "findclass(\"",
     "findmethod(",
@@ -202,6 +203,8 @@ class ArtPiCompleter:
             matches.extend(self._java_matches(text))
         if text.startswith("dynamic.native.") or "dynamic.native.".startswith(text):
             matches.extend(self._native_matches(text))
+        if text.startswith("dynamic.unity.") or "dynamic.unity.".startswith(text):
+            matches.extend(self._unity_matches(text))
 
         seen = set()
         uniq = []
@@ -289,6 +292,66 @@ class ArtPiCompleter:
                     if cand.lower().startswith(text.lower()) and cand not in out:
                         out.append(cand)
         return out
+
+    def _unity_matches(self, text):
+        out = []
+        prefix = "dynamic.unity."
+        if not text.startswith(prefix):
+            if prefix.startswith(text):
+                out.append(prefix)
+            return out
+
+        rest = text[len(prefix):]
+        expr = "dynamic.unity"
+        after = rest
+        base = prefix
+
+        # Find the last top-level '.' outside quotes/parentheses.
+        depth = 0
+        in_quote = False
+        quote = ""
+        esc = False
+        last_dot = -1
+        for i, ch in enumerate(rest):
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if in_quote:
+                if ch == quote:
+                    in_quote = False
+                continue
+            if ch in "\"'":
+                in_quote = True
+                quote = ch
+                continue
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth = max(0, depth - 1)
+            elif ch == "." and depth == 0:
+                last_dot = i
+
+        if last_dot >= 0:
+            expr = prefix + rest[:last_dot]
+            after = rest[last_dot + 1:]
+            base = prefix + rest[:last_dot + 1]
+
+        try:
+            raw = self.client.eval_js_sync(
+                "JSON.stringify(__getCompletions({}))".format(json.dumps(expr)))
+            members = json.loads(raw) if raw else []
+        except Exception:
+            members = []
+
+        for m in members:
+            if not after or m.lower().startswith(after.lower()):
+                cand = base + m
+                if cand not in out:
+                    out.append(cand)
+        return out[:60]
 
 
 def setup_readline(client):

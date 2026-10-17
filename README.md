@@ -34,7 +34,8 @@
 | **界面自动化 (`UI.*`)** | `UI.dump` 打印 View 层级树，`UI.find` 附带祖先链与最近点击目标，`UI.click` / `swipe` / `setText` 免 ADB 直接操作界面 |
 | **ptrace 链式内嵌注入** | 单个 `artpi-cli` 二进制**联合内嵌 Agent SO 与 JADX CLI Jar**，自动解压部署，支持 `-P <pid>` / `-k <pkg>` / `-f <file>` |
 | **硬件断点/观察点** | 现代统一 API（`HW.attach` 代码断点 / `HW.watch` 数据断点 / `HW.watchDlopen` 动态库监控），ARM64 物理调试寄存器驱动，零内存修改、无检测特征、跨线程布控与硬件单步连续触发 |
-| **内置 QuickJS REPL** | 注入后直接进入交互终端，支持可注册代理域 `dynamic.java` / `dynamic.native`（`unity` / `objc` 按运行时条件挂载），免重编动态分析 |
+| **Unity IL2CPP 分析** | 基于 UnityResolve 的 `dynamic.unity`：程序集/类/字段/方法遍历与调用、通配符 `findclass` / `findmethods`、MethodInfo 断点与 Hook、GameObject / Button 监听器解析、`libil2cpp.so` 导出符号直达 |
+| **内置 QuickJS REPL** | 注入后直接进入交互终端，支持可注册代理域 `dynamic.java` / `dynamic.native` / `dynamic.unity`（`objc` 按运行时条件挂载），免重编动态分析 |
 
 ---
 
@@ -337,14 +338,69 @@ jmethodBox(item.clickTarget.clickListener.artMethod).hook(function(ctx) {
 |---|---|---|
 | `dynamic.java` | Android / ART 进程 | 完整实现 |
 | `dynamic.native` | 始终 | 完整实现 |
-| `dynamic.unity` | Android 进程检测到 `libil2cpp.so` / `libunity.so` | 空实现框架（预留） |
+| `dynamic.unity` | Android 进程检测到 `libil2cpp.so` / `libunity.so`，或 injector 提供 `unityLibDir` | 完整实现（UnityResolve / IL2CPP） |
 | `dynamic.objc` | Apple 平台 | 空实现框架（预留） |
 
 ```javascript
-dynamic.domains();                    // 已挂载域列表，如 ["java", "native"]
+dynamic.domains();                    // 已挂载域列表，如 ["java", "native", "unity"]
 dynamic.has("unity");                 // 是否挂载
 dynamic.register("mydomain", rootObj);// 注册自定义域
 ```
+
+#### 5. Unity 域 (`dynamic.unity.*`) — UnityResolve / IL2CPP
+
+`dynamic.unity` 基于 vendored 的 `UnityResolve.hpp`，采用懒初始化：只有在 `libil2cpp.so` 已加载且 Unity 运行时完成启动后才读取元数据；启动早期调用会返回可重试错误，不会在 loader 阶段崩溃。
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `unity.available()` / `isAvailable()` | `()` | 运行时与元数据是否就绪 |
+| `unity.assemblies()` | `()` | 程序集名称列表 |
+| `unity.assembly` | `(name)` | 获取程序集包装对象 |
+| `unity.class` | `(asm, name[, ns])` | 获取类包装对象 |
+| `unity.findclass` | `(pattern[, options])` | 遍历全部类；支持 `*` / `?` 通配符 |
+| `unity.findmethods` | `(pattern[, options])` | 遍历全部方法；支持 `*` / `?` 通配符 |
+| `unity.m` | `(classOrName[, sort[, detailed]])` | 等价 Il2CppHookScripts 的 `m()` / `showMethods` |
+| `unity.mi` | `(methodInfoPtr)` | 打印 Assembly → Image → Class → Method 层级 |
+| `unity.b` | `(methodInfoPtr[, maxCalls])` | 单方法详细断点（入参、返回、时间） |
+| `unity.lfs` | `(instancePtr)` | 列出实例字段、偏移、类型与值 |
+| `unity.showGameObject` | `(gameObjectPtr)` | 打印 GameObject 名称、Layer、Transform 与层级 |
+| `unity.button` / `unity.buttons()` | `(buttonPtr)` / `()` | 检查按钮及其 onClick 监听器 |
+| `unity.B_Button` | `()` | Hook `Button.OnPointerClick` / `UIButton.OnClick`，打印 hook MethodInfo、GameObject、`m_RuntimeCalls` / `m_PersistentCalls` 及每个 UnityAction 的 MethodInfo、RVA、签名和 target |
+| `unity.HookSetActive` | `()` | Hook `GameObject.SetActive`，同对象同状态去重输出 |
+| `unity.HookOnPointerClick` | `()` | Hook `Button.OnPointerClick` 并输出 GameObject 信息 |
+| `unity.hooks.BF` / `BFA` | `(filter[, options])` | 按方法名批量 inline hook |
+| `unity.hooks.list()` / `unhookAll()` | `()` | 查看 / 卸载 Unity hook |
+| `unity.il2cpp.<symbol>` | property | 访问 `libil2cpp.so` 任意导出符号，返回 `NativeBox`（含地址/hook/dump 等） |
+| `unity.dump` | `([path])` | 导出 `dump.cs` |
+
+`findclass` / `findmethods` 的 options 支持 `{ assembly, namespace, class, exact, limit, includeAbstract }`。`unity.m` 的 `sort` 可为 `access` / `address` / `name` / `args`。
+
+```javascript
+dynamic.unity.findclass("*Stage12*");
+dynamic.unity.findmethods("Run", { class: "Stage12*", limit: 30 });
+
+let cls = dynamic.unity.assembly("Assembly-CSharp.dll")
+                     .class("Stage12CueResetSourceChecks");
+cls.methods();   // 0x... ---> 0x... (0x7c6644@libil2cpp.so) | public static String Run()
+cls.m();         // TS m() / showMethods 风格
+cls.m("address", true); // 按地址排序并展开详细参数
+
+// MethodInfo 指针位于 methodInfo，native 函数地址位于 address
+let run = cls.method("Run");
+dynamic.unity.b(run.methodInfo);       // 详细断点
+dynamic.unity.mi(run.methodInfo);      // 层级信息
+
+dynamic.unity.B_Button();              // 点击时输出监听方法 MethodInfo
+dynamic.unity.buttons();
+
+// libil2cpp.so 导出符号直达；Tab 可补全全部导出
+dynamic.unity.il2cpp.il2cpp_string_new;
+dynamic.unity.il2cpp.;
+
+D();  // 同时卸载 Java / native / Unity 等全部 hook
+```
+
+> `m`、`findclass`、`findmethods` 仅挂载在 `dynamic.unity` 下，不暴露为全局函数，避免与 Java 侧同名 API 冲突。
 
 ---
 
@@ -864,4 +920,5 @@ qbdi.trace({
 - [QBDI](https://github.com/quarkslab/QBDI) —— Native 动态二进制插桩（DBI）执行器
 - [QuickJS](https://bellard.org/quickjs/) —— 嵌入式轻量 JavaScript 引擎
 - [xDL](https://github.com/hexhacking/xDL) —— Android 7.0+ linker namespace 绕过
+- UnityResolve.hpp —— Unity IL2CPP 元数据解析与调用（MIT，vendored 于 `external/unityresolve`）
 - [xz-embedded](https://github.com/torvalds/linux/tree/master/lib/xz) —— LZMA 解压缩

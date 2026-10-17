@@ -15,6 +15,7 @@
 #include "agent_linker.h"
 #include "agent_qbdi.h"
 #include "agent_jni.h"
+#include "agent_unity.h"
 #include "sandbox/pi_interp_tracer.h"
 
 #include <map>
@@ -391,12 +392,14 @@ static JSValue JsDetachAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc
     size_t n = NativeUnhookAllCount();
     size_t t = TraceStopAll();
     size_t hw = HwHookDetachAll();
+    size_t u = UnityDetachAll();
     JniStopTrace();
     std::string msg = "Detached: " + std::to_string(j) + " java hook(s), "
                     + std::to_string(n) + " native hook(s), "
                     + std::to_string(t) + " trace(s), "
                     + std::to_string(d) + " debug breakpoint(s), "
-                    + std::to_string(hw) + " hardware hook(s), JNI vtable restored";
+                    + std::to_string(hw) + " hardware hook(s), "
+                    + std::to_string(u) + " unity hook(s), JNI vtable restored";
     return JS_NewString(ctx, msg.c_str());
 }
 

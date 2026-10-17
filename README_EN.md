@@ -34,7 +34,8 @@ Target Platform: **Android 7.0 ~ 15 (arm64-v8a)**, root privileges required for 
 | **UI Automation (`UI.*`)** | `UI.dump` prints the view hierarchy, `UI.find` returns the ancestor chain and nearest click target, and `UI.click` / `swipe` / `setText` drive the UI directly without ADB |
 | **Self-Contained Multi-Payload Packing** | A single `artpi-cli` binary encapsulates the injector ELF, XZ-compressed `libartpi_agent.so`, and deflated `jadxcli.jar` (~10MB total), auto-extracting upon launch |
 | **Hardware Breakpoint / Watchpoint** | Modern unified API (`HW.attach` code breakpoint / `HW.watch` data watchpoint / `HW.watchDlopen` library monitoring), powered by ARM64 debug registers with zero code patching, zero stealth footprint, cross-thread arming, and seamless step-over state machine |
-| **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with registrable proxy domains (`dynamic.java.*`, `dynamic.native.*`; `unity` / `objc` mounted by runtime), eliminating script compilation overhead |
+| **Unity IL2CPP Analysis** | `dynamic.unity` powered by UnityResolve: assembly/class/field/method traversal and invocation, wildcard `findclass` / `findmethods`, MethodInfo breakpoints and hooks, GameObject / Button listener inspection, and direct `libil2cpp.so` export access |
+| **Built-in QuickJS REPL** | Direct terminal interaction inside the target process with registrable proxy domains (`dynamic.java.*`, `dynamic.native.*`, `dynamic.unity.*`; `objc` mounted by runtime), eliminating script compilation overhead |
 
 ---
 
@@ -309,14 +310,69 @@ jmethodBox(item.clickTarget.clickListener.artMethod).hook(function(ctx) {
 |---|---|---|
 | `dynamic.java` | Android / ART process | Full |
 | `dynamic.native` | Always | Full |
-| `dynamic.unity` | Android process with `libil2cpp.so` / `libunity.so` loaded | Empty stub (reserved) |
+| `dynamic.unity` | Android process with `libil2cpp.so` / `libunity.so` loaded, or an injector-provided `unityLibDir` hint | Full (UnityResolve / IL2CPP) |
 | `dynamic.objc` | Apple platform | Empty stub (reserved) |
 
 ```javascript
-dynamic.domains();                    // mounted domains, e.g. ["java", "native"]
+dynamic.domains();                    // mounted domains, e.g. ["java", "native", "unity"]
 dynamic.has("unity");                 // whether a domain is mounted
 dynamic.register("mydomain", rootObj);// register a custom domain
 ```
+
+#### 5. Unity Domain (`dynamic.unity.*`) — UnityResolve / IL2CPP
+
+`dynamic.unity` is backed by the vendored `UnityResolve.hpp`. Initialization is lazy: metadata is read only after `libil2cpp.so` is loaded and the Unity runtime has finished starting. Early calls return a retryable error instead of faulting inside the Unity loader.
+
+| API | Signature | Description |
+|---|---|---|
+| `unity.available()` / `isAvailable()` | `()` | Whether the runtime and metadata are ready |
+| `unity.assemblies()` | `()` | Assembly name list |
+| `unity.assembly` | `(name)` | Assembly wrapper |
+| `unity.class` | `(asm, name[, ns])` | Class wrapper |
+| `unity.findclass` | `(pattern[, options])` | Scans all classes; supports `*` / `?` wildcards |
+| `unity.findmethods` | `(pattern[, options])` | Scans all methods; supports `*` / `?` wildcards |
+| `unity.m` | `(classOrName[, sort[, detailed]])` | Il2CppHookScripts-compatible `m()` / `showMethods` |
+| `unity.mi` | `(methodInfoPtr)` | Prints Assembly → Image → Class → Method hierarchy |
+| `unity.b` | `(methodInfoPtr[, maxCalls])` | Detailed single-method breakpoint (args, return value, time) |
+| `unity.lfs` | `(instancePtr)` | Lists instance fields, offsets, types, and values |
+| `unity.showGameObject` | `(gameObjectPtr)` | Prints GameObject name, layer, transform, and hierarchy |
+| `unity.button` / `unity.buttons()` | `(buttonPtr)` / `()` | Inspect buttons and their onClick listeners |
+| `unity.B_Button` | `()` | Hooks `Button.OnPointerClick` / `UIButton.OnClick` and prints the hook MethodInfo, GameObject, `m_RuntimeCalls` / `m_PersistentCalls`, and each UnityAction's MethodInfo, RVA, signature, and target |
+| `unity.HookSetActive` | `()` | Hooks `GameObject.SetActive` with per-object/state deduplication |
+| `unity.HookOnPointerClick` | `()` | Hooks `Button.OnPointerClick` and prints GameObject info |
+| `unity.hooks.BF` / `BFA` | `(filter[, options])` | Batch inline hooks by method name |
+| `unity.hooks.list()` / `unhookAll()` | `()` | List / detach Unity hooks |
+| `unity.il2cpp.<symbol>` | property | Access any `libil2cpp.so` export as a `NativeBox` (address/hook/dump helpers) |
+| `unity.dump` | `([path])` | Dump `dump.cs` |
+
+`findclass` / `findmethods` options: `{ assembly, namespace, class, exact, limit, includeAbstract }`. `unity.m` accepts `sort` = `access` / `address` / `name` / `args`.
+
+```javascript
+dynamic.unity.findclass("*Stage12*");
+dynamic.unity.findmethods("Run", { class: "Stage12*", limit: 30 });
+
+let cls = dynamic.unity.assembly("Assembly-CSharp.dll")
+                     .class("Stage12CueResetSourceChecks");
+cls.methods();   // 0x... ---> 0x... (0x7c6644@libil2cpp.so) | public static String Run()
+cls.m();         // TS m() / showMethods style
+cls.m("address", true); // sort by address with detailed parameters
+
+// MethodInfo pointer is methodInfo; native function address is address
+let run = cls.method("Run");
+dynamic.unity.b(run.methodInfo);       // detailed breakpoint
+dynamic.unity.mi(run.methodInfo);      // hierarchy
+
+dynamic.unity.B_Button();              // print listener MethodInfo on click
+dynamic.unity.buttons();
+
+// Direct libil2cpp.so exports; Tab completes all exported symbols
+dynamic.unity.il2cpp.il2cpp_string_new;
+dynamic.unity.il2cpp.;
+
+D();  // detaches Java / native / Unity hooks together
+```
+
+> `m`, `findclass`, and `findmethods` are mounted only under `dynamic.unity` (not global) to avoid collisions with the Java-side APIs.
 
 ---
 
@@ -752,4 +808,5 @@ To reveal **which native routine or shared library initiated the JNI call**, ful
 - [QBDI](https://github.com/quarkslab/QBDI) — Native Dynamic Binary Instrumentation (DBI) engine
 - [QuickJS](https://bellard.org/quickjs/) — Lightweight embeddable JavaScript engine
 - [xDL](https://github.com/hexhacking/xDL) — Android 7.0+ linker namespace bypass
+- UnityResolve.hpp — Unity IL2CPP metadata resolution and invocation (MIT, vendored under `external/unityresolve`)
 - [xz-embedded](https://github.com/torvalds/linux/tree/master/lib/xz) — Embedded LZMA2/XZ decompression

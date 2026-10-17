@@ -32,6 +32,7 @@ set(AGENT_SOURCES
     agent_trace.cpp
     agent_debug.cpp
     agent_dynamic.cpp
+    agent_unity.cpp
     agent_hw_hook.cpp
     agent_linker.cpp
     agent_qbdi.cpp
@@ -51,9 +52,15 @@ target_include_directories(artpi_agent PRIVATE
     ../../engine/mpack
     ../../external/xdl/include
     ../../external/qbdi/include
+    ../../external/unityresolve
     ../../engine/native
     ../../engine/native/qbdi
 )
+
+# UnityResolve::Invoke uses try/catch; the rest of the agent is built with
+# -fno-exceptions, so enable exceptions only for this translation unit.
+set_source_files_properties(agent_unity.cpp PROPERTIES
+    COMPILE_FLAGS "-fexceptions -Wno-deprecated-declarations")
 
 find_library(log-lib log)
 

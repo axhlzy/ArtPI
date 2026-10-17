@@ -318,6 +318,33 @@ namespace {
         return true;
     }
 
+    // Resolve the installed APK path via `pm path` (works before the app runs).
+    std::string ResolveApkPath(const std::string &pkg) {
+        if (pkg.empty()) return "";
+        std::string cmd = "pm path " + pkg + " 2>/dev/null";
+        FILE *fp = popen(cmd.c_str(), "r");
+        if (!fp) return "";
+        char line[512];
+        std::string out;
+        while (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strncmp(line, "package:", 8) == 0) {
+                out = line + 8;
+                break;
+            }
+        }
+        pclose(fp);
+        return out;
+    }
+
+    // /data/app/.../base.apk -> /data/app/.../lib/arm64 (UnityResolve hint).
+    std::string ResolveUnityLibDir(const std::string &pkg) {
+        std::string apk = ResolveApkPath(pkg);
+        size_t slash = apk.rfind('/');
+        if (slash == std::string::npos) return "";
+        return apk.substr(0, slash) + "/lib/arm64";
+    }
+
     void EnsureJadxJarDeployed() {
         const char* targetPath = "/data/local/tmp/jadxcli.jar";
         struct stat st{};
@@ -501,20 +528,25 @@ int main(int argc, char **argv) {
                 printf("[+] pre-deployed payload -> %s (%zu bytes)\n",
                        preDeployedSoPath.c_str(), preExtractedPayload.size());
             }
-            if (opt.libLog || opt.libConstructors || !opt.stopLib.empty()) {
+            // Always write the boot cfg in spawn mode: besides the early
+            // dlopen monitor, it carries the Unity lib dir hint used by
+            // dynamic.unity to detect libil2cpp.so before it is mapped.
+            {
+                std::string unityLibDir = ResolveUnityLibDir(opt.pkgName);
                 std::string cfgPath = dataDir + "/artpi_boot.cfg";
                 int fd = open(cfgPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
                 if (fd >= 0) {
-                    char buf[256];
+                    char buf[512];
                     // autoResume lets the agent release the gated main thread by
                     // itself once the early monitor is armed (covers --server and
                     // a client that fails to connect).
-                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\nautoResume=%d\nctors=%d\nqbdiFilter=%s\nqbdiMaxLog=%zu\n",
+                    snprintf(buf, sizeof(buf), "libLog=%d\nstopLib=%s\nautoResume=%d\nctors=%d\nqbdiFilter=%s\nqbdiMaxLog=%zu\nunityLibDir=%s\n",
                              opt.libLog ? 1 : 0, opt.stopLib.c_str(),
                              ShouldAutoGateSpawn(opt) ? 1 : 0,
                              opt.libConstructors ? 1 : 0,
                              opt.qbdiFilter.c_str(),
-                             opt.fullLog ? 0 : opt.maxLog);
+                             opt.fullLog ? 0 : opt.maxLog,
+                             unityLibDir.c_str());
                     write(fd, buf, strlen(buf));
                     close(fd);
                     struct stat dirSt{};

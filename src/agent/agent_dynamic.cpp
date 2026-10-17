@@ -6,6 +6,7 @@
 #include "agent_java.h"
 #include "agent_native.h"
 #include "agent_memory.h"
+#include "agent_unity.h"
 #include "../../include/ArtPI.h"
 #include "frida-gum.h"
 
@@ -15,6 +16,18 @@
 #include <algorithm>
 #include <sstream>
 #include <mutex>
+#include <cstdio>
+#include <cstring>
+#include <dlfcn.h>
+#include <unistd.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+#ifndef RTLD_NOLOAD
+#define RTLD_NOLOAD 0x4
+#endif
 
 namespace artpi { namespace agent {
 
@@ -702,23 +715,45 @@ const char* kDynamicBootstrapJs = R"JS(
     // =========================================================================
     // 3. Dynamic Unity & ObjC stubs
     // =========================================================================
-    function makeUnityRoot() {
-        let root = {
-            $domain: "unity",
-            $available: true,
-            isAvailable: function() { return true; },
-            findAssemblies: function() { return []; },
-            findClasses: function() { return []; },
-            findMethods: function() { return []; },
-            toString: function() { return "[UnityDomain available: empty implementation]"; }
+    // dynamic.unity.il2cpp exposes every exported symbol of libil2cpp.so.
+    // Property access returns a NativeBox (address/hook/dump helpers); tab
+    // completion is served by __native_unity_completions('il2cpp').
+    function makeUnityIl2cppRoot() {
+        let box = {
+            __unity_kind: "il2cpp",
+            __ptr: 0,
+            $name: "libil2cpp.so",
+            findSymbol: function(name) {
+                return Native.findSymbol("libil2cpp.so", name);
+            },
+            toString: function() { return "[UnityIL2CPP libil2cpp.so]"; }
         };
-        return new Proxy(root, {
+        return new Proxy(box, {
             get(target, prop) {
                 if (typeof prop !== 'string') return target[prop];
                 if (prop in target) return target[prop];
-                return createUnavailableDomain("unity." + prop, "Unity metadata resolver is not implemented yet");
+                // Never treat internal probes (__h/__ptr/...) as symbols; the
+                // generic completion helper checks __h to detect Java refs.
+                if (prop.charCodeAt(0) === 95) return undefined;
+                let addr = Native.findSymbol("libil2cpp.so", prop);
+                if (!addr) addr = Native.findSymbol("libil2cpp.so", "_" + prop);
+                return makeNativeBox("libil2cpp.so", prop, addr || 0n);
             }
         });
+    }
+
+    function makeUnityRoot() {
+        let root = globalThis.__NativeUnity;
+        if (!root) return createUnavailableDomain("unity", "UnityResolve bridge missing");
+        root.$domain = "unity";
+        root.$available = true;
+        root.il2cpp = makeUnityIl2cppRoot();
+        // Compatibility aliases with the old placeholder API.
+        root.findAssemblies = function() { try { return root.assemblies(); } catch (e) { return []; } };
+        root.findClasses = function(a) { try { let asm = root.assembly(a); return asm ? asm.classes() : []; } catch (e) { return []; } };
+        root.findMethods = function(a, c) { try { let asm = root.assembly(a); let cls = asm && asm.class(c); return cls ? cls.methods() : []; } catch (e) { return []; } };
+        root.toString = function() { return "[UnityDomain: UnityResolve]"; };
+        return root;
     }
 
     function makeObjcRoot() {
@@ -791,6 +826,68 @@ static bool HasLoadedModuleByName(const char* needle) {
     return false;
 }
 
+#if defined(__ANDROID__)
+static std::string DynamicCurrentPackage() {
+    char buf[256] = {0};
+    FILE* fp = fopen("/proc/self/cmdline", "rb");
+    if (!fp) return "";
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    std::string s(buf, n);
+    size_t nul = s.find('\0');
+    if (nul != std::string::npos) s = s.substr(0, nul);
+    size_t colon = s.find(':');
+    if (colon != std::string::npos) s = s.substr(0, colon);
+    return s;
+}
+
+static bool FileExists(const std::string& path) {
+    return access(path.c_str(), F_OK) == 0;
+}
+
+// True when the app ships a Unity runtime even if it has not been dlopen'd yet
+// (important for -S: the agent runs before libil2cpp.so is mapped).  Derive the
+// app's native lib dir from the mapped base.apk instead of globbing /data/app
+// (glob is API 28+ and /data/app is not listable from the app UID).
+static bool HasUnityLibraryOnDisk() {
+    // Injector-provided hint from the boot cfg: <apk-dir>/lib/arm64.
+    std::string hint = UnityGetLibDirHint();
+    if (!hint.empty() &&
+        (FileExists(hint + "/libil2cpp.so") || FileExists(hint + "/libunity.so"))) {
+        return true;
+    }
+
+    auto mods = EnumerateAllLoadedModules();
+    for (const auto& m : mods) {
+        size_t apk = m.path.find("/base.apk");
+        if (apk == std::string::npos) continue;
+        size_t slash = m.path.rfind('/', apk);
+        if (slash == std::string::npos) continue;
+        std::string appDir = m.path.substr(0, slash); // .../<pkg>-<hash>
+
+        static const char* kAbis[] = { "arm64", "arm", "x86_64", "x86" };
+        for (const char* abi : kAbis) {
+            std::string libDir = appDir + "/lib/" + abi;
+            if (FileExists(libDir + "/libil2cpp.so") ||
+                FileExists(libDir + "/libunity.so")) {
+                return true;
+            }
+        }
+    }
+
+    // Some apps copy native libs into their data dir.
+    std::string pkg = DynamicCurrentPackage();
+    if (!pkg.empty()) {
+        std::string dataDir = "/data/user/0/" + pkg + "/lib";
+        if (FileExists(dataDir + "/libil2cpp.so") ||
+            FileExists(dataDir + "/libunity.so")) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 static JSValue JsDynamicHasJava(JSContext* ctx, JSValueConst, int, JSValueConst*) {
 #if defined(__ANDROID__)
     return JS_NewBool(ctx, true);
@@ -801,7 +898,27 @@ static JSValue JsDynamicHasJava(JSContext* ctx, JSValueConst, int, JSValueConst*
 
 static JSValue JsDynamicHasUnity(JSContext* ctx, JSValueConst, int, JSValueConst*) {
 #if defined(__ANDROID__)
-    return JS_NewBool(ctx, HasLoadedModuleByName("libil2cpp.so") || HasLoadedModuleByName("libunity.so"));
+    // libil2cpp.so/libunity.so: already mapped OR shipped by this app on disk.
+    bool has = HasLoadedModuleByName("libil2cpp.so") ||
+               HasLoadedModuleByName("libunity.so") ||
+               HasUnityLibraryOnDisk() ||
+               !UnityGetLibDirHint().empty();
+    return JS_NewBool(ctx, has);
+#elif defined(_WIN32)
+    bool has = GetModuleHandleA("GameAssembly.dll") != nullptr ||
+               GetModuleHandleA("UnityPlayer.dll") != nullptr;
+    return JS_NewBool(ctx, has);
+#elif defined(__APPLE__)
+    // iOS: UnityFramework.framework; macOS: UnityPlayer.dylib / UnityPlayer.
+    bool has = dlopen("UnityFramework.framework/UnityFramework", RTLD_NOLOAD) != nullptr ||
+               dlopen("UnityFramework", RTLD_NOLOAD) != nullptr ||
+               dlopen("UnityPlayer.dylib", RTLD_NOLOAD) != nullptr ||
+               dlopen("UnityPlayer", RTLD_NOLOAD) != nullptr;
+    return JS_NewBool(ctx, has);
+#elif defined(__linux__)
+    bool has = HasLoadedModuleByName("libil2cpp.so") ||
+               HasLoadedModuleByName("libunity.so");
+    return JS_NewBool(ctx, has);
 #else
     return JS_NewBool(ctx, false);
 #endif
@@ -835,6 +952,9 @@ void RegisterDynamicApis(JSContext* ctx) {
                       JS_NewCFunction(ctx, JsDynamicHasUnity, "__native_dynamicHasUnity", 0));
     JS_SetPropertyStr(ctx, global, "__native_dynamicHasObjc",
                       JS_NewCFunction(ctx, JsDynamicHasObjc, "__native_dynamicHasObjc", 0));
+
+    // UnityResolve bridge (globalThis.__NativeUnity), consumed by makeUnityRoot().
+    RegisterUnityApis(ctx, global);
 
     // Evaluate dynamic bootstrap script to create globalThis.dynamic proxy tree
     JSValue res = JS_Eval(ctx, kDynamicBootstrapJs, strlen(kDynamicBootstrapJs), "<dynamic_bootstrap>", JS_EVAL_TYPE_GLOBAL);
