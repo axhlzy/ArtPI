@@ -14,9 +14,13 @@
 #include <sys/wait.h>
 #include <sys/uio.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <elf.h>
 #include <asm/ptrace.h>
+#include <cstdlib>
 
 #ifndef PTRACE_GETREGSET
 #define PTRACE_GETREGSET 0x4204
@@ -42,16 +46,26 @@ static gboolean OnGumException(GumExceptionDetails* details, gpointer user_data)
     return (res != 0) ? TRUE : FALSE;
 }
 
-struct ThreadCollector {
-    std::vector<pid_t> tids;
-};
+// Enumerate /proc/self/task directly instead of gum_process_enumerate_threads.
+// Gum parses each thread's "status" file and dereferences the strstr() result
+// without a NULL check; hardened/packed apps (libDexHelper etc.) can make that
+// file unreadable or non-standard, which crashes inside Gum. We only need the
+// TIDs here, so a plain readdir is both safer and much cheaper.
+static void EnumerateThreadIds(std::vector<pid_t>& out) {
+    DIR* dir = opendir("/proc/self/task");
+    if (!dir) return;
 
-static gboolean EnumThreadCallback(const GumThreadDetails* details, gpointer user_data) {
-    if (details) {
-        auto* col = reinterpret_cast<ThreadCollector*>(user_data);
-        col->tids.push_back(static_cast<pid_t>(details->id));
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        const char* name = entry->d_name;
+        if (name[0] == '.') continue;
+        char* end = nullptr;
+        long tid = strtol(name, &end, 10);
+        if (end != nullptr && *end == '\0' && tid > 0) {
+            out.push_back(static_cast<pid_t>(tid));
+        }
     }
-    return TRUE;
+    closedir(dir);
 }
 
 // Read the true comparator count from the kernel instead of probing with
@@ -61,23 +75,48 @@ static gboolean EnumThreadCallback(const GumThreadDetails* details, gpointer use
 // silently dropped (which is why probing with gum_thread_set_hardware_* always
 // "succeeds" up to 16). We query it from a short-lived traced child: a thread
 // cannot ptrace a sibling of the same thread group.
-static int ReadHwSlotCount(bool watch) {
-    pid_t child = fork();
-    if (child < 0) return -1;
+static int HwSlotCountChild(void*) {
+    ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+    kill(getpid(), SIGSTOP);
+    _exit(0);
+    return 0;
+}
 
-    if (child == 0) {
-        // Child: become tracee, stop, and stay idle until detached.
-        ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
-        kill(getpid(), SIGSTOP);
-        _exit(0);
+static int ReadHwSlotCount(bool watch) {
+    // clone(SIGCHLD) instead of fork(): hardened/packed runtimes (libDexHelper
+    // etc.) install pthread_atfork handlers that can deadlock, while clone()
+    // bypasses them and still gives us a separately traced child process.
+    constexpr size_t kStackSize = 64 * 1024;
+    void* stack = mmap(nullptr, kStackSize, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) return -1;
+
+    uintptr_t top = reinterpret_cast<uintptr_t>(stack) + kStackSize;
+    top &= ~static_cast<uintptr_t>(15);
+
+    pid_t child = clone(HwSlotCountChild, reinterpret_cast<void*>(top),
+                        SIGCHLD, nullptr);
+    if (child < 0) {
+        munmap(stack, kStackSize);
+        return -1;
     }
 
+    // Bounded wait: never block the agent if the child cannot stop.
     int status = 0;
-    pid_t r;
-    do { r = waitpid(child, &status, 0); } while (r < 0 && errno == EINTR);
-    if (r != child || !WIFSTOPPED(status)) {
+    bool stopped = false;
+    for (int i = 0; i < 200; i++) {
+        pid_t r = waitpid(child, &status, WNOHANG);
+        if (r == child) {
+            stopped = WIFSTOPPED(status);
+            break;
+        }
+        if (r < 0 && errno != EINTR) break;
+        usleep(1000);
+    }
+    if (!stopped) {
         kill(child, SIGKILL);
-        do { r = waitpid(child, &status, 0); } while (r < 0 && errno == EINTR);
+        waitpid(child, &status, 0);
+        munmap(stack, kStackSize);
         return -1;
     }
 
@@ -94,7 +133,8 @@ static int ReadHwSlotCount(bool watch) {
     }
 
     ptrace(PTRACE_DETACH, child, nullptr, nullptr);
-    do { r = waitpid(child, &status, 0); } while (r < 0 && errno == EINTR);
+    waitpid(child, &status, 0);
+    munmap(stack, kStackSize);
     return count;
 }
 
@@ -130,23 +170,15 @@ bool HwHookManager::init() {
     exceptor_ = ex;
     gum_exceptor_add(ex, OnGumException, this);
 
-    // Query the real comparator count from the kernel (cheap fork + one
-    // PTRACE_GETREGSET; does not touch our own debug registers).
-    bp_capacity_ = ReadHwSlotCount(false);
-    wp_capacity_ = ReadHwSlotCount(true);
-    if (bp_capacity_ <= 0) {
-        HW_LOGW("hardware breakpoint capacity probe failed, assuming 4");
-        bp_capacity_ = 4;
-    }
-    if (wp_capacity_ <= 0) {
-        HW_LOGW("hardware watchpoint capacity probe failed, assuming 4");
-        wp_capacity_ = 4;
-    }
-    if (bp_capacity_ > kMaxHwSlots) bp_capacity_ = kMaxHwSlots;
-    if (wp_capacity_ > kMaxHwSlots) wp_capacity_ = kMaxHwSlots;
+    // Do NOT fork here: init() sits on the early-boot critical path and
+    // hardened apps (libDexHelper etc.) can make fork/waitpid hang forever.
+    // Start with the common default; refreshCapacity() queries the real
+    // kernel value later (interactive/exhaustion path, with a bounded wait).
+    bp_capacity_ = 4;
+    wp_capacity_ = 4;
 
     initialized_ = true;
-    HW_LOGI("HwHookManager initialized: %d breakpoint slot(s), %d watchpoint slot(s), "
+    HW_LOGI("HwHookManager initialized (default %d BP + %d WP slots; lazy kernel query), "
             "GumExceptor installed",
             bp_capacity_, wp_capacity_);
     return true;
@@ -168,16 +200,16 @@ int HwHookManager::watchpointCapacity() const {
 }
 
 void HwHookManager::refreshCapacity() {
+    // Query the kernel OUTSIDE the manager lock: in hardened apps fork/waitpid
+    // can block, and HandleException (signal handler) must never be starved.
+    int bp = ReadHwSlotCount(false);
+    int wp = ReadHwSlotCount(true);
+
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (!initialized_) return;
 
     int old_bp = bp_capacity_;
     int old_wp = wp_capacity_;
-
-    // Reading the kernel resource info never touches our own debug registers,
-    // so it is safe even while hooks are live.
-    int bp = ReadHwSlotCount(false);
-    int wp = ReadHwSlotCount(true);
     if (bp > 0) bp_capacity_ = bp;
     if (wp > 0) wp_capacity_ = wp;
     if (bp_capacity_ > kMaxHwSlots) bp_capacity_ = kMaxHwSlots;
@@ -333,15 +365,15 @@ uint32_t HwHookManager::attach(const HwHookConfig& config) {
             return 0;
         }
     } else {
-        ThreadCollector col;
-        gum_process_enumerate_threads(EnumThreadCallback, &col, GUM_THREAD_FLAGS_ALL);
+        std::vector<pid_t> tids;
+        EnumerateThreadIds(tids);
         int success_count = 0;
-        for (pid_t tid : col.tids) {
+        for (pid_t tid : tids) {
             if (armOnThread(*session, tid)) {
                 success_count++;
             }
         }
-        if (success_count == 0 && !col.tids.empty()) {
+        if (success_count == 0 && !tids.empty()) {
             freeSlot(config.type, slot);
             return 0;
         }
@@ -447,13 +479,13 @@ size_t HwHookManager::rearmMissingThreads() {
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (!initialized_) return 0;
 
-    ThreadCollector col;
-    gum_process_enumerate_threads(EnumThreadCallback, &col, GUM_THREAD_FLAGS_ALL);
+    std::vector<pid_t> tids;
+    EnumerateThreadIds(tids);
 
     size_t armed = 0;
     for (auto& s : sessions_) {
         if (!s->active) continue;
-        for (pid_t tid : col.tids) {
+        for (pid_t tid : tids) {
             if (s->config.thread_id > 0 && s->config.thread_id != tid) continue;
             if (s->armed_threads.count(tid)) continue;
             if (armOnThread(*s, tid)) armed++;

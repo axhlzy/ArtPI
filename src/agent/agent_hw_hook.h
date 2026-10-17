@@ -40,6 +40,10 @@ size_t HwHookRearmMissingThreads();
 // thread (tid == pid). Used by the agent's boot auto-resume.
 bool HwHookMainThreadArmed();
 
+// Query the kernel for the real comparator counts (bounded wait; safe to call
+// from a background thread after the early-boot critical path).
+void HwHookRefreshCapacity();
+
 // Query all active hardware hooks (including Gum inline fallback hooks)
 std::vector<HwHookInfo> HwHookListAll();
 HwSlotStatus HwHookGetSlotStatus();

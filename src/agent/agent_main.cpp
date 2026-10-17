@@ -300,6 +300,9 @@ void* AgentThreadEntry(void*) {
                     }
                 }
             }
+            // Critical path is over: ask the kernel for the real comparator
+            // counts (bounded; a no-op default is kept on hardened apps).
+            artpi::agent::HwHookRefreshCapacity();
             return nullptr;
         };
         pthread_t rearmThread;

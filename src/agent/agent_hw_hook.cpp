@@ -921,6 +921,10 @@ bool HwHookMainThreadArmed() {
     return false;
 }
 
+void HwHookRefreshCapacity() {
+    HwHookManager::instance().refreshCapacity();
+}
+
 bool SetupDlopenHwMonitor(const std::string& stopLib, bool libLog) {
     if (g_dlopenMonitorActive) {
         // Early boot may have raced with the injector's ptrace attachment.
