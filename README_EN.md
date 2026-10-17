@@ -370,6 +370,16 @@ dynamic.unity.buttons();
 let method = dynamic.unity.assembly("Assembly-CSharp.dll").class("BallClickLayer").method(".ctor");
 console.log(method.toString()); // namespace, assembly, class, method, rva, return, parameters
 
+// Pure dot-property chained syntax (supports hyphens '-' or underscores '_', .ctor mapped to ._ctor, full REPL Tab completion)
+let ctor = dynamic.unity.assembly.Assembly_CSharp.BallClickLayer._ctor;
+// Or with hyphenated assembly name:
+let ctor2 = dynamic.unity.assembly.Assembly-CSharp.BallClickLayer._ctor;
+ctor.mi();           // prints Assembly → Class → Method hierarchy and RVA/MP/MI
+ctor.address;        // native function address
+ctor.methodInfo;     // Il2CppMethodInfo* pointer
+ctor.hook(function(args) { console.log("ctor hooked!"); }); // quick hook
+ctor.b();            // quick breakpoint
+
 // Direct libil2cpp.so exports; NativeBox supports variadic native invocation (.invoke(...args) or direct call)
 let strFn = dynamic.unity.il2cpp.il2cpp_string_new;
 let myStr = strFn.invoke("Hello from ArtPI!"); // or directly strFn("Hello from ArtPI!")

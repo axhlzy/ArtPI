@@ -671,6 +671,7 @@ static void FetchDynamicCompletions(int fd, const AgentEndpoint& ep) {
 }
 
 static std::vector<std::string> FetchExprMembers(const std::string& expr);
+static std::string PreprocessUnityLine(const std::string& input);
 
 static std::vector<std::string> GetCandidatesForToken(const std::string& token) {
     std::vector<std::string> results;
@@ -854,9 +855,23 @@ static std::vector<std::string> GetCandidatesForToken(const std::string& token) 
                 after = rest.substr(lastDot + 1);
             }
             auto members = FetchExprMembers(expr);
+            std::vector<std::pair<std::string, double>> ranked;
             for (const auto& m : members) {
                 if (after.empty() || StartsWithIgnoreCase(m, after)) {
                     results.push_back(expr + "." + m);
+                } else if (!after.empty()) {
+                    double sim = artpi::utils::LevenshteinSimilarity(after, m);
+                    if (sim >= 0.45) {
+                        ranked.push_back({ expr + "." + m, sim });
+                    }
+                }
+            }
+            if (results.empty() && !ranked.empty()) {
+                std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                    return a.second > b.second;
+                });
+                for (size_t i = 0; i < std::min<size_t>(ranked.size(), 10); ++i) {
+                    results.push_back(ranked[i].first);
                 }
             }
         }
@@ -900,11 +915,44 @@ static std::string QuoteJsString(const std::string& s) {
     return out;
 }
 
+static std::string PreprocessUnityLine(const std::string& input) {
+    std::string out;
+    size_t pos = 0;
+    const std::string marker = ".assembly.";
+    while (pos < input.size()) {
+        size_t idx = input.find(marker, pos);
+        if (idx == std::string::npos) {
+            out += input.substr(pos);
+            break;
+        }
+        out += input.substr(pos, idx - pos);
+        out += ".assembly";
+        size_t nameStart = idx + marker.size();
+        size_t nameEnd = nameStart;
+        while (nameEnd < input.size()) {
+            char c = input[nameEnd];
+            if (isalnum(c) || c == '_' || c == '$' || c == '-') {
+                nameEnd++;
+            } else {
+                break;
+            }
+        }
+        std::string name = input.substr(nameStart, nameEnd - nameStart);
+        if (name.find('-') != std::string::npos) {
+            out += "[\"" + name + "\"]";
+        } else {
+            out += "." + name;
+        }
+        pos = nameEnd;
+    }
+    return out;
+}
+
 static std::vector<std::string> FetchExprMembers(const std::string& expr) {
     auto it = g_exprMembersCache.find(expr);
     if (it != g_exprMembersCache.end()) return it->second;
 
-    std::string script = "JSON.stringify(__getCompletions(" + QuoteJsString(expr) + "))";
+    std::string script = "JSON.stringify(__getCompletions(" + QuoteJsString(PreprocessUnityLine(expr)) + "))";
     std::string res = EvalOnAgentSync(script);
     auto members = ExtractJsonStringArray(res);
     std::sort(members.begin(), members.end());
@@ -928,11 +976,11 @@ static CompletionContext FindCompletionContext(const std::string& line, size_t p
     CompletionContext ctx;
     if (pos == 0) return ctx;
 
-    // Scan backwards from pos for member prefix
+    // Scan backwards from pos for member prefix (allow '-' for assembly names like Assembly-CSharp)
     size_t memberStart = pos;
     while (memberStart > 0) {
         char c = line[memberStart - 1];
-        if (isalnum(c) || c == '_' || c == '$') {
+        if (isalnum(c) || c == '_' || c == '$' || c == '-') {
             memberStart--;
         } else {
             break;
@@ -946,7 +994,7 @@ static CompletionContext FindCompletionContext(const std::string& line, size_t p
         size_t wordStart = pos;
         while (wordStart > 0) {
             char c = line[wordStart - 1];
-            if (isalnum(c) || c == '_' || c == '$' || c == '.') {
+            if (isalnum(c) || c == '_' || c == '$' || c == '.' || c == '-') {
                 wordStart--;
             } else {
                 break;
@@ -980,7 +1028,7 @@ static CompletionContext FindCompletionContext(const std::string& line, size_t p
             else if (paren > 0 || bracket > 0) {
                 p--;
             }
-            else if (isalnum(c) || c == '_' || c == '$' || c == '.' || c == '"' || c == '\'') {
+            else if (isalnum(c) || c == '_' || c == '$' || c == '.' || c == '"' || c == '\'' || c == '-') {
                 p--;
             }
             else {
@@ -1660,7 +1708,7 @@ static void RunInteractiveSession(const AgentEndpoint& ep) {
         req.set("cmd", msgpack::Value("eval"));
 
         msgpack::Value args = msgpack::Value::makeMap();
-        args.set("script", msgpack::Value(line));
+        args.set("script", msgpack::Value(PreprocessUnityLine(line)));
         req.set("args", args);
 
         if (!SendMsgpackFrame(fd, req)) {
@@ -1848,7 +1896,7 @@ bool EvalScript(const AgentEndpoint& ep, const std::string& script, std::string&
     req.set("seq", msgpack::Value(1));
     req.set("cmd", msgpack::Value("eval"));
     msgpack::Value args = msgpack::Value::makeMap();
-    args.set("script", msgpack::Value(script));
+    args.set("script", msgpack::Value(PreprocessUnityLine(script)));
     req.set("args", args);
 
     if (!SendMsgpackFrame(fd, req)) {

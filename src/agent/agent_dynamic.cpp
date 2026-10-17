@@ -758,12 +758,162 @@ const char* kDynamicBootstrapJs = R"JS(
         });
     }
 
+    function makeUnityMethodProxy(m, clsObj) {
+        if (!m) return null;
+        let fn = function(...args) {
+            return m.invoke(...args);
+        };
+        fn.methodInfo = m.methodInfo;
+        fn.address = m.address;
+        fn.invoke = function(...args) { return m.invoke(...args); };
+        fn.call = function(...args) { return m.invoke(...args); };
+        fn.hook = function(cb) {
+            if (m.address && m.address !== 0n) {
+                return nhook(m.address, cb);
+            }
+            throw new Error("Method has no native function address to hook");
+        };
+        fn.b = function() {
+            if (m.methodInfo && typeof dynamic.unity.b === 'function') {
+                return dynamic.unity.b(m.methodInfo);
+            }
+            if (m.address && m.address !== 0n) return brkn(m.address);
+            throw new Error("No address or methodInfo available for breakpoint");
+        };
+        fn.mi = function() {
+            if (m.methodInfo && typeof dynamic.unity.mi === 'function') {
+                return dynamic.unity.mi(m.methodInfo);
+            }
+            return m.toString();
+        };
+        fn.toString = function() { return m.toString(); };
+        fn.__unity_kind = 'method';
+        fn.__ptr = m.__ptr;
+        return fn;
+    }
+
+    function makeClassProxy(clsObj) {
+        if (!clsObj) return null;
+        let pxy;
+        pxy = new Proxy(clsObj, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (prop in target) return target[prop];
+                if (prop === '__unity_kind') return 'class';
+                if (prop.charCodeAt(0) === 95 && prop.length > 1 && prop.charAt(1) === '_') {
+                    return target[prop];
+                }
+
+                let mName = prop;
+                if (mName === "_ctor" || mName === "$ctor" || mName === "ctor") {
+                    mName = ".ctor";
+                } else if (mName === "_cctor" || mName === "$cctor" || mName === "cctor") {
+                    mName = ".cctor";
+                }
+
+                let m = target.method(mName);
+                if (m) {
+                    return makeUnityMethodProxy(m, target);
+                }
+
+                let f = target.field(prop);
+                if (f) return f;
+
+                return undefined;
+            }
+        });
+        return pxy;
+    }
+
+    function makeAssemblyProxy(asmObj) {
+        if (!asmObj) return null;
+        let pxy;
+        pxy = new Proxy(asmObj, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (prop in target) return target[prop];
+                if (prop === '__unity_kind') return 'assembly';
+                if (prop.charCodeAt(0) === 95 && prop.length > 1 && prop.charAt(1) === '_') {
+                    return target[prop];
+                }
+
+                let cls = target.class(prop);
+                if (!cls) {
+                    let dotted = prop.replace(/_/g, '.');
+                    cls = target.class(dotted);
+                }
+                if (cls) {
+                    return makeClassProxy(cls);
+                }
+                return undefined;
+            }
+        });
+        return pxy;
+    }
+
+    function makeUnityAssemblyRootProxy(nativeAssemblyFn, root) {
+        let fnWrapper = function(name) {
+            let asm = nativeAssemblyFn(name);
+            return asm ? makeAssemblyProxy(asm) : null;
+        };
+
+        function findAssembly(prop) {
+            let asm = nativeAssemblyFn(prop);
+            if (asm) return asm;
+            asm = nativeAssemblyFn(prop + ".dll");
+            if (asm) return asm;
+            let dashed = prop.replace(/_/g, '-');
+            asm = nativeAssemblyFn(dashed);
+            if (asm) return asm;
+            asm = nativeAssemblyFn(dashed + ".dll");
+            if (asm) return asm;
+
+            try {
+                let list = root.assemblies();
+                let pLower = prop.toLowerCase().replace(/_/g, '-');
+                for (let i = 0; i < list.length; i++) {
+                    let aName = list[i];
+                    let aStem = aName.endsWith('.dll') ? aName.slice(0, -4) : aName;
+                    if (aStem.toLowerCase() === pLower || aName.toLowerCase() === pLower) {
+                        return nativeAssemblyFn(aName);
+                    }
+                }
+            } catch(e) {}
+            return null;
+        }
+
+        let pxy;
+        pxy = new Proxy(fnWrapper, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (prop in target) return target[prop];
+                if (prop === '__unity_kind') return 'assembly_root';
+                if (prop === '__ptr') return 0;
+                if (prop === 'toString') return function() { return "[UnityAssemblyRoot]"; };
+                if (prop.charCodeAt(0) === 95 && prop.length > 1 && prop.charAt(1) === '_') {
+                    return target[prop];
+                }
+
+                let asm = findAssembly(prop);
+                if (asm) {
+                    return makeAssemblyProxy(asm);
+                }
+                return undefined;
+            }
+        });
+        return pxy;
+    }
+
     function makeUnityRoot() {
         let root = globalThis.__NativeUnity;
         if (!root) return createUnavailableDomain("unity", "UnityResolve bridge missing");
         root.$domain = "unity";
         root.$available = true;
         root.il2cpp = makeUnityIl2cppRoot();
+        if (typeof root.assembly === 'function') {
+            let nativeAssemblyFn = root.assembly.bind(root);
+            root.assembly = makeUnityAssemblyRootProxy(nativeAssemblyFn, root);
+        }
         // Compatibility aliases with the old placeholder API.
         root.findAssemblies = function() { try { return root.assemblies(); } catch (e) { return []; } };
         root.findClasses = function(a) { try { let asm = root.assembly(a); return asm ? asm.classes() : []; } catch (e) { return []; } };

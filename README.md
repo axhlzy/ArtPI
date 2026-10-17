@@ -398,6 +398,16 @@ dynamic.unity.buttons();
 let method = dynamic.unity.assembly("Assembly-CSharp.dll").class("BallClickLayer").method(".ctor");
 console.log(method.toString()); // namespace, assembly, class, method, rva, return, parameters
 
+// 全点链式语法（支持连字符 '-' 或下划线 '_'，.ctor 映射为 ._ctor，支持 REPL Tab 逐级补全）
+let ctor = dynamic.unity.assembly.Assembly_CSharp.BallClickLayer._ctor;
+// 或原生中划线写法：
+let ctor2 = dynamic.unity.assembly.Assembly-CSharp.BallClickLayer._ctor;
+ctor.mi();           // 打印 Assembly → Class → Method 层级与 RVA/MP/MI
+ctor.address;        // native 函数地址
+ctor.methodInfo;     // Il2CppMethodInfo* 指针
+ctor.hook(function(args) { console.log("ctor hooked!"); }); // 快速 hook
+ctor.b();            // 快速断点
+
 // libil2cpp.so 导出符号直达；NativeBox 支持原生变参调用 (.invoke(...args) 或直接作为函数调用)
 let strFn = dynamic.unity.il2cpp.il2cpp_string_new;
 let myStr = strFn.invoke("Hello from ArtPI!"); // 或直接 strFn("Hello from ArtPI!")

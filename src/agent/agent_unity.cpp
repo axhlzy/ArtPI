@@ -1826,8 +1826,8 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
     std::lock_guard<std::mutex> lk(g_unityMutex);
     if (kind == "root") {
         for (const char* h : {"init()", "available()", "isAvailable()", "assemblies()",
-                              "assembly(", "class(", "findclass(", "findmethods(",
-                              "m(", "dump(", "string(", "toString(",
+                              "assembly", "assembly.", "assembly(", "class(", "findclass(", "findClass(",
+                              "findmethods(", "findMethods(", "m(", "dump(", "string(", "toString(",
                               "threadAttach()", "threadDetach()", "help()",
                               "mi(", "b(", "lfs(", "showGameObject(",
                               "button(", "buttons()", "B_Button(",
@@ -1838,7 +1838,29 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
         std::string err;
         if (EnsureInitLocked(&err)) {
             for (auto* a : UnityResolve::assembly) {
+                std::string stem = a->name;
+                if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".dll") {
+                    stem = stem.substr(0, stem.size() - 4);
+                }
+                std::string sanitized = stem;
+                for (char& ch : sanitized) if (ch == '-') ch = '_';
+                add(std::string("assembly.") + sanitized);
+                if (sanitized != stem) add(std::string("assembly.") + stem);
                 add(std::string("assembly(\"") + a->name + "\")");
+            }
+        }
+    } else if (kind == "assembly_root") {
+        std::string err;
+        if (EnsureInitLocked(&err)) {
+            for (auto* a : UnityResolve::assembly) {
+                std::string stem = a->name;
+                if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".dll") {
+                    stem = stem.substr(0, stem.size() - 4);
+                }
+                std::string sanitized = stem;
+                for (char& ch : sanitized) if (ch == '-') ch = '_';
+                add(sanitized);
+                if (sanitized != stem) add(stem);
             }
         }
     } else if (kind == "il2cpp") {
@@ -1855,6 +1877,7 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
         if (a) {
             for (const char* h : {"name", "file", "classes()", "class(", "get("}) add(h);
             for (auto* c : a->classes) {
+                add(c->name);
                 add(std::string("class(\"") + c->name + "\")");
             }
         }
@@ -1866,12 +1889,22 @@ static JSValue JsUnityCompletions(JSContext* ctx, JSValueConst, int argc, JSValu
                                   "new()", "type()", "findObjects()"}) {
                 add(h);
             }
+            add("_ctor");
             for (auto* f : c->fields) {
+                add(f->name);
                 add(std::string("field(\"") + f->name + "\")");
             }
             for (auto* m : c->methods) {
+                std::string mName = m->name;
+                if (mName == ".ctor") add("_ctor");
+                else if (mName == ".cctor") add("_cctor");
+                else add(mName);
                 add(std::string("method(\"") + m->name + "\")");
             }
+        }
+    } else if (kind == "method") {
+        for (const char* h : {"invoke()", "call()", "hook(", "b()", "mi()", "methodInfo", "address"}) {
+            add(h);
         }
     }
     return arr;

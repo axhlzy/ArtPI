@@ -24,32 +24,13 @@ include_directories(
     src
     engine
     engine/pine
-    external/xz-embedded/linux/include/linux
-    external/xz-embedded/userspace
-    external/xdl/include
-    external/xdl
-    # nmmvm (nmmp) embedded dalvik interpreter
     engine/nmmvm
     engine/nmmvm/include
-    # §NATIVE: libgum (Frida-Gum) / QBDI 引擎与跨层桥
-    external/frida-gum/include
-    external/qbdi/include
-    external/magic_enum/include
     engine/native
     engine/tracer/unified
 )
 
-set(XZ_EMBEDDED_SOURCE
-        external/xz-embedded/linux/lib/xz/xz_crc32.c
-        external/xz-embedded/linux/lib/xz/xz_dec_lzma2.c
-        external/xz-embedded/linux/lib/xz/xz_dec_stream.c)
-
-set(XDL_SOURCES
-        external/xdl/xdl.c
-        external/xdl/xdl_iterate.c
-        external/xdl/xdl_linker.c
-        external/xdl/xdl_lzma.c
-        external/xdl/xdl_util.c)
+add_subdirectory(external)
 
 set(ARTPI_SOURCES
         # Core ArtPI Framework (src/core)
@@ -101,10 +82,6 @@ set(ARTPI_SOURCES
         engine/utils/well_known_classes.cpp
         engine/utils/pi_hash.cpp
 
-        # External sub-tools
-        ${XZ_EMBEDDED_SOURCE}
-        ${XDL_SOURCES}
-
         # NATIVE: Native Hook 抽象层 + 动态注册嗅探器 + 硬件断点 (engine/native)
         engine/native/hooker/pi_gum_hooker.cpp
         engine/native/hooker/pi_jni_sniffer.cpp
@@ -137,8 +114,6 @@ else()
 endif()
 
 set_source_files_properties(
-    ${XZ_EMBEDDED_SOURCE}
-    ${XDL_SOURCES}
     engine/nmmvm/vm/DexCatch.cpp
     engine/nmmvm/vm/Exception.cpp
     engine/nmmvm/vm/GlobalCache.cpp
@@ -157,12 +132,6 @@ set_target_properties(artpi_static PROPERTIES OUTPUT_NAME "artpi_static")
 find_library(log-lib log)
 find_package(cxx CONFIG)
 
-# ==============================================================================
-# NATIVE: 依赖库链接 —— 全部静态打包 (libfrida-gum.a + libQBDI.a)
-# ==============================================================================
-set(FRIDA_GUM_LIB "${CMAKE_CURRENT_SOURCE_DIR}/external/frida-gum/lib/${CMAKE_ANDROID_ARCH_ABI}/libfrida-gum.a")
-set(QBDI_LIB      "${CMAKE_CURRENT_SOURCE_DIR}/external/qbdi/lib/${CMAKE_ANDROID_ARCH_ABI}/libQBDI.a")
-
 if (TARGET cxx::cxx)
     target_link_libraries(artpi ${log-lib} cxx::cxx)
     target_link_libraries(artpi_static ${log-lib} cxx::cxx)
@@ -172,7 +141,13 @@ else()
 endif()
 
 foreach(_t artpi artpi_static)
-    target_link_libraries(${_t} ${FRIDA_GUM_LIB} ${QBDI_LIB})
+    target_link_libraries(${_t}
+        artpi_xdl
+        artpi_xz
+        artpi_frida_gum
+        artpi_qbdi
+        artpi_magic_enum
+    )
 endforeach()
 
 if (CMAKE_STRIP)

@@ -599,6 +599,39 @@ struct JsReentrancyGuard {
 };
 } // namespace
 
+static std::string PreprocessUnityLine(const std::string& input) {
+    std::string out;
+    size_t pos = 0;
+    const std::string marker = ".assembly.";
+    while (pos < input.size()) {
+        size_t idx = input.find(marker, pos);
+        if (idx == std::string::npos) {
+            out += input.substr(pos);
+            break;
+        }
+        out += input.substr(pos, idx - pos);
+        out += ".assembly";
+        size_t nameStart = idx + marker.size();
+        size_t nameEnd = nameStart;
+        while (nameEnd < input.size()) {
+            char c = input[nameEnd];
+            if (isalnum(c) || c == '_' || c == '$' || c == '-') {
+                nameEnd++;
+            } else {
+                break;
+            }
+        }
+        std::string name = input.substr(nameStart, nameEnd - nameStart);
+        if (name.find('-') != std::string::npos) {
+            out += "[\"" + name + "\"]";
+        } else {
+            out += "." + name;
+        }
+        pos = nameEnd;
+    }
+    return out;
+}
+
 std::string EvalJs(const std::string& script, const char* filename) {
     std::lock_guard<std::mutex> lk(g_jsMutex);
     if (!g_ctx) return "[!] QuickJS context not initialized";
@@ -616,6 +649,7 @@ std::string EvalJs(const std::string& script, const char* filename) {
     } else if (trimmed == "D" || trimmed == "detach") {
         effectiveScript = "D()";
     }
+    effectiveScript = PreprocessUnityLine(effectiveScript);
 
     JSValue val = JS_Eval(g_ctx, effectiveScript.c_str(), effectiveScript.size(), filename, JS_EVAL_TYPE_GLOBAL);
 

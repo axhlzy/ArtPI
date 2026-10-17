@@ -40,12 +40,6 @@ set(AGENT_SOURCES
     agent_jni.cpp
     jni_trampoline_arm64.S
     agent_js.cpp
-    ../../external/KittyMemory/KittyArm64.cpp
-    ../../external/KittyMemory/KittyMemory.cpp
-    ../../external/KittyMemory/KittyScanner.cpp
-    ../../external/KittyMemory/KittyUtils.cpp
-    ../../external/KittyMemory/MemoryBackup.cpp
-    ../../external/KittyMemory/MemoryPatch.cpp
     ${QUICKJS_SOURCES}
 )
 
@@ -77,6 +71,7 @@ find_library(log-lib log)
 # Link against the core static library libartpi_static.a + system libs
 target_link_libraries(artpi_agent PRIVATE
     artpi_static
+    artpi_kittymemory
     ${log-lib}
     dl
 )
