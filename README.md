@@ -599,8 +599,134 @@ HW.detachAll();
 - **构造函数接力追踪（`-LC` / `--lib-constructors`）**：
   - 自动在 Linker 的 `soinfo::call_constructors` 下硬件断点，动态解析目标 SO 库内存中的 ELF Header 和 `PT_DYNAMIC` 段，提取 `DT_INIT` 及所有 `DT_INIT_ARRAY` 构造函数。
   - **单槽接力下断机制（Daisy-Chaining）**：每个构造函数命中后立即就地回收断点槽位并下断下一个构造函数，利用 LIFO 依赖栈结合 `constructors_called` 动态探测处理 Bionic 依赖嵌套递归，无论依赖树多深均**恒定仅消耗 1 个硬件断点槽位**。
-  - **毫秒级执行耗时打点**：实时打印每个构造函数调用的相对偏移（`+0x...`）与执行耗时，并在该库所有初始化完成后输出整体耗时，助力快速定位加固壳逻辑、加解密过程或耗时最长的核心业务代码。
+  - **毫秒级执行耗时打点**：实时打印每个构造函数调用的相对偏移（`+0x...`）、xDL 符号名与执行耗时，并在该库所有初始化完成后输出整体耗时，助力快速定位加固壳逻辑、加解密过程或耗时最长的核心业务代码。
+  - **定向 QBDI 模拟执行追踪**：支持在 `-LC` 后附加规则，命中目标构造函数时自动接管并触发指令级 QBDI 模拟执行追踪（包含实时通用寄存器 GPR 变更打印）：
+    - `-LC`：追踪所有库的所有构造函数（常规硬件接力打点耗时）。
+    - `-LC <libName>:<index>`：例如 `-LC liboattest.so:0` 仅对目标库的第 0 个构造函数启用 QBDI 模拟执行。
+    - `-LC <libName>:<symbolName>`：例如 `-LC liboattest.so:custom_dt_init` 按符号名精准触发 QBDI trace。
+    - `-LC <libName>@<offsetOrAddr>`：例如 `-LC liboattest.so@0x475bc` 按相对偏移或绝对内存地址精准匹配。
+  - **日志全量输出控制**：
+    - `--log` / `--full-log`：取消默认的截断限制，完整打印所有模拟执行的反汇编指令流及寄存器变化。
+    - `--max-log <N>`：自定义日志行数预算限制（0 为无限制）。
 - **条件挂起**：若传入 `--stop-lib libil2cpp.so`，当该库被加载时，主线程将在 dlopen 入口被自动挂起（进入 futex wait），便于在 REPL 中布控早期初始化函数，输入 `resume` 即可继续执行。
+
+---
+
+### 6.8 `Linker.*` / `linker.*` — Linker 与 ELF soinfo 深入解析与控制
+
+提供对 Bionic Linker 运行时内部数据结构与加载模块 ELF 信息的深层内省能力。完全支持大小写不敏感（`Linker` 或 `linker` 均可调用）。
+
+#### 1. 核心 API
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `Linker.find` / `linker.find` | `(nameOrAddr)` | 根据 SO 库名（如 `"liboattest.so"`）或内存地址查找对应的 `soinfo` 对象 |
+| `Linker.main` / `linker.somain` | `()` | 获取主可执行文件（主程序）的 `soinfo` 对象 |
+| `Linker.list` / `linker.modules` | `()` | 枚举当前进程中所有已加载的 SO 库 `soinfo` 对象列表 |
+| `Linker.getConstructors` | `(nameOrAddr)` | 获取目标库的全部初始化函数（`DT_INIT`、`DT_INIT_ARRAY`），自动通过 xDL 解析符号名并计算加载偏置与相对偏移 |
+| `Linker.getDestructors` | `(nameOrAddr)` | 获取目标库的全部退出/析构函数（`DT_FINI`、`DT_FINI_ARRAY`），自动通过 xDL 解析符号名 |
+| `Linker.symbols` / `linker.symtab` | `(nameOrAddr[, count])` | 直接遍历目标模块 ELF `.symtab` 与 `.strtab` 符号表，返回包含索引、符号名、地址、大小、绑定类型与符号类型的对象数组（默认前 100 条，负数表示全部） |
+| `Linker.linkMap` | `()` | 遍历并返回当前已加载模块的 `link_map` 链表数组（`{addr, name, phnum}`） |
+| `Linker.load` | `(libName)` | 借助 Linker 内核 `__loader_dlopen` 接口直接加载指定 SO 库，**彻底绕过 Android 7.0+ Linker Namespace 隔离限制** |
+| `Linker.dump` | `(nameOrAddr)` | 返回格式化后的完整 SO 详细信息文本（包含 base、size、phdr、dynamic、strtab、symtab、needed 依赖库、constructors 构造函数、destructors 析构函数） |
+
+#### 2. `soinfo` 对象属性说明
+
+当调用 `linker.find("liboattest.so")` 或 `linker.main()` 时返回的对象包含以下字段：
+
+- `name` / `soname`：SO 库名称（如 `"liboattest.so"`）
+- `base`：加载基址（十六进制字符串，如 `"0x7b6705f000"`）
+- `size`：模块映射占用内存大小（字节数）
+- `loadBias`：加载偏置（`base - p_vaddr`）
+- `phdr`：ELF Program Header 数组虚拟内存地址
+- `phnum`：Program Header 段数量
+- `dynamic`：`PT_DYNAMIC` 段虚拟内存地址
+- `strtab` / `strtabSize`：字符串表内存地址及大小
+- `symtab` / `symentSize` / `symtabCount`：符号表内存地址、表项大小及符号总数
+- `needed` / `dependencies`：依赖的外部共享库列表（数组，如 `["libandroid.so", "liblog.so", "libc.so"]`）
+- `constructors`：初始化构造函数列表数组，每一项包含 `{ type, tag, desc, symbol, address, func, offset }`
+- `destructors`：退出析构函数列表数组，每一项包含 `{ type, tag, desc, symbol, address, func, offset }`
+- `preinit`：主执行文件预初始化函数列表数组（若存在）
+- `dumpText`：完整格式化排版的展示文本（采用定长空格填充对齐，10 进制连续编号）
+- `toString()`：终端交互直接打印时自动调用，输出结构化的全景信息
+
+#### 3. 示例代码
+
+```javascript
+// 1. 查找并直接打印目标 SO 库信息
+console.log(linker.find("liboattest.so"));
+
+// 输出示例：
+// [soinfo @ 0x7ec1dcea80] liboattest.so
+//   base     : 0x7b6705f000 (size: 0x59ad0, bias: 0x7b6705f000)
+//   phdr     : 0x7b6705f040 (phnum: 9)
+//   dynamic  : 0x7b670b3868
+//   strtab   : 0x7b67063d6c (size: 0x48b0)
+//   symtab   : 0x7b6705f2f8 (count: 794, syment: 24)
+//   needed   : libandroid.so, liblog.so, libm.so, libdl.so, libc.so
+//   constructors: 8 found
+//     [0]  DT_INIT (custom_dt_init) @ 0x7b67081530
+//     [1]  DT_INIT_ARRAY[0] (+0x47a5c) @ 0x7b670a6a5c
+//     [2]  DT_INIT_ARRAY[1] (+0x47dc4) @ 0x7b670a6dc4
+//     [3]  DT_INIT_ARRAY[2] (+0x225ac) (ctor_priority_101) @ 0x7b670815ac
+//     [4]  DT_INIT_ARRAY[3] (+0x22600) (ctor_priority_102) @ 0x7b67081600
+//     [5]  DT_INIT_ARRAY[4] (+0x22654) (ctor_section_init_array) @ 0x7b67081654
+//     [6]  DT_INIT_ARRAY[5] (+0x226a8) (ctor_default_priority) @ 0x7b670816a8
+//     [7]  DT_INIT_ARRAY[6] (+0x2278c) @ 0x7b6708178c
+//   destructors : 5 found
+//     [0]  DT_FINI (custom_dt_fini) @ 0x7b67081584
+//     [1]  DT_FINI_ARRAY[0] (+0x224e8) @ 0x7b670814e8
+//     [2]  DT_FINI_ARRAY[1] (+0x22724) (dtor_fini_array_101) @ 0x7b67081724
+
+// 2. 单独提取目标模块的析构函数
+let dtors = linker.getDestructors("liboattest.so");
+console.log("Destructors count: " + dtors.destructors.length);
+
+// 3. 读取并检索符号表（显示前 10 个符号）
+let syms = linker.symbols("liboattest.so", 10);
+syms.forEach(s => {
+    if (s.name) console.log(`[${s.index}] ${s.name} @ ${s.address} (${s.bind} ${s.type})`);
+});
+
+// 4. 绕过 Namespace 直接加载目标库
+let handle = linker.load("libmytest.so");
+```
+
+---
+
+### 6.9 `QBDI.*` / `qbdi.*` — 原生二进制插桩 (DBI) 模拟执行与 Trace
+
+将 Quarkslab 的现代 Native 动态二进制插桩引擎（QBDI）深度融入 QuickJS 运行时。完全支持大小写不敏感（`QBDI`、`Qbdi` 或 `qbdi` 均可调用）。
+
+#### 1. 核心 API
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `qbdi.version()` | `()` | 返回当前集成的 QBDI 引擎版本信息对象 |
+| `qbdi.trace` | `(options \| fnOrAddr[, options])` | 对指定 Native 函数或内存地址启动 QBDI 指令级执行追踪 |
+| `qbdi.disassemble` | `(addr, count)` | 基于 QBDI 反汇编引擎输出指定地址前 `count` 条机器码指令 |
+| `qbdi.run` | `(fnOrAddr, ...args)` | 在 QBDI 隔离插桩上下文中模拟调用指定 Native 函数 |
+
+#### 2. `qbdi.trace` 配置选项
+
+- `target`：目标函数地址或导出符号名（如 `"0x7b670815ac"` 或 `"liboattest.so!ctor_priority_101"`）
+- `range`：插桩检测范围（指定 `[start, end]` 或模块名；默认自动包含目标函数所在模块代码段）
+- `maxInstructions`：最大模拟执行指令预算（默认 500,000）
+- `maxLog`：最大输出反汇编日志行数（默认 100；`0` 表示全量日志不截断）
+- `dumpRegs`：是否实时打印寄存器变更高亮（`true` 打印指令修改前后的 GPR 寄存器差量，如 ` ; x0=0x4, sp=0x...`）
+- `onInstruction`：逐指令回调 `function(inst) { ... }`，返回 `false` 可提前终止 trace
+- `onBasicBlock`：基本块执行回调 `function(bb) { ... }`
+
+#### 3. 示例代码
+
+```javascript
+// 快速 Trace 一个关键 Native 函数（自动捕获并打印指令级反汇编与寄存器改变量）
+qbdi.trace({
+    target: "libnative.so!encrypt_payload",
+    maxLog: 50,
+    dumpRegs: true
+});
+```
 
 ---
 

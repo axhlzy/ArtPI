@@ -528,10 +528,92 @@ HW.detachAll();
 #### CLI Early Spawn Monitoring & Constructor Tracing (`-S` with `-L` / `-LC` / `--stop-lib`)
 When spawning an app with `-S`:
 - `-L, --lib-log`: Trace all dynamic library loading events via hardware breakpoint on `dlopen`/`android_dlopen_ext`.
-- `-LC, --lib-constructors`: In addition to dlopen logging, hooks Linker's `soinfo::call_constructors`, parses `DT_INIT` and `DT_INIT_ARRAY` from memory, and daisy-chains one-shot hardware breakpoints to trace each constructor with millisecond execution timing using strictly 1 hardware breakpoint slot.
+- `-LC, --lib-constructors`: In addition to dlopen logging, hooks Linker's `soinfo::call_constructors`, parses `DT_INIT` and `DT_INIT_ARRAY` from memory, and daisy-chains one-shot hardware breakpoints to trace each constructor with millisecond execution timing and xDL symbol resolution using strictly 1 hardware breakpoint slot.
+  - `-LC`: Trace all constructors across all loaded libraries with millisecond timing.
+  - `-LC <libName>:<index>`: e.g. `-LC liboattest.so:0` isolates and traces constructor index 0 using QBDI emulation, while relaying others via hardware breakpoints.
+  - `-LC <libName>:<symbolName>`: e.g. `-LC liboattest.so:custom_dt_init` triggers QBDI emulation by symbol name.
+  - `-LC <libName>@<offsetOrAddr>`: e.g. `-LC liboattest.so@0x475bc` triggers QBDI emulation by relative file offset or virtual memory address.
+  - `--log / --full-log`: Full trace logging without truncation limits.
+  - `--max-log <N>`: Custom log budget (default 100, 0 for unlimited).
 - `--stop-lib <name>`: Pause the main thread upon loading the specified library.
 
 ---
+
+### 6.8 `Linker.*` / `linker.*` — Linker & ELF Soinfo Introspection & Control
+
+Provides deep introspection into the Bionic Linker's runtime internal data structures and loaded ELF metadata. Fully case-insensitive (`Linker` or `linker`).
+
+#### 1. Core APIs
+
+| API | Signature | Description |
+|---|---|---|
+| `Linker.find` / `linker.find` | `(nameOrAddr)` | Find the `soinfo` object corresponding to a library name or memory address |
+| `Linker.main` / `linker.somain` | `()` | Obtain the `soinfo` object of the main executable |
+| `Linker.list` / `linker.modules` | `()` | Enumerate `soinfo` objects of all loaded libraries in the process |
+| `Linker.getConstructors` | `(nameOrAddr)` | Extract all initialization functions (`DT_INIT`, `DT_INIT_ARRAY`) with resolved xDL symbol names and relative offsets |
+| `Linker.getDestructors` | `(nameOrAddr)` | Extract all termination functions (`DT_FINI`, `DT_FINI_ARRAY`) with resolved xDL symbol names |
+| `Linker.symbols` / `linker.symtab` | `(nameOrAddr[, count])` | Parse ELF `.symtab` and `.strtab`, returning an array of symbols (name, address, size, bind, type) |
+| `Linker.linkMap` | `()` | Traverse and return the `link_map` chain (`{addr, name, phnum}`) |
+| `Linker.load` | `(libName)` | Call Linker kernel `__loader_dlopen` directly, **bypassing Android 7.0+ Linker Namespace restrictions** |
+| `Linker.dump` | `(nameOrAddr)` | Return formatted text summary of the library metadata |
+
+#### 2. `soinfo` Object Properties
+
+Calling `linker.find("liboattest.so")` or `linker.main()` returns an object with:
+- `name` / `soname`: Library filename (e.g. `"liboattest.so"`)
+- `base`: Load base address (`"0x7b6705f000"`)
+- `size`: Mapped memory size in bytes
+- `loadBias`: Load bias (`base - p_vaddr`)
+- `phdr` / `phnum`: Program headers array pointer and count
+- `dynamic`: `PT_DYNAMIC` segment pointer
+- `strtab` / `strtabSize`: String table pointer and size
+- `symtab` / `symentSize` / `symtabCount`: Symbol table pointer, entry size, and total symbol count
+- `needed` / `dependencies`: Array of DT_NEEDED library names
+- `constructors`: Array of constructors `{ type, tag, desc, symbol, address, func, offset }`
+- `destructors`: Array of destructors `{ type, tag, desc, symbol, address, func, offset }`
+- `preinit`: Array of preinitializers (if present)
+- `dumpText`: Structured string representation with decimal numbering and space alignment
+- `toString()`: Invoked automatically by REPL to render structured output
+
+#### 3. Example
+
+```javascript
+// 1. Inspect loaded library
+console.log(linker.find("liboattest.so"));
+
+// 2. Query destructors
+let dtors = linker.getDestructors("liboattest.so");
+console.log("Destructors: " + dtors.destructors.length);
+
+// 3. Inspect symbols
+let syms = linker.symbols("liboattest.so", 10);
+syms.forEach(s => console.log(`[${s.index}] ${s.name} @ ${s.address}`));
+```
+
+---
+
+### 6.9 `QBDI.*` / `qbdi.*` — Dynamic Binary Instrumentation (DBI) Emulation & Tracing
+
+Integrates Quarkslab's Native Dynamic Binary Instrumentation (QBDI) engine into QuickJS. Fully case-insensitive (`QBDI`, `Qbdi`, or `qbdi`).
+
+#### 1. Core APIs
+
+| API | Signature | Description |
+|---|---|---|
+| `qbdi.version()` | `()` | Returns QBDI engine version information |
+| `qbdi.trace` | `(options \| fnOrAddr[, options])` | Launch instruction-level QBDI execution trace on a native function or address |
+| `qbdi.disassemble` | `(addr, count)` | Disassemble `count` instructions starting at `addr` |
+| `qbdi.run` | `(fnOrAddr, ...args)` | Emulate calling a native function in an isolated QBDI context |
+
+#### 2. `qbdi.trace` Options
+
+- `target`: Function address or symbol name
+- `range`: Instrumented memory range (default: module code range)
+- `maxInstructions`: Execution instruction budget (default: 500,000)
+- `maxLog`: Log line count limit (default: 100, 0 for unlimited)
+- `dumpRegs`: Enable real-time GPR register diff logging (e.g. ` ; x0=0x4, sp=0x...`)
+- `onInstruction`: Per-instruction callback `function(inst)`
+- `onBasicBlock`: Per-basic-block callback `function(bb)`
 
 ## 7. Dependencies & Acknowledgments
 
