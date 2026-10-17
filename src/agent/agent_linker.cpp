@@ -486,19 +486,33 @@ static JSValue MakeSoinfoJsObject(JSContext* ctx, uintptr_t soinfo_ptr, uintptr_
             }
             ss << "\n";
         }
+        auto formatIndexTag = [](size_t i, size_t total) -> std::string {
+            std::string s = "[" + std::to_string(i) + "]";
+            size_t targetWidth = 5;
+            if (total >= 100) {
+                targetWidth = std::to_string(total).length() + 3;
+            }
+            if (s.length() < targetWidth) {
+                s.append(targetWidth - s.length(), ' ');
+            } else {
+                s.push_back(' ');
+            }
+            return s;
+        };
+
         if (!elf.preinit.empty()) {
             ss << "  preinit  : " << std::dec << elf.preinit.size() << " found\n";
             for (size_t i = 0; i < elf.preinit.size(); i++) {
-                ss << "    [" << std::dec << i << "]\t" << elf.preinit[i].desc << " @ 0x" << std::hex << elf.preinit[i].func << "\n";
+                ss << "    " << formatIndexTag(i, elf.preinit.size()) << elf.preinit[i].desc << " @ 0x" << std::hex << elf.preinit[i].func << "\n";
             }
         }
         ss << "  constructors: " << std::dec << elf.ctors.size() << " found\n";
         for (size_t i = 0; i < elf.ctors.size(); i++) {
-            ss << "    [" << std::dec << i << "]\t" << elf.ctors[i].desc << " @ 0x" << std::hex << elf.ctors[i].func << "\n";
+            ss << "    " << formatIndexTag(i, elf.ctors.size()) << elf.ctors[i].desc << " @ 0x" << std::hex << elf.ctors[i].func << "\n";
         }
         ss << "  destructors : " << std::dec << elf.dtors.size() << " found\n";
         for (size_t i = 0; i < elf.dtors.size(); i++) {
-            ss << "    [" << std::dec << i << "]\t" << elf.dtors[i].desc << " @ 0x" << std::hex << elf.dtors[i].func << "\n";
+            ss << "    " << formatIndexTag(i, elf.dtors.size()) << elf.dtors[i].desc << " @ 0x" << std::hex << elf.dtors[i].func << "\n";
         }
         dumpStr = ss.str();
     }
