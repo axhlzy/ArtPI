@@ -38,6 +38,8 @@ jobject JsValueToJavaObject(JNIEnv* env, JSContext* ctx, JSValueConst v, const s
 // Class inspection & member preparation
 std::string JavaClassName(JNIEnv* env, jclass cls);
 std::string SimplifyJavaType(std::string t);
+// "int" -> "I", "java.lang.String" -> "Ljava/lang/String;", "int[]" -> "[I"
+std::string TypeNameToDescriptor(const std::string& tn);
 int PrepareClassMembers(JNIEnv* env, jclass cls);
 
 // Observed objects tracking (for raw pointer to jobject resolution)

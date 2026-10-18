@@ -285,7 +285,7 @@ std::string JavaClassName(JNIEnv* env, jclass cls) {
     return n;
 }
 
-static std::string TypeNameToDescriptor(const std::string& tn) {
+std::string TypeNameToDescriptor(const std::string& tn) {
     if (tn.empty()) return "Ljava/lang/Object;";
     if (tn[0] == '[') {
         std::string d = tn;

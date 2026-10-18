@@ -243,7 +243,23 @@ static const std::map<std::string, std::string> kApiDocs = {
      "      jnihw(\"FindClass\", (ctx) => { console.log(\"Class:\", ctx.readCString(ctx.x1)); })"},
     {"jnistop", "Usage: jnistop()\n  - Stops JNI Vtable tracing and restores original JNINativeInterface table."},
     {"JNI", "Usage: JNI.trace(filter) | JNI.stop() | JNI.hwtrace(funcName, [cb]) | JNI.hwstop() | JNI.status()"},
-    {"jni", "Alias for JNI (case-insensitive)"}
+    {"jni", "Alias for JNI (case-insensitive)"},
+
+    {"registerClass",
+     "Usage: Java.registerClass({ name, superclass?, implements?, methods, fields? })\n"
+     "  - Builds a DEX at runtime and splices it into the app PathClassLoader, so the\n"
+     "    returned object is a real Java class whose methods are implemented in JS.\n"
+     "  - Handle: .$injected (app-visible) / .$className / .$new() / .$method(n,s)\n"
+     "            .$loader / .$dispose()"},
+    {"registeredClasses", "Usage: Java.registeredClasses() -> ['com.example.Hook', ...]"},
+    {"loadDex",
+     "Usage: Java.loadDex(pathOrBytes, {inject=true, prepend=false, name='external.dex'})\n"
+     "  - Loads an arbitrary .dex (device path, number[] or byte[] JRef) and splices its\n"
+     "    DexPathList elements into the app PathClassLoader by default, so\n"
+     "    env->FindClass / Class.forName / app code can resolve the new classes.\n"
+     "  - Returns a handle: .$injected / .$name / .$loader / .loadClass(name) / .$dispose()\n"
+     "  - {inject:false} keeps the dex isolated in its own ClassLoader."},
+    {"loadedDexes", "Usage: Java.loadedDexes() -> [{name, injected}, ...]"}
 };
 
 static JSValue JsListAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
@@ -524,6 +540,10 @@ bool InitJs(JNIEnv* env) {
         }
         if (loader) PI::Interp::RegisterAppClassLoader(env, loader);
     }
+
+    // Install regardless of whether an app loader was available this early:
+    // the fallback resolves it lazily through GetAppClassLoader().
+    artpi::agent::InstallInterpClassFallback();
 
     // App-scope allowlist: only StepIn into classes owned by the app's own
     // package. This is robust under R8/ProGuard repackaging (bundled libs such

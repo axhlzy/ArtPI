@@ -14,6 +14,12 @@
 #include <strings.h>
 #include <unordered_map>
 #include <cctype>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
+#include <dirent.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -420,6 +426,7 @@ const std::vector<std::string> kCompletions = {
 
 std::mutex g_termMutex;
 std::string g_currentPrompt = "artpi> ";
+std::string g_pendingInput;   // accumulated complete lines of a multi-line entry
 std::string g_currentLine;
 size_t g_currentPos = 0;
 bool g_isRawMode = false;
@@ -1224,6 +1231,221 @@ void RefreshLineLocked() {
     std::cout << std::flush;
 }
 
+// ---------------------------------------------------------------------------
+// REPL "!" commands — terminal-side helpers (the CLI runs on the device, so
+// these operate on the device filesystem / shell directly).
+//
+//   !load <file.js>   read a JS file and evaluate it in the agent (same as -f)
+//   !ls [-l] [dir]    list a directory
+//   !pwd / !cd <dir>  working directory of the REPL (affects !load / !ls)
+//   !cat <file>       print a file
+//   !sh <cmd>         run a shell command
+//   !classes          shortcut for Java.registeredClasses()
+//   !help             show this help
+//
+// When *outScript is non-empty the caller evaluates it on the agent.
+// ---------------------------------------------------------------------------
+static void ReplPrint(const std::string& text) {
+    std::lock_guard<std::mutex> lk(g_termMutex);
+    ClearMenuLocked();
+    std::cout << "\r\033[K" << text;
+    if (text.empty() || text.back() != '\n') std::cout << "\r\n";
+    std::cout << std::flush;
+    RefreshLineLocked();
+}
+
+static std::string TrimSpaces(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+static std::string CurrentDir() {
+    char buf[4096] = {0};
+    return getcwd(buf, sizeof(buf)) != nullptr ? std::string(buf) : std::string("?");
+}
+
+static std::string HumanSize(unsigned long long n) {
+    char buf[64];
+    if (n >= 1024ULL * 1024 * 1024) snprintf(buf, sizeof(buf), "%.1fG", n / 1073741824.0);
+    else if (n >= 1024ULL * 1024) snprintf(buf, sizeof(buf), "%.1fM", n / 1048576.0);
+    else if (n >= 1024ULL) snprintf(buf, sizeof(buf), "%.1fK", n / 1024.0);
+    else snprintf(buf, sizeof(buf), "%lluB", n);
+    return buf;
+}
+
+static std::string BangUsage() {
+    return
+        "  !load <file.js>    evaluate a JS file in the agent (same as -f)\n"
+        "  !ls [-l] [dir]     list a directory (device-side)\n"
+        "  !pwd               show the REPL working directory\n"
+        "  !cd <dir>          change the REPL working directory\n"
+        "  !cat <file>        print a text file\n"
+        "  !sh <cmd>          run a shell command\n"
+        "  !classes           Java.registeredClasses()\n"
+        "  !help              this help";
+}
+
+// Returns true when the line was a terminal command. A non-empty *outScript
+// asks the caller to evaluate that script on the agent.
+static bool HandleBangCommand(const std::string& line, std::string* outScript) {
+    outScript->clear();
+
+    const std::string body = TrimSpaces(line.substr(1));
+    if (body.empty()) {
+        ReplPrint(BangUsage());
+        return true;
+    }
+
+    size_t sp = body.find_first_of(" \t");
+    const std::string cmd = sp == std::string::npos ? body : body.substr(0, sp);
+    const std::string rest = sp == std::string::npos ? "" : TrimSpaces(body.substr(sp + 1));
+
+    if (cmd == "help" || cmd == "h" || cmd == "?") {
+        ReplPrint(BangUsage());
+        return true;
+    }
+
+    if (cmd == "pwd") {
+        ReplPrint(CurrentDir());
+        return true;
+    }
+
+    if (cmd == "cd") {
+        if (rest.empty()) {
+            ReplPrint("[!] usage: !cd <dir>");
+        } else if (chdir(rest.c_str()) != 0) {
+            ReplPrint(std::string("[!] cd failed: ") + std::strerror(errno));
+        } else {
+            ReplPrint("[*] cwd = " + CurrentDir());
+        }
+        return true;
+    }
+
+    if (cmd == "ls") {
+        bool longFormat = false;
+        std::string path;
+        {
+            std::string r = rest;
+            if (r.rfind("-l", 0) == 0) {
+                longFormat = true;
+                r = TrimSpaces(r.substr(2));
+            }
+            path = r.empty() ? "." : r;
+        }
+
+        DIR* dir = opendir(path.c_str());
+        if (dir == nullptr) {
+            // Not a directory: show the single entry (stat) when it exists.
+            struct stat st {};
+            if (stat(path.c_str(), &st) == 0) {
+                ReplPrint(path + (longFormat ? "  " + HumanSize(static_cast<unsigned long long>(st.st_size)) : ""));
+            } else {
+                ReplPrint(std::string("[!] ls: ") + std::strerror(errno));
+            }
+            return true;
+        }
+
+        std::vector<std::string> names;
+        while (struct dirent* ent = readdir(dir)) {
+            const std::string n = ent->d_name;
+            if (n == "." || n == "..") continue;
+            names.push_back(n);
+        }
+        closedir(dir);
+        std::sort(names.begin(), names.end());
+
+        std::ostringstream ss;
+        if (longFormat) {
+            for (const auto& n : names) {
+                const std::string full = path + "/" + n;
+                struct stat st {};
+                if (stat(full.c_str(), &st) != 0) continue;
+                const char type = S_ISDIR(st.st_mode) ? 'd' : (S_ISLNK(st.st_mode) ? 'l' : '-');
+                ss << type << " "
+                   << std::setw(8) << HumanSize(static_cast<unsigned long long>(st.st_size))
+                   << "  " << n << "\n";
+            }
+        } else {
+            for (size_t i = 0; i < names.size(); ++i) {
+                ss << names[i];
+                ss << ((i + 1) % 4 == 0 ? "\n" : "\t");
+            }
+            if (!names.empty() && names.size() % 4 != 0) ss << "\n";
+        }
+        if (names.empty()) ss << "(empty)\n";
+        ReplPrint(ss.str());
+        return true;
+    }
+
+    if (cmd == "cat") {
+        if (rest.empty()) {
+            ReplPrint("[!] usage: !cat <file>");
+            return true;
+        }
+        std::ifstream f(rest, std::ios::binary);
+        if (!f) {
+            ReplPrint("[!] cannot open " + rest);
+            return true;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        std::string text = ss.str();
+        constexpr size_t kMax = 256 * 1024;
+        if (text.size() > kMax) {
+            text.resize(kMax);
+            text += "\n... (truncated at 256 KiB)\n";
+        }
+        ReplPrint(text);
+        return true;
+    }
+
+    if (cmd == "sh" || cmd == "exec") {
+        if (rest.empty()) {
+            ReplPrint("[!] usage: !sh <command>");
+            return true;
+        }
+        std::lock_guard<std::mutex> lk(g_termMutex);
+        ClearMenuLocked();
+        std::cout << std::flush;
+        int rc = std::system(rest.c_str());
+        std::cout << "\r\033[K[$?] exit " << rc << "\r\n" << std::flush;
+        RefreshLineLocked();
+        return true;
+    }
+
+    if (cmd == "load" || cmd == "source" || cmd == "." || cmd == "run") {
+        if (rest.empty()) {
+            ReplPrint("[!] usage: !load <file.js>");
+            return true;
+        }
+        std::ifstream f(rest, std::ios::binary);
+        if (!f) {
+            ReplPrint("[!] cannot open " + rest);
+            return true;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        std::string script = ss.str();
+        if (script.empty()) {
+            ReplPrint("[!] empty file: " + rest);
+            return true;
+        }
+        ReplPrint("[*] loading " + rest + " (" + std::to_string(script.size()) + " bytes)");
+        *outScript = std::move(script);
+        return true;
+    }
+
+    if (cmd == "classes" || cmd == "registered") {
+        *outScript = "Java.registeredClasses()";
+        return true;
+    }
+
+    ReplPrint("[!] unknown command: !" + cmd + "   (try !help)");
+    return true;
+}
+
 void RenderDropdownMenuLocked(const std::vector<std::string>& candidates, size_t selectedIdx) {
     if (candidates.empty()) {
         ClearMenuLocked();
@@ -1353,10 +1575,96 @@ void HandleTabCompletion() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-line editing helpers
+//
+// The REPL renders one physical line at a time (prompt + current line). When
+// the Enter key is pressed on a syntactically incomplete snippet we keep the
+// already-typed lines in `g_pendingInput` and switch to a "  ...> " prompt, so
+// pasting a function/object literal just works.
+// ---------------------------------------------------------------------------
+static bool IsJsInputComplete(const std::string& src, bool* trailingBackslash) {
+    if (trailingBackslash != nullptr) *trailingBackslash = false;
+
+    // Trailing "\" forces a continuation (explicit line joining).
+    size_t end = src.find_last_not_of(" \t\r");
+    if (end != std::string::npos && src[end] == '\\') {
+        if (trailingBackslash != nullptr) *trailingBackslash = true;
+        return false;
+    }
+
+    int depth = 0;
+    bool inLineComment = false;
+    bool inBlockComment = false;
+    char quote = 0;           // '\'' '"' '`'
+    bool escaped = false;
+
+    for (size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        const char next = (i + 1 < src.size()) ? src[i + 1] : '\0';
+
+        if (inLineComment) {
+            if (c == '\n') inLineComment = false;
+            continue;
+        }
+        if (inBlockComment) {
+            if (c == '*' && next == '/') {
+                inBlockComment = false;
+                ++i;
+            }
+            continue;
+        }
+        if (quote != 0) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == quote) {
+                quote = 0;
+            }
+            continue;   // newlines inside a string keep it open
+        }
+
+        if (c == '/' && next == '/') { inLineComment = true; ++i; continue; }
+        if (c == '/' && next == '*') { inBlockComment = true; ++i; continue; }
+        if (c == '\'' || c == '"' || c == '`') { quote = c; continue; }
+
+        if (c == '(' || c == '[' || c == '{') ++depth;
+        else if (c == ')' || c == ']' || c == '}') { if (depth > 0) --depth; }
+    }
+
+    if (quote != 0 || inBlockComment) return false;
+    return depth == 0;
+}
+
+static std::string TrimTrailingBackslash(std::string s) {
+    size_t end = s.find_last_not_of(" \t\r");
+    if (end != std::string::npos && s[end] == '\\') s.erase(end, 1);
+    return s;
+}
+
 bool ReadInteractiveLine(std::string& outLine, std::vector<std::string>& history) {
     if (!g_isRawMode) {
-        std::cout << g_currentPrompt << std::flush;
-        return static_cast<bool>(std::getline(std::cin, outLine));
+        // Piped input: also honour multi-line snippets so `printf '...' | cli -k`
+        // works for object literals / function bodies.
+        for (;;) {
+            std::cout << g_currentPrompt << std::flush;
+            std::string line;
+            if (!std::getline(std::cin, line)) return false;
+
+            std::string joined = g_pendingInput.empty() ? line
+                                                        : g_pendingInput + "\n" + line;
+            bool trailingBackslash = false;
+            if (!IsJsInputComplete(joined, &trailingBackslash)) {
+                g_pendingInput = trailingBackslash ? TrimTrailingBackslash(joined) : joined;
+                g_currentPrompt = "  ...> ";
+                continue;
+            }
+            outLine = TrimTrailingBackslash(joined);
+            g_pendingInput.clear();
+            g_currentPrompt = "artpi> ";
+            return true;
+        }
     }
 
     {
@@ -1386,8 +1694,25 @@ bool ReadInteractiveLine(std::string& outLine, std::vector<std::string>& history
                 continue;
             }
             ClearMenuLocked();
+
+            std::string joined = g_pendingInput.empty() ? g_currentLine
+                                                        : g_pendingInput + "\n" + g_currentLine;
+            bool trailingBackslash = false;
+            if (!IsJsInputComplete(joined, &trailingBackslash)) {
+                // Incomplete snippet: keep the lines and continue on the next one.
+                g_pendingInput = trailingBackslash ? TrimTrailingBackslash(joined) : joined;
+                g_currentLine.clear();
+                g_currentPos = 0;
+                g_currentPrompt = "  ...> ";
+                std::cout << "\r\n" << std::flush;
+                RefreshLineLocked();
+                continue;
+            }
+
             std::cout << "\r\n" << std::flush;
-            outLine = g_currentLine;
+            outLine = TrimTrailingBackslash(joined);
+            g_pendingInput.clear();
+            g_currentPrompt = "artpi> ";
             if (!outLine.empty()) {
                 if (history.empty() || history.back() != outLine) {
                     history.push_back(outLine);
@@ -1406,6 +1731,8 @@ bool ReadInteractiveLine(std::string& outLine, std::vector<std::string>& history
         if (c == 3) { // Ctrl+C
             ClearMenuLocked();
             std::cout << "^C\r\n" << std::flush;
+            g_pendingInput.clear();
+            g_currentPrompt = "artpi> ";
             g_currentLine.clear();
             g_currentPos = 0;
             RefreshLineLocked();
@@ -1414,6 +1741,13 @@ bool ReadInteractiveLine(std::string& outLine, std::vector<std::string>& history
 
         if (c == 4) { // Ctrl+D
             ClearMenuLocked();
+            if (g_currentLine.empty() && !g_pendingInput.empty()) {
+                // Abort a multi-line entry instead of exiting the REPL.
+                g_pendingInput.clear();
+                g_currentPrompt = "artpi> ";
+                RefreshLineLocked();
+                continue;
+            }
             if (g_currentLine.empty()) {
                 std::cout << "\r\n" << std::flush;
                 outLine = "exit";
@@ -1565,6 +1899,7 @@ static void RunInteractiveSession(const AgentEndpoint& ep) {
               << "  ArtPI Interactive QuickJS REPL (Connected to " << DescribeEndpoint(ep) << ")\n"
               << "  Type JS commands (e.g. dynamic.java.<Class>.dumpCode())\n"
               << "  [Ghost Text] autosuggest, [\u2192/Tab] accept, [Tab] menu dropdown.\n"
+              << "  Terminal commands: !help  (!load <file.js>, !ls, !pwd, !sh <cmd>)\n"
               << "========================================================\n" << std::endl;
 
     std::atomic<bool> running{true};
@@ -1668,6 +2003,14 @@ static void RunInteractiveSession(const AgentEndpoint& ep) {
             } else {
                 continue;
             }
+        }
+
+        // Terminal-side "!" commands (fs/shell helpers + !load <file.js>).
+        if (line[0] == '!') {
+            std::string bangScript;
+            HandleBangCommand(line, &bangScript);
+            if (bangScript.empty()) continue;
+            line = std::move(bangScript);
         }
 
         msgpack::Value req = msgpack::Value::makeMap();

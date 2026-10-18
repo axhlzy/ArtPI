@@ -8,6 +8,8 @@
 #include "agent_java_hook.h"
 #include "agent_java_choose.h"
 #include "agent_java_ui.h"
+#include "agent_java_registerclass.h"
+#include "agent_invoke.h"
 
 extern "C" {
     typedef void (*PineObservedObjectCallback)(JNIEnv* env, uint64_t raw, jobject obj);
@@ -27,6 +29,8 @@ void RegisterJavaApis(JSContext* ctx, JSValue global, JSValue java) {
     RegisterJavaHookApis(ctx, global, java);
     RegisterJavaChooseApis(ctx, global, java);
     RegisterJavaUiApis(ctx, global);
+    RegisterJavaRegisterClassApis(ctx, global, java);
+    RegisterJavaInvokeApis(ctx, global, java);
 }
 
 }} // namespace artpi::agent

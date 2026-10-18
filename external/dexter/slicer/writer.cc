@@ -176,7 +176,12 @@ static void WriteEncodedValue(const ir::EncodedValue* ir_value, Section& data) {
 
   // optionally check the encoding against the original one
   // (if possible, some of the values contain relocated indexes)
+  // Modified for ArtPI: IR built from scratch (pi_dex_gen.cpp) has no original
+  // byte range, so skip the cross-check instead of asserting.
   SLICER_EXTRA({
+    if (ir_value->original.ptr() == nullptr) {
+      return;
+    }
     switch (type) {
       case dex::kEncodedByte:
       case dex::kEncodedShort:

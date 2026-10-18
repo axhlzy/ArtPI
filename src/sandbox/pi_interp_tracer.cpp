@@ -93,6 +93,9 @@ void RegisterAppClassLoader(JNIEnv* env, jobject loader) {
 // managed stack has no valid frame and env->FindClass() aborts ART.
 static thread_local int g_interpDepth = 0;
 
+static ClassLookupFn g_classLookupFallback = nullptr;
+void SetClassLookupFallback(ClassLookupFn fn) { g_classLookupFallback = fn; }
+
 jclass FindClassRefCached(JNIEnv* env, const char* name) {
     if (!env || !name) return nullptr;
     {
@@ -143,6 +146,23 @@ jclass FindClassRefCached(JNIEnv* env, const char* name) {
                                 "FindClassRefCached '%s': NO loader (loader=%p lc=%p)",
                                 name, loader, lc);
         }
+    }
+
+    // Agent-provided fallback (app loader + generated-class registry). This is
+    // what makes `new-instance` / `const-class` work for classes that live in a
+    // runtime-loaded DEX, or when the app loader was not known at init time.
+    if (g_classLookupFallback != nullptr) {
+        jclass local = g_classLookupFallback(env, name);
+        if (local != nullptr) {
+            jclass resolved = static_cast<jclass>(env->NewGlobalRef(local));
+            env->DeleteLocalRef(local);
+            if (resolved != nullptr) {
+                std::lock_guard<std::mutex> lk(g_clsCacheMutex);
+                g_clsCache[name] = resolved;
+                return resolved;
+            }
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
     }
 
     // On the interpreter/hook path the managed stack has no valid frame, so

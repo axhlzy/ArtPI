@@ -284,6 +284,13 @@ void RegisterAppClassLoader(JNIEnv* env, jobject loader);
 // Falls back to env->FindClass only when the name is not cached.
 jclass FindClassRefCached(JNIEnv* env, const char* jniName);
 
+// Optional agent-provided fallback used when both the class cache and the app
+// ClassLoader fail (e.g. classes from a runtime-loaded DEX, or an app loader
+// that was not available yet when RegisterAppClassLoader() ran).
+// The callee returns a LOCAL ref (or nullptr).
+using ClassLookupFn = jclass (*)(JNIEnv* env, const char* jniSlashName);
+void SetClassLookupFallback(ClassLookupFn fn);
+
 // Choose whether the per-instruction trace dumps register values AFTER the
 // instruction executes (true, default) or BEFORE (false, buffered pre-state).
 void SetDumpRegsAfter(bool after);

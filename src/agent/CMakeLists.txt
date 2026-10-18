@@ -27,6 +27,8 @@ set(AGENT_SOURCES
     agent_java_hook.cpp
     agent_java_choose.cpp
     agent_java_ui.cpp
+    agent_java_registerclass.cpp
+    agent_invoke.cpp
     agent_native.cpp
     agent_memory.cpp
     agent_trace.cpp
@@ -39,6 +41,7 @@ set(AGENT_SOURCES
     agent_qbdi.cpp
     agent_jni.cpp
     jni_trampoline_arm64.S
+    native_thunk_arm64.S
     agent_js.cpp
     ${QUICKJS_SOURCES}
 )

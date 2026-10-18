@@ -238,7 +238,13 @@ const char* kDynamicBootstrapJs = R"JS(
     // 1. Dynamic Java Class & Method Proxy
     // =========================================================================
     function makeClassBox(className) {
-        let cls = Java.findClass(className);
+        // Java.findClass() returns a BigInt jclass on success, but a *string*
+        // for wildcard listings and for the "[!] ... did you mean" suggestions.
+        // Treating that string as a class is what made `listMethods()` report
+        // "Class not found" on a mis-resolved dot chain.
+        let found = Java.findClass(className);
+        let cls = (typeof found === 'bigint') ? found : null;
+        let resolveError = (typeof found === 'string') ? found : "";
         let methodCache = null;
 
         function getDeclaredMethods() {
@@ -293,6 +299,9 @@ const char* kDynamicBootstrapJs = R"JS(
         //   cls.hookall(onEnter [, onLeave])
         //   cls.hookall("encrypt|Header" [, onEnter, onLeave])
         function hookAllMethods(arg0, arg1, arg2) {
+            if (!cls) {
+                return resolveError || ("[!] Class not found: " + className);
+            }
             if (typeof arg0 === 'string') {
                 if (typeof Java.findAndHookAll === 'function') {
                     return Java.findAndHookAll(className, arg0, arg1, arg2);
@@ -377,6 +386,40 @@ const char* kDynamicBootstrapJs = R"JS(
                     return __native_jcall(className, mName, ...args);
                 }
                 throw new Error("__native_jcall is not available");
+            };
+
+            // ---- dual-path invocation -------------------------------------
+            // m(...)            : ART/JNI call (backwards compatible)
+            // .invokeJni(...)   : explicit ART/JNI call
+            // .invokeInterp(..) : run the bytecode on the embedded nmmvm
+            // .bind(obj)        : receiver-bound view for instance methods
+            mFn.invokeJni = function(...args) {
+                return __native_invoke(art, 'jni', null, ...args);
+            };
+            mFn.callJni = mFn.invokeJni;
+            mFn.invokeInterp = function(...args) {
+                return __native_invoke(art, 'interp', null, ...args);
+            };
+            mFn.callInterp = mFn.invokeInterp;
+            mFn.invoke = mFn.invokeInterp;   // NMMVM is the "instrumented" path
+            mFn.nmmvm = mFn.invokeInterp;
+            mFn.bind = function(thiz) {
+                let bound = {
+                    $thiz: thiz,
+                    className: className,
+                    methodName: mName,
+                    artMethod: art,
+                    signature: (info && info.signature) ? info.signature : "",
+                    invokeJni: function(...args) { return __native_invoke(art, 'jni', thiz, ...args); },
+                    invokeInterp: function(...args) { return __native_invoke(art, 'interp', thiz, ...args); },
+                    call: function(...args) { return __native_invoke(art, 'jni', thiz, ...args); },
+                    interp: function(...args) { return __native_invoke(art, 'interp', thiz, ...args); },
+                    invoke: function(...args) { return __native_invoke(art, 'interp', thiz, ...args); },
+                    callInterp: function(...args) { return __native_invoke(art, 'interp', thiz, ...args); },
+                    nmmvm: function(...args) { return __native_invoke(art, 'interp', thiz, ...args); },
+                    toString: function() { return "[JavaMethod bound " + className + "." + mName + "]"; }
+                };
+                return bound;
             };
 
             mFn.className = className;
@@ -483,6 +526,9 @@ const char* kDynamicBootstrapJs = R"JS(
                 return Java.decompile(className);
             },
             listMethods: function() {
+                if (!cls) {
+                    return resolveError || ("[!] Class not found: " + className);
+                }
                 return Java.listMethods(cls);
             },
             findMethods: function(pat) {
@@ -524,7 +570,7 @@ const char* kDynamicBootstrapJs = R"JS(
                 let innerProp = prop.startsWith("$") ? prop : ("$" + prop);
                 let inner = className + innerProp;
                 let innerCls = Java.findClass(inner);
-                if (innerCls) return makeClassBox(inner);
+                if (typeof innerCls === 'bigint') return makeClassBox(inner);
 
                 // Static field access on class
                 if (typeof __native_jfget === 'function') {
@@ -601,6 +647,15 @@ const char* kDynamicBootstrapJs = R"JS(
         });
     }
 
+    // Class-level API names. If one of these is accessed on a *package* chain,
+    // the previous segment was meant to be a class: surface findClass()'s
+    // "did you mean" message instead of silently building a bogus package.
+    const CLASS_BOX_APIS = {
+        hookall: 1, hookAll: 1, listMethods: 1, findMethods: 1, choose: 1,
+        findAndHook: 1, findandhook: 1, dumpCode: 1, dumpSmali: 1,
+        disassembly: 1, decompile: 1, hookallclassmethods: 1, $makeMethodBox: 1
+    };
+
     function makeJavaPackage(path) {
         let pkgObj = {
             $path: path,
@@ -612,9 +667,22 @@ const char* kDynamicBootstrapJs = R"JS(
             get(target, prop) {
                 if (typeof prop !== 'string') return target[prop];
                 if (prop in target) return target[prop];
+                if (path && CLASS_BOX_APIS[prop] === 1) {
+                    let asCls = Java.findClass(path);
+                    if (typeof asCls !== 'bigint') {
+                        return function() {
+                            return (typeof asCls === 'string')
+                                ? asCls
+                                : ("[!] Class not found: " + path);
+                        };
+                    }
+                    return makeClassBox(path)[prop];
+                }
                 let next = path ? (path + "." + prop) : prop;
                 let cls = Java.findClass(next);
-                if (cls) {
+                // Only a BigInt is a real jclass; strings are "did you mean"
+                // suggestions and must NOT terminate the package chain.
+                if (typeof cls === 'bigint') {
                     return makeClassBox(next);
                 }
                 return makeJavaPackage(next);

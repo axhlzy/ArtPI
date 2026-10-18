@@ -34,6 +34,19 @@ JNIEnv* GetEnv();
 // Application ClassLoader Discovery & Cache
 jobject GetAppClassLoader(JNIEnv* env);
 jclass FindClassWithFallback(JNIEnv* env, const std::string& className);
+
+// Same as FindClassWithFallback minus env->FindClass(). Returns a LOCAL ref.
+// env->FindClass() walks the managed stack, which is invalid on a frameless
+// hook/interpreter thread, so this variant is the only safe one there. It still
+// resolves: generated-class registry -> app ClassLoader.loadClass().
+// `allow_lazy_loader=false` additionally forbids the lazy GetAppClassLoader()
+// probe (which itself uses env->FindClass) and only uses an already cached one.
+jclass FindClassViaRegistryOrAppLoader(JNIEnv* env, const std::string& className,
+                                       bool allow_lazy_loader = true);
+
+// Logs a pending Java exception with Throwable.toString() and clears it.
+// Never uses ExceptionDescribe(): that is unsafe on frameless JNI threads.
+void LogAndClearJavaException(JNIEnv* env, const char* where);
 bool MatchWildcard(const std::string& str, const std::string& pattern);
 std::vector<std::string> EnumerateAppClassNames(JNIEnv* env);
 std::vector<std::string> FindMatchingClassNames(JNIEnv* env, const std::string& prefix, size_t limit = 50);
@@ -58,6 +71,10 @@ void InstallConsole(JSContext* ctx);
 // 1=hook, 2=trace, 4=breakpoint.
 int AgentReleaseMethodInstrumentation(void* artMethod);
 std::string FormatReleasedInstrumentation(int mask);
+
+// Install the interpreter's class-lookup fallback (app loader + generated
+// class registry). Call once from InitJs after the JS bindings are up.
+void InstallInterpClassFallback();
 
 // Early-startup main-thread pause gate (used by -W/--wait and --pause)
 bool ArtPIIsProcessPaused();

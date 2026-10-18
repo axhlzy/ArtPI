@@ -7,6 +7,7 @@
 #include "../../include/ArtPI.h"
 #include "art/art_method.h"
 #include "dex/pi_dex_resolver.h"
+#include "dex/pi_dex_loader.h"
 #include "levenshtein.h"
 
 #include <sstream>
@@ -415,6 +416,9 @@ static JSValue JsFindClass(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
             "android.os.Bundle", "android.widget.TextView", "android.view.View"
         };
         for (const auto& sc : kSysClasses) allNames.push_back(sc);
+        // Generated classes (Java.registerClass) are not part of any app dex,
+        // so they never show up in EnumerateAppClassNames().
+        for (const auto& gc : PI::DexLoader::ListGeneratedClasses()) allNames.push_back(gc);
 
         std::vector<std::string> matches;
         for (const auto& cn : allNames) {
@@ -464,6 +468,36 @@ static JSValue JsFindClass(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
     }
 
     jclass localCls = FindClassWithFallback(env, pattern);
+
+    // Generated classes (Java.registerClass) are only reachable through the
+    // DexLoader registry. Also accept a *simple* name (`GenMem` -> the single
+    // generated `com.foo.GenMem`), which is what people type in the REPL.
+    if (!localCls && pattern.find('.') == std::string::npos) {
+        std::string match;
+        bool ambiguous = false;
+        for (const auto& gc : PI::DexLoader::ListGeneratedClasses()) {
+            if (gc.size() <= pattern.size()) continue;
+            if (gc.compare(gc.size() - pattern.size(), pattern.size(), pattern) != 0) continue;
+            if (gc[gc.size() - pattern.size() - 1] != '.') continue;
+            if (!match.empty()) {
+                ambiguous = true;
+                break;
+            }
+            match = gc;
+        }
+        if (ambiguous) {
+            return JS_NewString(ctx, ("[!] '" + pattern +
+                "' is ambiguous; use the fully-qualified name").c_str());
+        }
+        if (!match.empty()) {
+            jclass reg = PI::DexLoader::FindGeneratedClass(env, match);
+            if (reg != nullptr) {
+                localCls = static_cast<jclass>(env->NewLocalRef(reg));
+                pattern = match;
+            }
+        }
+    }
+
     if (!localCls) {
         auto appClasses = EnumerateAppClassNames(env);
         std::vector<std::pair<std::string, double>> ranked;

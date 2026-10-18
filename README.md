@@ -171,6 +171,31 @@ adb shell su -c "/data/local/tmp/artpi-cli -S com.example.app --stop-lib libnati
 
 > **连接复用**：`artpi-cli` 自动扫描 `20700..20800` 端口并对已注入 Agent 探活复用；若应用未被注入，会自动提取 payload 完成远程 ptrace 注入。若应用未声明 `INTERNET` 权限，自动降级为抽象 UNIX Domain Socket（`@artpi_agent_<pid>`）。
 
+### 4.3 REPL 终端命令 (`!` 前缀)
+
+REPL 里的 `!` 命令由 **CLI 自身（设备侧）** 执行，不经过 QuickJS；`!load` 例外，它把文件内容送进 Agent 的同一个 JS 上下文求值（等价于启动参数 `-f`）。
+
+| 命令 | 说明 |
+|---|---|
+| `!load <file.js>` | 读取设备上的 JS 文件并在当前 JS 上下文中执行（别名 `!source` / `!.` / `!run`）|
+| `!ls [-l] [dir]` | 列出目录（`-l` 显示类型/大小）|
+| `!pwd` / `!cd <dir>` | 查看 / 切换 REPL 的工作目录（影响 `!load`、`!ls` 的相对路径）|
+| `!cat <file>` | 打印文本文件（>256 KiB 自动截断）|
+| `!sh <cmd>` | 执行 shell 命令（CLI 本身以 root 运行）|
+| `!classes` | 快捷执行 `Java.registeredClasses()`，列出 `Java.registerClass` 生成的类 |
+| `!help` | 列出以上命令 |
+
+> **多行输入**：REPL 支持直接续行 —— 当输入的括号/引号未闭合（或行尾是 `\`）时，提示符变为 `  ...> ` 并继续接收，直到语法完整；`Ctrl+C` 取消当前多行输入，`Ctrl+D` 在空行时退出。复杂脚本仍推荐 `!load <file.js>`。
+
+```
+artpi> !ls -l /data/local/tmp
+artpi> !load /data/local/tmp/artpi_regclass_keep.js
+artpi> !classes
+[ "com.artpi.probe.GenKeep", "com.artpi.probe.RunnerKeep" ]
+artpi> findclass('GenKeep')          // 生成类支持简单名 / 通配符查找
+0x4376
+```
+
 ---
 
 ## 5. 实机交互演示 (Showcase)
@@ -437,6 +462,121 @@ D();  // 同时卸载 Java / native / Unity 等全部 hook
 | `Java.unhookAll` | `()` | `string` | 卸载全部 Java Hook |
 | `Java.methodInfo` | `(artMethod)` | `object` | 提取方法的修饰符、类名、签名、编译状态及 nativeEntry |
 | `Java.methodBox` | `(artMethod)` | `MethodBox` | 将裸 `ArtMethod*` 包装为 `dynamic.java` 同款 MethodBox；全局别名 `jmethodBox` / `jmethodbox` / `methodBox` / `methodbox` |
+| `Java.registerClass` | `({name, superclass?, implements?, methods, fields?})` | `ClassProxy` | **运行时生成 DEX + 加载并注入 App ClassLoader**，方法体由 JS 实现（Frida `Java.registerClass` 同款）|
+| `Java.loadDex` | `(pathOrBytes[, {inject, prepend, name}])` | `DexHandle` | **加载任意 .dex**（设备路径 / `number[]` / `byte[]` JRef），默认拼接进 App PathClassLoader |
+| `Java.registeredClasses` | `()` | `string[]` | 列出当前已注册的生成类 |
+| `Java.loadedDexes` | `()` | `[{name, injected}]` | 列出通过 `loadDex` 加载的 DEX |
+| `Java.invoke` | `(artMethod, mode, receiver, ...args)` | 任意 | **双引擎调用**：`mode='jni'` 走 ART/JNI，`mode='interp'` 走内嵌 nmmvm 解释器 |
+
+#### 双引擎方法调用（ART/JNI vs nmmvm）
+
+同一个 `ArtMethod*` 可以走两条完全不同的执行路径，便于对比「原生执行」与「字节码解释执行」：
+
+```js
+var art = findmethod('com.example.Foo', 'calc', '(II)I');
+var m   = jmethodBox(art);
+
+m(1, 2);              // 旧行为 = ART/JNI
+m.invokeJni(1, 2);    // 显式 ART/JNI（Call*MethodA）
+m.invokeInterp(1, 2); // nmmvm 解释执行（不触发任何 hook）
+m.invoke(1, 2);       // .invoke / .nmmvm 是 invokeInterp 的别名
+
+// 实例方法需要接收者：
+var inst = __native_jcall('com.example.Foo', 'create');
+var b = jmethodBox(findmethod('com.example.Foo', 'mul', '(II)I')).bind(inst);
+b.invokeJni(6, 7);      // 42
+b.invokeInterp(6, 7);   // 42
+
+// 也可以直接调用（显式 mode + receiver）：
+Java.invoke(art, 'interp', null, 1, 2);
+```
+
+- `interp` 走 `PI::Interp::runMethod`：会做 shorty 解析、AAPCS 参数打包、字节码预扫描；
+  native / abstract 方法会被明确拒绝（`is native (no bytecode)`）。
+- 解释执行时若遇到运行时加载的类（`Java.loadDex` / `Java.registerClass`），
+  解释器现在会通过 agent 的 class-lookup fallback 解析（此前 `new-instance` 会直接失败）。
+
+#### `Java.loadDex` — 加载/注入任意 DEX
+
+```js
+var D = Java.loadDex('/data/user/0/com.example.app/cache/patch.dex', {
+    name: 'patch',      // 仅用于日志/列表
+    inject: true,       // 默认 true：拼接进 App PathClassLoader
+    prepend: false      // true 时新元素排在前面（同名单类时优先命中新 DEX）
+});
+
+D.$injected;                       // 是否成功拼接进 App ClassLoader
+D.loadClass('com.foo.Bar');        // -> JRef 类代理（会自动注册进 findClass 表）
+D.$loader;                          // 目标 ClassLoader（injected 时为 App loader）
+D.$dispose();                       // 释放持有的 global ref（已定义的类仍留在 loader 中）
+
+// 也可以直接给字节
+var D2 = Java.loadDex(bytesJRef /* byte[] */, { name: 'inline' });
+```
+
+实现要点：
+
+- 先建一个私有 loader（`InMemoryDexClassLoader`，不可用时回退 `DexClassLoader` 落地），
+  再用 **`BaseDexClassLoader.pathList` → `DexPathList.dexElements` 拼接**（纯 JNI 字段访问，
+  绕开 hidden-API 限制；写入后**回读校验**，失败自动重试 3 次：JNI 写 → 反射写 → 再 JNI 写）。
+- 拼接成功后 `loadClass` 走的是 **App ClassLoader**，因此类由它定义 —— 全局只有一份 Class 对象，
+  `Class.forName(...)` / `env->FindClass` / App 自己的代码都能直接解析到，不存在跨 loader 强转问题。
+- 降级（`$injected === false`，类仍可用、`findClass` 走内部注册表兜底）的两种情况：
+  1. 个别 ROM 忽略 final 字段写入 / 拼接校验失败（自动重试 3 次：JNI 写 → 反射写 → 再 JNI 写）；
+  2. **走了落地回退路径**（API<26 或强制 `__native_dexdisk(1)`）：一个 `DexFile` 只能注册给一个
+     ClassLoader，落地型 dex 只留在自己的私有 loader 里。
+- > 关于「一个 DexFile 两个 ClassLoader」：release 版 ART 通常只打
+  > `Attempt to register dex file ... with multiple class loaders` 警告，userdebug/eng 版可能直接 abort。
+  > 因此默认注入路径只在 `InMemoryDexClassLoader`（内存型 dex，已在真机验证）上启用；落地回退不注入。
+  > 如果目标 ROM 是 userdebug，请先用 `Java.registeredClasses()` + `$injected` 确认行为。
+
+
+#### `Java.registerClass` — 用 JS 实现一个全新的 Java 类
+
+生成流程：JS spec → Dexter(slicer) 构建独立 DEX → `InMemoryDexClassLoader(parent = App ClassLoader)`
+→ `RegisterNatives` → 每个方法一个运行时生成的 ARM64 桩（`x16 = slot`）→ `ArtpiNativeDispatch` → JS 函数。
+所有 JS 实现的方法在 DEX 中都是 `ACC_NATIVE`，**不涉及 smali 汇编**。
+
+```js
+var Hook = Java.registerClass({
+  name: 'com.example.Hook',
+  implements: ['com.example.Callback'],   // 父加载器 = App ClassLoader，接口类型可互通
+  methods: {
+    // 短式：从接口/父类同名方法自动推断签名（含 static 修饰）
+    onEvent: function (v) { console.log('event', v); },
+
+    // 完整式：显式 returnType / argumentTypes
+    twice: { returnType: 'int', argumentTypes: ['int'], static: true,
+             implementation: function (x) { return x * 2; } }
+  },
+  fields: { VERSION: { type: 'int', value: 7 } }   // 静态字段初始值
+});
+
+Hook.twice(21);                              // 静态方法 -> 42
+var h = Hook.$new();                         // 实例化（JRef 代理，实例方法直接调用）
+Hook.$className;                             // 'com.example.Hook'
+Hook.$injected;                              // true = 已拼接进 App PathClassLoader
+Hook.$method('twice', '(I)I');               // ArtMethod* -> 可交给 brkj / Trace / invokeInterpreted
+Hook.$loader;                                // 该类的 ClassLoader
+Hook.$dispose();                             // 注销 native 并按名称移除注册
+```
+
+实现细节与限制：
+
+- 生成类会注册到 `DexLoader` 全局表，因此 `findClass` / `findMethod` / `jhook` / `brkj` / `choose` / `prepare`
+  以及 nmmvm 解释器（`StepIn`）都能直接按类名解析到它。
+- `implements` 声明的接口方法若未在 `methods` 中实现，注册阶段会直接报错并列出缺失的方法签名。
+- 同名重载只能声明一个（用 `methodName` 作 key）；需要多个重载时请分开注册不同类名。
+- 默认加载策略会把这个 DEX 拼接进 **App PathClassLoader**（`$injected === true`），所以类由 App loader
+  定义，可以安全地作为回调 / 桥接类传给 App 代码；拼接失败或走落地回退时类留在私有 loader
+  （`$injected === false`，只能通过 `findClass` / 注册表访问）。仍然不建议用它替换 App 里已存在的同名类型。
+- `registerClass` 方法参数/返回值限制：整型、对象参数最多 **6 个**，浮点参数最多 **8 个**（超出会抛
+  `IllegalArgumentException`），暂不支持栈上传参；数组/非 `String` 对象只能以 **JRef** 形式传参或返回，
+  传普通 JS 数组/对象会直接报错。
+- 加载策略：API 26+ 走 `InMemoryDexClassLoader`（direct ByteBuffer 常驻内存）；不可用时（Android 8 以下、
+  或个别 ROM）自动回退为 **落地加载** —— 把 dex 写入应用 `code_cache/` 后交给 `dalvik.system.DexClassLoader`。
+  可用 `__native_dexdisk(1)` 在真机上强制走回退路径做验证。
+
 
 > **全局别名**：`findclass`、`findmethod`、`listmethods`、`dumpsmali`、`dumpcode`、`decompile`组件 `disassembly`、`choose`、`jhook`、`unhook`、`unhookall`、`jmethodbox` 均可直接在全局作用域调用。
 
@@ -506,7 +646,8 @@ D();  // 同时卸载 Java / native / Unity 等全部 hook
 
 | 参数名 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `mode` | `string` | `"CALL_TREE"` | 追踪模式：<br>• `"CALL_TREE"`：仅输出方法级调用树（轻量默认）<br>• `"INSN_STEP"` / `"INSTRUCTION_DIFF"`：方法调用树 + 逐条 Smali 指令及关联寄存器快照<br>• `"FULL_STACK_NATIVE"`：遇到 JNI 调用自动通过 QBDI 步入 Native 机器码做跨层全栈追踪 |
+| `mode` | `string` | `"CALL_TREE"` | 追踪模式：<br>• `"CALL_TREE"`：仅输出方法级调用树（轻量默认，JNI 调用会以 `[native]` 标记但不会步入）<br>• `"INSN_STEP"` / `"INSTRUCTION_DIFF"`：方法调用树 + 逐条 Smali 指令及关联寄存器快照<br>• `"FULL_STACK_NATIVE"`：遇到 JNI 调用自动通过 QBDI 步入 Native 机器码做跨层全栈追踪<br>• 简写：`"native"` / `"full"` → `FULL_STACK_NATIVE`，`"insn"` / `"instructions"` → `INSN_STEP`，`"diff"` → `INSTRUCTION_DIFF` |
+| `native` / `stepNative` | `boolean` | `false` | `mode` 的简写：为 `true` 时等价于 `mode: "FULL_STACK_NATIVE"`（步入 Native）|
 | `dumpAfter` | `boolean` | `true` | 逐指令追踪时寄存器取值时机：`true` 打印该指令**执行后**的寄存器状态；`false` 打印该指令**执行前**的寄存器状态 |
 | `maxDepth` | `number` | `8` | 最大调用递归深度（在 `Trace.java` + `onInsn` 模式下兼作单次最大指令数预算） |
 | `excludeSystem` | `boolean` | `true` | 过滤系统/框架层调用 |
@@ -530,7 +671,16 @@ dynamic.java.com.example.App.Z.trace({
     mode: "FULL_STACK_NATIVE"
 });
 
+// 示例 3b：等价简写
+dynamic.java.com.example.App.Z.trace("native");
+dynamic.java.com.example.App.Z.trace({ native: true });
+dynamic.java.com.example.App.Z.trace({ stepNative: true, maxDepth: 4 });
+
 ```
+
+> **JNI 边界**：即使使用默认的 `CALL_TREE`，App 类里的 native 方法调用也会在树里标出来（`[native] MainActivity.stringFromJNI()`），
+> 但不会步入机器码；要进入 native 内部继续展开请用 `mode: "FULL_STACK_NATIVE"` 或 `{ native: true }`。
+> 系统/框架类的调用仍按 `excludeSystem` 黑盒透传。
 
 > **追踪作用域**：为保证稳定性，解释器默认只步入 **App 自身包** 内的类（app-scope 允许列表，包名取自 `ActivityThread.currentPackageName()`，app_process 场景回退 `/proc/self/cmdline`）；系统/框架类一律黑盒透传。`suspend` 方法（签名含 `Continuation`）及 `kotlin` / `kotlinx` / `org.jetbrains` 等 Kotlin 运行时也会自动跳过，避免 R8 混淆后解释执行破坏协程的异常控制流。
 

@@ -475,7 +475,26 @@ RunResult runMethodInternal(JNIEnv* env, ArtMethod* method, jobject thisObj,
     // promote object returns out of the dying local frame
     jobject promoted = nullptr;
     if (!hasExc && (shorty[0] == 'L' || shorty[0] == '[')) {
-        promoted = env->PopLocalFrame(rv.l);
+        // The interpreter is supposed to hand back a LOCAL ref created inside
+        // the frame we pushed. Guard against anything else (a global handed
+        // through, or a bogus value) so PopLocalFrame() can never be asked to
+        // decode garbage.
+        const jobjectRefType refType = env->GetObjectRefType(rv.l);
+        if (rv.l == nullptr) {
+            env->PopLocalFrame(nullptr);
+        } else if (refType == JNILocalRefType) {
+            promoted = env->PopLocalFrame(rv.l);
+        } else if (refType == JNIGlobalRefType) {
+            // The interpreter handed us a global; bring it into the caller frame.
+            jobject local = env->NewLocalRef(rv.l);
+            promoted = env->PopLocalFrame(local);
+        } else {
+            // Not a reference at all (interpreter bailed out): never let
+            // PopLocalFrame() decode it.
+            PI_LOGW("InterpExecutor: object result %p has ref type %d (ignored)",
+                    (void*)rv.l, (int)refType);
+            env->PopLocalFrame(nullptr);
+        }
         rv.l = promoted;
     } else {
         env->PopLocalFrame(nullptr);
@@ -561,6 +580,31 @@ std::vector<jvalue> collectCallFrameArgs(const pine_native::CallFrame& frame) {
 // ============================================================================
 namespace pine_native {
 
+namespace {
+
+// Call-tree lines must stay on ONE physical line. A traced method can return
+// (or take) a multi-line String; dumping it verbatim emits unprefixed lines
+// that look like stray logs in the REPL. Keep the first line only and cap the
+// length.
+std::string TraceOneLine(const std::string& s, size_t maxLen = 160) {
+    std::string out;
+    out.reserve((s.size() < maxLen ? s.size() : maxLen) + 4);
+    for (char c : s) {
+        if (c == '\n' || c == '\r') {
+            out += "...";
+            break;
+        }
+        if (out.size() >= maxLen) {
+            out += "...";
+            break;
+        }
+        out += c;
+    }
+    return out;
+}
+
+}  // namespace
+
 jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
     jvalue ret{};
 
@@ -624,32 +668,38 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
                 } else {
                     targetInfo = e.formatMethod();
                 }
-                PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s[Native JNI] %s",
-                                FormatTraceTreePrefix(e.depth + 1, true).c_str(), targetInfo.c_str());
+                PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s[native] %s",
+                                FormatTraceTreePrefix(e.depth + 1, true).c_str(),
+                                TraceOneLine(targetInfo).c_str());
                 return PI::Interp::InvokeVerdict::StepIn;
             }
+            // Default CALL_TREE: mark the JNI boundary (explicitly, so it is
+            // visible in the tree) but do not step into native code.
+            PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s[native] %s",
+                            FormatTraceTreePrefix(e.depth + 1, true).c_str(),
+                            TraceOneLine(e.formatMethod()).c_str());
             return PI::Interp::InvokeVerdict::JniDirect;
         }
         PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s%s",
-                        FormatTraceTreePrefix(e.depth + 1, true).c_str(), e.formatMethod().c_str());
+                        FormatTraceTreePrefix(e.depth + 1, true).c_str(),
+                        TraceOneLine(e.formatMethod()).c_str());
         return PI::Interp::InvokeVerdict::StepIn;
     };
-    cbs.onInvokePost = [preset, FormatTraceTreePrefix](const PI::Interp::InvokeEvent& e,
+    cbs.onInvokePost = [FormatTraceTreePrefix](const PI::Interp::InvokeEvent& e,
                                 const jvalue* r, bool hasExc) {
         if (!PI::Interp::isInterpretableDescriptor(e.className) ||
             PI::Interp::isCoroutineSignature(e.signature)) return;
         if (e.isNative) {
-            if (preset == PI::Trace::TracePreset::FULL_STACK_NATIVE) {
-                PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s[Native JNI] %s() = %s",
-                                FormatTraceTreePrefix(e.depth + 1, false).c_str(), e.methodName.c_str(),
-                                e.formatResult(r, hasExc).c_str());
-            }
+            // Logged in every preset so JNI boundaries are always visible.
+            PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s[native] %s() = %s",
+                            FormatTraceTreePrefix(e.depth + 1, false).c_str(), e.methodName.c_str(),
+                            TraceOneLine(e.formatResult(r, hasExc)).c_str());
             PI::Trace::UnifiedCallDepth::set(e.depth);
             return;
         }
         PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "%s%s() = %s",
                         FormatTraceTreePrefix(e.depth + 1, false).c_str(), e.methodName.c_str(),
-                        e.formatResult(r, hasExc).c_str());
+                        TraceOneLine(e.formatResult(r, hasExc)).c_str());
         PI::Trace::UnifiedCallDepth::set(e.depth);
     };
 
@@ -680,7 +730,7 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
 
     PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "┌── %s%s%s%s",
                     class_name.c_str(), class_name.empty() ? "" : ".",
-                    method_name.c_str(), rootArgsStr.c_str());
+                    method_name.c_str(), TraceOneLine(rootArgsStr, 320).c_str());
     PI::Trace::UnifiedCallDepth::set(0);
 
     PI::Interp::RunResult res = PI::Interp::runMethodInternal(
@@ -731,7 +781,7 @@ jvalue CallFrame::invokeTraceInternal(PI::Trace::TracePreset preset) {
     }
     PI::Logger::log(PI::LogLevel::TRACE, "PI_CallTree", "└── %s%s%s() = %s",
                     class_name.c_str(), class_name.empty() ? "" : ".",
-                    method_name.c_str(), retStr.c_str());
+                    method_name.c_str(), TraceOneLine(retStr, 320).c_str());
     PI::Trace::UnifiedCallDepth::set(0);
 
     if (preset == PI::Trace::TracePreset::FULL_STACK_NATIVE) {

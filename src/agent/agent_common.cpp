@@ -7,6 +7,7 @@
 #include "agent_trace.h"
 #include "agent_debug.h"
 #include "../../include/ArtPI.h"
+#include "dex/pi_dex_loader.h"
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -26,6 +27,28 @@ static std::mutex g_clMutex;
 
 static std::vector<std::string> g_cachedClassNames;
 static std::mutex g_namesMutex;
+
+static jobject GetCachedAppClassLoader() {
+    std::lock_guard<std::mutex> lk(g_clMutex);
+    return g_appClassLoader;
+}
+
+static jclass AgentInterpClassLookup(JNIEnv* env, const char* slashName) {
+    if (env == nullptr || slashName == nullptr) return nullptr;
+    std::string dotted = slashName;
+    for (char& c : dotted) {
+        if (c == '/') c = '.';
+    }
+    // The interpreter/hook path has no valid managed frame, so neither
+    // env->FindClass() nor the lazy GetAppClassLoader() probe (it uses
+    // FindClass internally) may run here. Registry + the loader cached at
+    // InitJs are enough.
+    return FindClassViaRegistryOrAppLoader(env, dotted, /*allow_lazy_loader=*/false);
+}
+
+void InstallInterpClassFallback() {
+    PI::Interp::SetClassLookupFallback(&AgentInterpClassLookup);
+}
 
 JNIEnv* GetEnv() {
     if (!g_jvm) {
@@ -219,9 +242,46 @@ jobject GetAppClassLoader(JNIEnv* env) {
     return nullptr;
 }
 
-jclass FindClassWithFallback(JNIEnv* env, const std::string& className) {
-    if (className.empty()) return nullptr;
-    if (className.find('*') != std::string::npos || className.find('?') != std::string::npos) {
+void LogAndClearJavaException(JNIEnv* env, const char* where) {
+    if (env == nullptr || !env->ExceptionCheck()) return;
+
+    // NOTE: never ExceptionDescribe() here - this may run on a frameless JNI
+    // thread (hook trampoline / interpreter), where printing the trace can
+    // abort ART. Throwable.toString() is safe.
+    jthrowable ex = env->ExceptionOccurred();
+    env->ExceptionClear();
+    if (ex == nullptr) return;
+
+    // Throwable.toString() is safe here; resolve the class from the exception
+    // object itself (GetObjectClass) instead of env->FindClass(), which would
+    // re-introduce the frameless-stack hazard.
+    jclass thCls = env->GetObjectClass(ex);
+    jmethodID toStr = thCls
+        ? env->GetMethodID(thCls, "toString", "()Ljava/lang/String;")
+        : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    if (toStr != nullptr) {
+        auto js = static_cast<jstring>(env->CallObjectMethod(ex, toStr));
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (js != nullptr) {
+            const char* msg = env->GetStringUTFChars(js, nullptr);
+            if (msg != nullptr) {
+                PI_LOGW("%s: %s", where != nullptr ? where : "Java exception", msg);
+                env->ReleaseStringUTFChars(js, msg);
+            }
+            env->DeleteLocalRef(js);
+        }
+    }
+    if (thCls) env->DeleteLocalRef(thCls);
+    env->DeleteLocalRef(ex);
+}
+
+jclass FindClassViaRegistryOrAppLoader(JNIEnv* env, const std::string& className,
+                                       bool allow_lazy_loader) {
+    if (env == nullptr || className.empty()) return nullptr;
+    if (className.find('*') != std::string::npos ||
+        className.find('?') != std::string::npos) {
         return nullptr;
     }
 
@@ -229,6 +289,47 @@ jclass FindClassWithFallback(JNIEnv* env, const std::string& className) {
     std::string dotName = className;
     for (char& c : slashName) if (c == '.') c = '/';
     for (char& c : dotName) if (c == '/') c = '.';
+
+    // 1. Classes synthesized at runtime live in their own ClassLoader and are
+    //    invisible to env->FindClass / the app ClassLoader.
+    if (jclass generated = PI::DexLoader::FindGeneratedClass(env, slashName)) {
+        return static_cast<jclass>(env->NewLocalRef(generated));   // local ref
+    }
+
+    // 2. App ClassLoader.loadClass() (a managed Java frame, safe anywhere).
+    jobject cl = allow_lazy_loader ? GetAppClassLoader(env) : GetCachedAppClassLoader();
+    if (cl == nullptr) return nullptr;
+
+    // Derive the ClassLoader class from the instance: no env->FindClass() here.
+    jclass clCls = env->GetObjectClass(cl);
+    if (clCls == nullptr) return nullptr;
+    jmethodID loadClassMethod = env->GetMethodID(
+        clCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    if (env->ExceptionCheck() || loadClassMethod == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(clCls);
+        return nullptr;
+    }
+
+    jstring jName = env->NewStringUTF(dotName.c_str());
+    auto clsObj = (jclass)env->CallObjectMethod(cl, loadClassMethod, jName);
+    if (env->ExceptionCheck()) {
+        LogAndClearJavaException(env, ("FindClass('" + dotName + "')").c_str());
+        clsObj = nullptr;
+    }
+    env->DeleteLocalRef(jName);
+    env->DeleteLocalRef(clCls);
+    return clsObj;
+}
+
+jclass FindClassWithFallback(JNIEnv* env, const std::string& className) {
+    if (env == nullptr || className.empty()) return nullptr;
+    if (className.find('*') != std::string::npos || className.find('?') != std::string::npos) {
+        return nullptr;
+    }
+
+    std::string slashName = className;
+    for (char& c : slashName) if (c == '.') c = '/';
 
     // 1. Try env->FindClass (works for boot/system classes)
     jclass localCls = env->FindClass(slashName.c_str());
@@ -238,34 +339,10 @@ jclass FindClassWithFallback(JNIEnv* env, const std::string& className) {
     }
     if (localCls) return localCls;
 
-    // 2. Fallback: on-demand get App ClassLoader and use loadClass()
-    jobject cl = GetAppClassLoader(env);
-    if (cl) {
-        jclass clCls = env->FindClass("java/lang/ClassLoader");
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-            return nullptr;
-        }
-        jmethodID loadClassMethod = env->GetMethodID(clCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-            env->DeleteLocalRef(clCls);
-            return nullptr;
-        }
-
-        jstring jName = env->NewStringUTF(dotName.c_str());
-        auto clsObj = (jclass)env->CallObjectMethod(cl, loadClassMethod, jName);
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-            clsObj = nullptr;
-        }
-        env->DeleteLocalRef(jName);
-        env->DeleteLocalRef(clCls);
-        if (clsObj) return clsObj;
-    }
-
-    return nullptr;
+    // 1b/2. Generated-class registry, then app ClassLoader.
+    return FindClassViaRegistryOrAppLoader(env, className);
 }
+
 
 bool MatchWildcard(const std::string& str, const std::string& pattern) {
     size_t s = 0, p = 0, starIdx = std::string::npos, match = 0;

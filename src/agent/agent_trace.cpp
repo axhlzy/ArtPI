@@ -2,7 +2,9 @@
 // agent_trace.cpp - Trace domain bindings for QuickJS (Unified, Java, Native)
 //
 // Honors the optional `opt` / `new TraceOption()` object:
-//   mode          "CALL_TREE" (default) | "INSN_STEP"/"INSTRUCTION_DIFF"
+//   mode          "CALL_TREE" (default) | "INSN_STEP"/"INSTRUCTION_DIFF" |
+//                 "FULL_STACK_NATIVE" (aliases: "native"/"insn"/"diff")
+//   native/stepNative  bool  — shorthand for mode = "FULL_STACK_NATIVE"
 //   excludeSystem  bool  (default true)  — drop java.*/android.* & /system,/apex,/vendor events
 //   includeNative  string               — only deliver native events whose module matches
 //   maxDepth       int                  — StepIn depth budget when INSN_STEP
@@ -21,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <cctype>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -66,13 +69,57 @@ static std::shared_ptr<JSValue> GuardJsValue(JSValue v) {
     });
 }
 
+// Accepts the canonical preset names plus a few short aliases:
+//   "native" / "full" / "stepNative"  -> FULL_STACK_NATIVE
+//   "insn"   / "instructions"         -> INSN_STEP
+//   "diff"                            -> INSTRUCTION_DIFF
+static std::string NormalizeTraceMode(std::string m) {
+    for (char& c : m) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (m.empty() || m == "call_tree" || m == "tree" || m == "calls" ||
+        m == "method" || m == "method_only") {
+        return "CALL_TREE";
+    }
+    if (m == "insn" || m == "insns" || m == "insn_step" ||
+        m == "instruction" || m == "instructions") {
+        return "INSN_STEP";
+    }
+    if (m == "instruction_diff" || m == "insn_diff" || m == "diff") {
+        return "INSTRUCTION_DIFF";
+    }
+    if (m == "native" || m == "full" || m == "fullstack" || m == "full_stack" ||
+        m == "full_stack_native" || m == "step_native" || m == "stepnative") {
+        return "FULL_STACK_NATIVE";
+    }
+    return m;
+}
+
 static TraceOpt ParseTraceOpt(JSContext* ctx, JSValueConst opt) {
     TraceOpt o;
-    if (!ctx || !JS_IsObject(opt)) return o;
+    if (!ctx) return o;
+
+    // String shorthand: m.trace("native") / m.trace("insn")
+    if (JS_IsString(opt)) {
+        const char* s = JS_ToCString(ctx, opt);
+        if (s) {
+            o.mode = NormalizeTraceMode(s);
+            JS_FreeCString(ctx, s);
+        }
+        return o;
+    }
+    if (!JS_IsObject(opt)) return o;
 
     JSValue v = JS_GetPropertyStr(ctx, opt, "mode");
-    if (JS_IsString(v)) { const char* s = JS_ToCString(ctx, v); if (s) { o.mode = s; JS_FreeCString(ctx, s); } }
+    if (JS_IsString(v)) { const char* s = JS_ToCString(ctx, v); if (s) { o.mode = NormalizeTraceMode(s); JS_FreeCString(ctx, s); } }
     JS_FreeValue(ctx, v);
+
+    // `native: true` / `stepNative: true` is shorthand for FULL_STACK_NATIVE.
+    for (const char* key : {"native", "stepNative"}) {
+        v = JS_GetPropertyStr(ctx, opt, key);
+        if (!JS_IsUndefined(v) && !JS_IsNull(v) && JS_ToBool(ctx, v) != 0) {
+            o.mode = "FULL_STACK_NATIVE";
+        }
+        JS_FreeValue(ctx, v);
+    }
 
     v = JS_GetPropertyStr(ctx, opt, "excludeSystem");
     if (!JS_IsUndefined(v)) o.excludeSystem = (JS_ToBool(ctx, v) != 0);
@@ -297,6 +344,8 @@ static JSValue JsTraceOptionConstructor(JSContext* ctx, JSValueConst new_target,
     if (JS_IsException(obj)) obj = JS_NewObject(ctx);
 
     JS_SetPropertyStr(ctx, obj, "mode", JS_NewString(ctx, "CALL_TREE"));
+    JS_SetPropertyStr(ctx, obj, "native", JS_NewBool(ctx, false));
+    JS_SetPropertyStr(ctx, obj, "stepNative", JS_NewBool(ctx, false));
     JS_SetPropertyStr(ctx, obj, "includeNative", JS_NewString(ctx, ""));
     JS_SetPropertyStr(ctx, obj, "excludeSystem", JS_NewBool(ctx, true));
     JS_SetPropertyStr(ctx, obj, "maxDepth", JS_NewInt32(ctx, 8));
@@ -368,6 +417,10 @@ static JSValue CreateTraceHandle(JSContext* ctx, size_t traceId, const std::stri
     JS_SetPropertyStr(ctx, handle, "target", JS_NewString(ctx, desc.c_str()));
     JS_SetPropertyStr(ctx, handle, "stop", JS_NewCFunction(ctx, JsTraceStop, "stop", 0));
     JS_SetPropertyStr(ctx, handle, "toString", JS_NewCFunction(ctx, JsTraceHandleToString, "toString", 0));
+    // The REPL pretty-prints eval results; an empty dumpText suppresses the
+    // `{ "_id": ..., "target": ... }` echo. The "[trace] Started ..." event is
+    // the only output .trace() should produce.
+    JS_SetPropertyStr(ctx, handle, "dumpText", JS_NewString(ctx, ""));
     return handle;
 }
 

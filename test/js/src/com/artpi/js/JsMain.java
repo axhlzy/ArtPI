@@ -58,6 +58,8 @@ public class JsMain {
         breakpoints();
         hookLogging();
         debugTraceNativeSurface();
+        registerClass();
+        registerClassInterface();
 
         banner("Result: " + passed + " passed, " + failed + " failed");
         if (failed > 0) {
@@ -520,6 +522,66 @@ public class JsMain {
         eq("trace.unified", ev("typeof traceunified==='function' && typeof tracejava==='function' && typeof tracenative==='function'"), "true");
         eq("native.namespace", ev("typeof nhook==='function' && typeof Native.findModule==='function' && typeof Native.findSymbol==='function'"), "true");
         eq("native.findModule.libart", ev("String(Native.findModule('libart.so')).length > 0"), "true");
+    }
+
+    private static void registerClass() {
+        // Frida-style Java.registerClass: build a DEX at runtime, load it with
+        // InMemoryDexClassLoader and bind the methods to JS implementations.
+        eq("regclass.api", ev("typeof Java.registerClass === 'function'"), "true");
+
+        String define =
+                "var Gen1 = Java.registerClass({"
+              + "  name: 'com.artpi.js.Gen1',"
+              + "  methods: {"
+              + "    add: { returnType: 'int', argumentTypes: ['int','int'], static: true,"
+              + "           implementation: function(a, b){ return a + b; } },"
+              + "    hello: { returnType: 'java.lang.String', argumentTypes: ['java.lang.String'],"
+              + "             static: true, implementation: function(s){ return 'hi ' + s; } },"
+              + "    doubleIt: { returnType: 'int', argumentTypes: ['int'],"
+              + "                implementation: function(a){ return a * 2; } }"
+              + "  }"
+              + "});"
+              + "Gen1.$className";
+        eq("regclass.define", ev(define), "com.artpi.js.Gen1");
+        eq("regclass.registered", ev("Java.registeredClasses().indexOf('com.artpi.js.Gen1') >= 0"), "true");
+
+        eq("regclass.static.int", ev("Gen1.add(2, 3)"), "5");
+        eq("regclass.static.str", ev("Gen1.hello('x')"), "hi x");
+        eq("regclass.instance", ev("var g1 = Gen1.$new(); g1.doubleIt(21)"), "42");
+
+        // The generated class is a real Java class: reflection + ArtMethod work.
+        eq("regclass.artmethod", ev("typeof Gen1.$method('add', '(II)I') === 'bigint'"), "true");
+
+        eq("regclass.dispose", ev("Gen1.$dispose()"), "true");
+        eq("regclass.disposed", ev("Java.registeredClasses().indexOf('com.artpi.js.Gen1') < 0"), "true");
+    }
+
+    private static void registerClassInterface() {
+        // The real use case: an app interface implemented by JS and passed back
+        // into app code (Java -> JS callback). Short-form methods infer their
+        // signatures from the implemented interface.
+        String define =
+                "globalThis.__cbSaw = -1;"
+              + "var GenCb = Java.registerClass({"
+              + "  name: 'com.artpi.js.GenCb',"
+              + "  implements: ['com.artpi.js.JsCallback'],"
+              + "  methods: {"
+              + "    onValue: function(v){ globalThis.__cbSaw = v; },"
+              + "    describe: function(tag){ return tag + ':' + __cbSaw; }"
+              + "  }"
+              + "});"
+              + "GenCb.$className";
+        eq("regiface.define", ev(define), "com.artpi.js.GenCb");
+
+        // Java -> JS: JsTarget.fireCallback(GenCb.$new(), 21) calls onValue(42)
+        // then describe("fire") -> "fire:42".length == 7.
+        String call = "var __cb = GenCb.$new();"
+                    + "__native_jcall('com.artpi.js.JsTarget', 'fireCallback', __cb, 21)";
+        eq("regiface.callback.result", ev(call), "7");
+        eq("regiface.callback.sawValue", ev("globalThis.__cbSaw"), "42");
+
+        eq("regiface.dispose", ev("GenCb.$dispose()"), "true");
+        ev("delete globalThis.GenCb;");
     }
 
     // ------------------------------------------------------------------ utils

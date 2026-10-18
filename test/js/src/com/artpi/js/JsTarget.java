@@ -7,6 +7,21 @@ public class JsTarget {
         return a + b;
     }
 
+    /** Factory used by the dual-path (JNI vs nmmvm) invocation tests. */
+    public static JsTarget create() {
+        return new JsTarget();
+    }
+
+    /** ACC_PRIVATE -> lands in dex "direct_methods" (not virtual). */
+    private int secret(int x) {
+        return x * 3 + 1;
+    }
+
+    /** ACC_PRIVATE | ACC_STATIC -> direct + static. */
+    private static int hiddenStatic(int x) {
+        return x * 7;
+    }
+
     public static String greet(String name) {
         return "hi " + name;
     }
@@ -61,5 +76,14 @@ public class JsTarget {
     /** Calls a system method (java.lang.String.length) — for excludeSystem trace tests. */
     public static int strLen(String s) {
         return s.length();
+    }
+
+    /**
+     * App-side code that invokes a JS-implemented interface: the real
+     * Java.registerClass use case (registered object used as a callback).
+     */
+    public static int fireCallback(JsCallback cb, int v) {
+        cb.onValue(v * 2);
+        return cb.describe("fire").length();
     }
 }

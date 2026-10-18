@@ -32,6 +32,14 @@ include_directories(
 
 add_subdirectory(external)
 
+# Dexter (slicer) DEX manipulation library - required by src/dex/pi_dex_gen.cpp
+# (runtime DEX generation for Java.registerClass). Must be added BEFORE the
+# artpi targets so `slicer` exists when we link against it.
+# NOTE: the old ARTPI_ENABLE_DEXTER cache variable is intentionally gone: it is
+# a hard dependency now, and a stale OFF value in an existing build dir would
+# silently break the link.
+add_subdirectory(external/dexter)
+
 set(ARTPI_SOURCES
         # Core ArtPI Framework (src/core)
         src/core/pi.cpp
@@ -42,6 +50,8 @@ set(ARTPI_SOURCES
         # DEX parsing & disassembly (src/dex)
         src/dex/pi_smali.cpp
         src/dex/pi_dex_resolver.cpp
+        src/dex/pi_dex_gen.cpp
+        src/dex/pi_dex_loader.cpp
 
         # Native disassembly & symbol resolution (src/native)
         src/native/pi_native.cpp
@@ -130,14 +140,15 @@ set_target_properties(artpi PROPERTIES OUTPUT_NAME "artpi")
 set_target_properties(artpi_static PROPERTIES OUTPUT_NAME "artpi_static")
 
 find_library(log-lib log)
+find_library(z-lib z)
 find_package(cxx CONFIG)
 
 if (TARGET cxx::cxx)
-    target_link_libraries(artpi ${log-lib} cxx::cxx)
-    target_link_libraries(artpi_static ${log-lib} cxx::cxx)
+    target_link_libraries(artpi ${log-lib} ${z-lib} cxx::cxx)
+    target_link_libraries(artpi_static ${log-lib} ${z-lib} cxx::cxx)
 else()
-    target_link_libraries(artpi ${log-lib})
-    target_link_libraries(artpi_static ${log-lib})
+    target_link_libraries(artpi ${log-lib} ${z-lib})
+    target_link_libraries(artpi_static ${log-lib} ${z-lib})
 endif()
 
 foreach(_t artpi artpi_static)
@@ -147,6 +158,9 @@ foreach(_t artpi artpi_static)
         artpi_frida_gum
         artpi_qbdi
         artpi_magic_enum
+        # Dexter (slicer): static libs propagate PRIVATE deps as LINK_ONLY, so
+        # libartpi_agent.so still resolves these symbols when it links artpi_static.
+        slicer
     )
 endforeach()
 
@@ -177,10 +191,6 @@ endif()
 # 这样在 CLion 里单独构建某个 target 时也会按整条链编译。
 #
 # 注意: 内嵌 payload (agent / jadxcli.jar) 的打包与 prebuild/ 的发布仍由 Gradle
-option(ARTPI_ENABLE_DEXTER "Build Dexter (slicer) DEX manipulation library" OFF)
-if(ARTPI_ENABLE_DEXTER)
-    add_subdirectory(external/dexter)
-endif()
 add_subdirectory(src/agent)
 add_subdirectory(cli/injector)
 add_subdirectory(test)
