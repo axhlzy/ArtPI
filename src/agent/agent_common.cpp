@@ -8,9 +8,15 @@
 #include "agent_debug.h"
 #include "../../include/ArtPI.h"
 #include "dex/pi_dex_loader.h"
+#include "art/art_method.h"
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <unordered_set>
+#include <sys/uio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include "../../external/KittyMemory/KittyMemory.h"
 
 namespace artpi { namespace agent {
 
@@ -314,7 +320,15 @@ jclass FindClassViaRegistryOrAppLoader(JNIEnv* env, const std::string& className
     jstring jName = env->NewStringUTF(dotName.c_str());
     auto clsObj = (jclass)env->CallObjectMethod(cl, loadClassMethod, jName);
     if (env->ExceptionCheck()) {
-        LogAndClearJavaException(env, ("FindClass('" + dotName + "')").c_str());
+        static std::mutex s_missMutex;
+        static std::unordered_set<std::string> s_missLogged;
+        {
+            std::lock_guard<std::mutex> lk(s_missMutex);
+            if (s_missLogged.insert(dotName).second) {
+                PI_LOGD("FindClass('%s'): not found in app ClassLoader", dotName.c_str());
+            }
+        }
+        env->ExceptionClear();
         clsObj = nullptr;
     }
     env->DeleteLocalRef(jName);
@@ -529,6 +543,79 @@ std::string FormatReleasedInstrumentation(int mask) {
     if (mask & 2) what += (what.empty() ? "trace" : ", trace");
     if (mask & 4) what += (what.empty() ? "breakpoint" : ", breakpoint");
     return what;
+}
+
+MemoryTargetKind InspectAddress(uintptr_t addr, std::string* outReason) {
+    if (addr < 0x1000 || addr >= 0x00007fffffffffffULL) {
+        if (outReason) *outReason = "Address is null or out of userland range";
+        return MemoryTargetKind::kInvalid;
+    }
+
+
+    // 2. Query memory mappings from /proc/self/maps
+    KittyMemory::ProcMap map = KittyMemory::getAddressMap(reinterpret_cast<const void*>(addr));
+    if (!map.isValid()) {
+        uint32_t probe = 0;
+        struct iovec liov = { &probe, sizeof(probe) };
+        struct iovec riov = { reinterpret_cast<void*>(addr), sizeof(probe) };
+        if (syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0) <= 0) {
+            if (outReason) *outReason = "Address is not mapped or readable";
+            return MemoryTargetKind::kInvalid;
+        }
+        return MemoryTargetKind::kFallbackNative;
+    }
+
+    if (!map.readable) {
+        if (outReason) *outReason = "Address is in non-readable memory";
+        return MemoryTargetKind::kInvalid;
+    }
+
+    // Dimension 1: Executable permission check.
+    // In Android / Linux, W^X is strictly enforced:
+    // ArtMethod structs and DEX bytecodes are NEVER executable.
+    // JIT code, dynamic trampolines, stubs, and native ELF code are ALWAYS executable.
+    if (map.executable) {
+        return MemoryTargetKind::kNativeCode;
+    }
+
+    // Dimension 2: Check for DEX magic header at target address
+    uint8_t magic[8] = {0};
+    struct iovec liov = { magic, sizeof(magic) };
+    struct iovec riov = { reinterpret_cast<void*>(addr), sizeof(magic) };
+    if (syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0) == sizeof(magic)) {
+        if (std::memcmp(magic, "dex\n", 4) == 0 || std::memcmp(magic, "cdex", 4) == 0) {
+            return MemoryTargetKind::kDexFile;
+        }
+    }
+
+    // Dimension 3: Multi-dimensional validation for ArtMethod
+    // An ArtMethod MUST satisfy:
+    // a) Alignment: 4-byte or 8-byte aligned
+    // b) declaring_class_ is a 32-bit compressed reference to mirror::Class in ART heap
+    // c) The mirror::Class itself must be in readable memory
+    // d) access_flags_ has plausible bits and is not all 1s (0xFFFFFFFF) or 0
+    if ((addr & 3) == 0) {
+        uint8_t method_buf[64] = {0};
+        struct iovec liov = { method_buf, sizeof(method_buf) };
+        struct iovec riov = { reinterpret_cast<void*>(addr), sizeof(method_buf) };
+        if (syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0) == sizeof(method_buf)) {
+            auto* fake_m = reinterpret_cast<pine::art::ArtMethod*>(method_buf);
+            uint32_t decl_class = fake_m->GetDeclaringClass();
+            uint32_t access_flags = fake_m->GetAccessFlags();
+            if (decl_class >= 0x10000 && (decl_class & 3) == 0 && access_flags != 0 && access_flags != 0xFFFFFFFF) {
+                // Verify the declaring Class object is readable
+                uint32_t class_header[2] = {0, 0};
+                struct iovec cliov = { class_header, sizeof(class_header) };
+                struct iovec criov = { reinterpret_cast<void*>(static_cast<uintptr_t>(decl_class)), sizeof(class_header) };
+                if (syscall(SYS_process_vm_readv, getpid(), &cliov, 1, &criov, 1, 0) == sizeof(class_header)) {
+                    return MemoryTargetKind::kArtMethod;
+                }
+            }
+        }
+    }
+
+    // Dimension 4: Default fallback is ALWAYS Native disassembly!
+    return MemoryTargetKind::kFallbackNative;
 }
 
 }} // namespace artpi::agent

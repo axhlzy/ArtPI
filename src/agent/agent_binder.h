@@ -1,5 +1,5 @@
 //
-// agent_binder.h - Modern C++20 Template Metaprogramming Dispatcher for QuickJS
+// agent_binder.h - Production-grade C++20 Template Metaprogramming Dispatcher for QuickJS
 //
 #pragma once
 
@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <optional>
 #include <functional>
 #include <utility>
 #include <sstream>
@@ -26,15 +27,15 @@ struct JsTraits;
 template <>
 struct JsTraits<bool> {
     static constexpr const char* name = "boolean";
-    static bool from_js(JSContext* /*ctx*/, JSValueConst v) {
-        return JS_ToBool(nullptr, v) > 0;
+    static bool from_js(JSContext* ctx, JSValueConst v) {
+        return JS_ToBool(ctx, v) > 0;
     }
     static JSValue to_js(JSContext* ctx, bool val) {
         return JS_NewBool(ctx, val);
     }
 };
 
-// --- 32-bit Integers ---
+// --- Small & 32-bit Integers ---
 template <typename T>
 struct JsTraits<T, std::enable_if_t<std::is_integral_v<T> && sizeof(T) <= 4 && std::is_signed_v<T> && !std::is_same_v<T, bool>>> {
     static constexpr const char* name = "int32";
@@ -61,18 +62,12 @@ struct JsTraits<T, std::enable_if_t<std::is_integral_v<T> && sizeof(T) <= 4 && s
     }
 };
 
-// --- 64-bit Integers ---
+// --- 64-bit Integers (Transparently supports Number, BigInt & Hex Strings) ---
 template <typename T>
 struct JsTraits<T, std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8 && std::is_signed_v<T>>> {
     static constexpr const char* name = "int64";
     static T from_js(JSContext* ctx, JSValueConst v) {
-        int64_t val = 0;
-        if (JS_IsBigInt(ctx, v)) {
-            JS_ToBigInt64(ctx, &val, v);
-        } else {
-            JS_ToInt64(ctx, &val, v);
-        }
-        return static_cast<T>(val);
+        return static_cast<T>(ParsePtr(ctx, v));
     }
     static JSValue to_js(JSContext* ctx, T val) {
         return JS_NewBigInt64(ctx, static_cast<int64_t>(val));
@@ -135,9 +130,6 @@ struct JsTraits<std::string> {
 template <>
 struct JsTraits<std::string_view> {
     static constexpr const char* name = "string";
-    static std::string from_js(JSContext* ctx, JSValueConst v) {
-        return JsTraits<std::string>::from_js(ctx, v);
-    }
     static JSValue to_js(JSContext* ctx, std::string_view val) {
         return JS_NewStringLen(ctx, val.data(), val.size());
     }
@@ -175,7 +167,19 @@ struct JsTraits<JSValue> {
     }
 };
 
-
+// --- std::optional<T> ---
+template <typename T>
+struct JsTraits<std::optional<T>> {
+    static constexpr const char* name = "optional";
+    static std::optional<T> from_js(JSContext* ctx, JSValueConst v) {
+        if (JS_IsNull(v) || JS_IsUndefined(v)) return std::nullopt;
+        return JsTraits<T>::from_js(ctx, v);
+    }
+    static JSValue to_js(JSContext* ctx, const std::optional<T>& val) {
+        if (!val.has_value()) return JS_NULL;
+        return JsTraits<T>::to_js(ctx, *val);
+    }
+};
 
 // --- std::vector<T> ---
 template <typename T>
@@ -206,7 +210,46 @@ struct JsTraits<std::vector<T>> {
 };
 
 // ============================================================================
-// 2. Function Signature Deduction (FunctionTraits)
+// 2. Scoped Argument Extractor (RAII for string lifetimes)
+// ============================================================================
+
+template <typename T>
+struct ArgHolder {
+    using CleanT = std::decay_t<T>;
+    CleanT value;
+    ArgHolder(JSContext* ctx, JSValueConst v) : value(JsTraits<CleanT>::from_js(ctx, v)) {}
+    decltype(auto) get() { return value; }
+};
+
+template <>
+struct ArgHolder<const char*> {
+    const char* str = nullptr;
+    JSContext* ctx = nullptr;
+    ArgHolder(JSContext* c, JSValueConst v) : ctx(c) {
+        str = JS_ToCString(ctx, v);
+    }
+    ~ArgHolder() {
+        if (str) JS_FreeCString(ctx, str);
+    }
+    const char* get() const { return str ? str : ""; }
+};
+
+template <>
+struct ArgHolder<std::string_view> {
+    const char* str = nullptr;
+    size_t len = 0;
+    JSContext* ctx = nullptr;
+    ArgHolder(JSContext* c, JSValueConst v) : ctx(c) {
+        str = JS_ToCStringLen(ctx, &len, v);
+    }
+    ~ArgHolder() {
+        if (str) JS_FreeCString(ctx, str);
+    }
+    std::string_view get() const { return str ? std::string_view(str, len) : std::string_view(); }
+};
+
+// ============================================================================
+// 3. Function Signature Deduction (FunctionTraits)
 // ============================================================================
 
 template <typename T>
@@ -241,7 +284,7 @@ struct FunctionTraits<Ret(Class::*)(Args...)> {
 };
 
 // ============================================================================
-// 3. Dispatch Invoker & Dispatcher
+// 4. Safe Dispatch Invoker
 // ============================================================================
 
 template <typename Func, size_t... Is>
@@ -254,60 +297,105 @@ inline JSValue DispatchCall(JSContext* ctx, Func&& func, int argc, JSValueConst*
         return JS_ThrowTypeError(ctx, "Function requires at least %zu argument(s), got %d", numArgs, argc);
     }
 
-    if constexpr (std::is_void_v<Ret>) {
-        func(JsTraits<std::tuple_element_t<Is, typename Traits::ArgsTuple>>::from_js(ctx, argv[Is])...);
-        return JS_UNDEFINED;
-    } else {
-        auto result = func(JsTraits<std::tuple_element_t<Is, typename Traits::ArgsTuple>>::from_js(ctx, argv[Is])...);
-        return JsTraits<Ret>::to_js(ctx, result);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    try {
+#endif
+        std::tuple<ArgHolder<std::tuple_element_t<Is, typename Traits::ArgsTuple>>...> holders{
+            ArgHolder<std::tuple_element_t<Is, typename Traits::ArgsTuple>>(ctx, argv[Is])...
+        };
+
+        if constexpr (std::is_void_v<Ret>) {
+            func(std::get<Is>(holders).get()...);
+            return JS_UNDEFINED;
+        } else {
+            auto result = func(std::get<Is>(holders).get()...);
+            return JsTraits<Ret>::to_js(ctx, result);
+        }
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    } catch (const std::exception& e) {
+        return JS_ThrowInternalError(ctx, "C++ exception: %s", e.what());
+    } catch (...) {
+        return JS_ThrowInternalError(ctx, "Unknown C++ exception occurred");
     }
+#endif
 }
 
-// Wrapper for stateless function pointers / closures
+// ============================================================================
+// 5. GC-Managed Lambda / Closure Holder
+// ============================================================================
+
+struct IBinderHolder {
+    virtual ~IBinderHolder() = default;
+    virtual JSValue invoke(JSContext* ctx, int argc, JSValueConst* argv) = 0;
+};
+
 template <typename Func>
-struct NativeFunctionHolder {
-    static JSValue Callback(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv, int /*magic*/, JSValue* func_data) {
-        void* ptr = JS_GetOpaque(func_data[0], 0);
-        if (!ptr) return JS_ThrowInternalError(ctx, "Invalid native function holder");
-        auto* fn = reinterpret_cast<Func*>(ptr);
-        return DispatchCall(ctx, *fn, argc, argv, std::make_index_sequence<FunctionTraits<Func>::arity>{});
+struct BinderHolderImpl : public IBinderHolder {
+    Func func;
+    explicit BinderHolderImpl(Func&& f) : func(std::forward<Func>(f)) {}
+    JSValue invoke(JSContext* ctx, int argc, JSValueConst* argv) override {
+        return DispatchCall(ctx, func, argc, argv, std::make_index_sequence<FunctionTraits<Func>::arity>{});
     }
 };
 
-// Specialized for plain function pointers without heap allocation
-template <typename Ret, typename... Args>
-struct PlainFunctionHolder {
-    using FuncPtr = Ret(*)(Args...);
-    static JSValue Callback(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv, int magic) {
-        auto fn = reinterpret_cast<FuncPtr>(static_cast<uintptr_t>(magic));
-        return DispatchCall(ctx, fn, argc, argv, std::make_index_sequence<sizeof...(Args)>{});
+inline JSClassID g_binderHolderClassId = 0;
+
+inline void BinderHolderFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* holder = reinterpret_cast<IBinderHolder*>(JS_GetOpaque(val, g_binderHolderClassId));
+    delete holder;
+}
+
+inline void EnsureBinderClassRegistered(JSContext* ctx) {
+    if (g_binderHolderClassId == 0) {
+        static std::mutex s_mutex;
+        std::lock_guard<std::mutex> lk(s_mutex);
+        if (g_binderHolderClassId == 0) {
+            JSRuntime* rt = JS_GetRuntime(ctx);
+            JS_NewClassID(rt, &g_binderHolderClassId);
+            JSClassDef def = {};
+            def.class_name = "ArtPI_BinderHolder";
+            def.finalizer = BinderHolderFinalizer;
+            JS_NewClass(rt, g_binderHolderClassId, &def);
+        }
+    }
+}
+
+inline JSValue BinderHolderCallback(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv, int /*magic*/, JSValue* func_data) {
+    auto* holder = reinterpret_cast<IBinderHolder*>(JS_GetOpaque(func_data[0], g_binderHolderClassId));
+    if (!holder) {
+        return JS_ThrowInternalError(ctx, "Invalid binder closure holder");
+    }
+    return holder->invoke(ctx, argc, argv);
+}
+
+// Compile-time static invoker for zero-allocation free function pointers
+template <auto Func>
+struct StaticFunctionInvoker {
+    using Traits = FunctionTraits<decltype(Func)>;
+    static JSValue Callback(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+        return DispatchCall(ctx, Func, argc, argv, std::make_index_sequence<Traits::arity>{});
     }
 };
 
 // ============================================================================
-// 4. JsBinder Fluent Interface
+// 6. JsBinder Fluent Interface
 // ============================================================================
 
 class JsBinder {
 public:
-    explicit JsBinder(JSContext* ctx) : ctx_(ctx) {}
+    explicit JsBinder(JSContext* ctx) : ctx_(ctx) {
+        EnsureBinderClassRegistered(ctx_);
+    }
 
-    // Bind a plain C++ free function pointer
-    template <typename Ret, typename... Args>
-    JsBinder& bind(JSValue target, const char* name, Ret(*func)(Args...),
+    // 1. Compile-Time Non-Type Function Pointer Binding (Zero Heap Allocation, Fastest)
+    // Usage: binder.bind<&MyFunction>(target, "myFunc", {"myfunc"});
+    template <auto Func>
+    JsBinder& bind(JSValue target, const char* name,
                    const std::vector<std::string>& aliases = {}) {
-        constexpr int arity = static_cast<int>(sizeof...(Args));
-        
-        // Wrap as QuickJS CFunctionData
-        auto* fnPtr = new auto(func);
-        JSValue data = JS_NewObject(ctx_);
-        JS_SetOpaque(data, fnPtr);
+        using Traits = FunctionTraits<decltype(Func)>;
+        constexpr int arity = static_cast<int>(Traits::arity);
 
-        JSValue cfunc = JS_NewCFunctionData(ctx_,
-            NativeFunctionHolder<Ret(*)(Args...)>::Callback,
-            arity, 0, 1, &data);
-        JS_FreeValue(ctx_, data);
-
+        JSValue cfunc = JS_NewCFunction(ctx_, StaticFunctionInvoker<Func>::Callback, name, arity);
         JS_SetPropertyStr(ctx_, target, name, JS_DupValue(ctx_, cfunc));
         for (const auto& alias : aliases) {
             JS_SetPropertyStr(ctx_, target, alias.c_str(), JS_DupValue(ctx_, cfunc));
@@ -316,20 +404,36 @@ public:
         return *this;
     }
 
-    // Bind a lambda or std::function
+    // 2. Runtime Free Function Pointer Binding
+    // Usage: binder.bind(target, "myFunc", &MyFunction, {"myfunc"});
+    template <typename Ret, typename... Args>
+    JsBinder& bind(JSValue target, const char* name, Ret(*func)(Args...),
+                   const std::vector<std::string>& aliases = {}) {
+        return bind(target, name, [func](Args... args) -> Ret {
+            if constexpr (std::is_void_v<Ret>) {
+                func(std::forward<Args>(args)...);
+            } else {
+                return func(std::forward<Args>(args)...);
+            }
+        }, aliases);
+    }
+
+    // 3. Lambda / Functor / Closure Binding (GC-Managed Lifetime)
+    // Usage: binder.bind(target, "myFunc", [](int a, const std::string& b) { ... });
     template <typename Lambda, typename = std::enable_if_t<!std::is_pointer_v<std::decay_t<Lambda>>>>
     JsBinder& bind(JSValue target, const char* name, Lambda&& lambda,
                    const std::vector<std::string>& aliases = {}) {
         using FuncType = std::decay_t<Lambda>;
         constexpr int arity = static_cast<int>(FunctionTraits<FuncType>::arity);
 
-        auto* holder = new FuncType(std::forward<Lambda>(lambda));
-        JSValue data = JS_NewObject(ctx_);
+        // Allocate polymorphic holder
+        IBinderHolder* holder = new BinderHolderImpl<FuncType>(std::forward<Lambda>(lambda));
+
+        // Create a GC-managed QuickJS object
+        JSValue data = JS_NewObjectClass(ctx_, g_binderHolderClassId);
         JS_SetOpaque(data, holder);
 
-        JSValue cfunc = JS_NewCFunctionData(ctx_,
-            NativeFunctionHolder<FuncType>::Callback,
-            arity, 0, 1, &data);
+        JSValue cfunc = JS_NewCFunctionData(ctx_, BinderHolderCallback, arity, 0, 1, &data);
         JS_FreeValue(ctx_, data);
 
         JS_SetPropertyStr(ctx_, target, name, JS_DupValue(ctx_, cfunc));

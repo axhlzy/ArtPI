@@ -33,6 +33,10 @@ static void log_(const std::string& msg) {
 
 static logger_type log = log_;
 
+thread_local jmp_buf* g_slicer_trap_jmp = nullptr;
+thread_local const char* g_slicer_trap_error = nullptr;
+static thread_local std::string g_slicer_trap_error_str;
+
 void set_logger(logger_type new_logger) {
   log = new_logger;
 }
@@ -40,30 +44,47 @@ void set_logger(logger_type new_logger) {
 // Helper for the default SLICER_CHECK() policy
 void _checkFailed(const char* expr, int line, const char* file) {
   std::stringstream ss;
-  ss << std::endl << "SLICER_CHECK failed [";
-  ss << expr << "] at " << file << ":" << line;
-  ss << std::endl << std::endl;
-  log(ss.str());
+  ss << "SLICER_CHECK failed [" << expr << "] at " << file << ":" << line;
+  log(std::string("\n") + ss.str() + "\n\n");
+  if (g_slicer_trap_jmp != nullptr) {
+    g_slicer_trap_error_str = ss.str();
+    g_slicer_trap_error = g_slicer_trap_error_str.c_str();
+    jmp_buf* target = g_slicer_trap_jmp;
+    g_slicer_trap_jmp = nullptr;
+    longjmp(*target, 1);
+  }
   abort();
 }
 
 void _checkFailedOp(const void* lhs, const void* rhs, const char* op, const char* suffix, int line,
                     const char* file) {
   std::stringstream ss;
-  ss << std::endl << "SLICER_CHECK_" << suffix << " failed [";
-  ss << lhs << " " << op << " " << rhs;
-  ss << "] at " << file << ":" << line;
-  log(ss.str());
+  ss << "SLICER_CHECK_" << suffix << " failed [" << lhs << " " << op << " " << rhs
+     << "] at " << file << ":" << line;
+  log(std::string("\n") + ss.str() + "\n\n");
+  if (g_slicer_trap_jmp != nullptr) {
+    g_slicer_trap_error_str = ss.str();
+    g_slicer_trap_error = g_slicer_trap_error_str.c_str();
+    jmp_buf* target = g_slicer_trap_jmp;
+    g_slicer_trap_jmp = nullptr;
+    longjmp(*target, 1);
+  }
   abort();
 }
 
 void _checkFailedOp(uint32_t lhs, uint32_t rhs, const char* op, const char* suffix, int line,
                     const char* file) {
   std::stringstream ss;
-  ss << std::endl << "SLICER_CHECK_" << suffix << " failed [";
-  ss << lhs << " " << op << " " << rhs;
-  ss << "] at " << file << ":" << line;
-  log(ss.str());
+  ss << "SLICER_CHECK_" << suffix << " failed [" << lhs << " " << op << " " << rhs
+     << "] at " << file << ":" << line;
+  log(std::string("\n") + ss.str() + "\n\n");
+  if (g_slicer_trap_jmp != nullptr) {
+    g_slicer_trap_error_str = ss.str();
+    g_slicer_trap_error = g_slicer_trap_error_str.c_str();
+    jmp_buf* target = g_slicer_trap_jmp;
+    g_slicer_trap_jmp = nullptr;
+    longjmp(*target, 1);
+  }
   abort();
 }
 

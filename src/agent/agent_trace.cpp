@@ -473,6 +473,9 @@ static JSValue JsTraceJava(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
     if (argc < 1) return JS_NewString(ctx, "Usage: tracejava(method, [opt])");
     int64_t ptr = ParsePtr(ctx, argv[0]);
     if (!ptr || ptr < 0x1000) return JS_NewString(ctx, "[!] Invalid method pointer");
+    if (InspectAddress(static_cast<uintptr_t>(ptr)) != MemoryTargetKind::kArtMethod) {
+        return JS_NewString(ctx, "[!] Address is not a valid ArtMethod");
+    }
 
     PI::Method m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
     if (!m.isValid()) return JS_NewString(ctx, "[!] Cannot resolve ArtMethod");
@@ -662,10 +665,14 @@ static JSValue JsTraceUnified(JSContext* ctx, JSValueConst /*this_val*/, int arg
     int64_t ptr = ParsePtr(ctx, argv[0]);
     if (!ptr || ptr < 0x1000) return JS_NewString(ctx, "[!] Invalid target pointer");
 
+    if (InspectAddress(static_cast<uintptr_t>(ptr)) != MemoryTargetKind::kArtMethod) {
+        return JsTraceNative(ctx, JS_UNDEFINED, argc, argv);
+    }
+
     ArtMethod* art = reinterpret_cast<ArtMethod*>(ptr);
     PI::Method m = PI::resolve(art);
 
-    // Native method (or raw native address): delegate to tracenative.
+    // Native method: delegate to tracenative.
     if (!m.isValid() || m.isNative()) {
         if (m.isValid()) {
             void* entry = art->GetEntryPointFromJni();

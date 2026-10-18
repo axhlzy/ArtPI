@@ -641,7 +641,7 @@ void BytecodeEncoder::FixupLabels() {
     SLICER_CHECK_NE(rel_offset, 0);
     dex::u2* instr = bytecode_.ptr<dex::u2>(fixup.offset * 2);
     if (fixup.short_fixup) {
-      // TODO: explicit out-of-range check
+      SLICER_CHECK_LE(rel_offset, 0x7fff);
       assert(instr[1] == 0);
       instr[1] = Pack_16(rel_offset);
     } else {

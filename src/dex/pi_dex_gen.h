@@ -5,26 +5,21 @@
 // The image is meant to be loaded with dalvik.system.InMemoryDexClassLoader
 // (see pi_dex_loader.h).
 //
-// Why standalone (and not merged into a loaded DEX)?
-//   Dexter's ir::DexFile::Normalize() re-sorts/renumbers every index section.
-//   Existing classes/strings inserted into an already-loaded DEX would shift
-//   the indices referenced by *existing* bytecode, which is never rewritten.
-//   A brand-new image has no such baggage: cross-references to app/framework
-//   classes are resolved by name at link time.
-//
-// Current scope: method bodies are always ACC_NATIVE (dispatched to JS by the
-// agent, see agent_java_registerclass.cpp). No code items, no try/catch, no
-// debug info -> the generated image stays tiny and fully deterministic.
-//
 
 #ifndef PI_DEX_GEN_H
 #define PI_DEX_GEN_H
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace PI {
+
+namespace DexWriter {
+class Writer;
+}
+
 namespace DexGen {
 
 // DEX access flags (dex_format.h subset, kept local to avoid leaking headers)
@@ -47,6 +42,10 @@ struct MethodSpec {
     uint32_t    access_flags = ACC_PUBLIC | ACC_NATIVE;
     bool        is_static = false;
     bool        is_constructor = false;
+
+    // If writer is non-null, method is assembled into pure Dalvik bytecode (non-native).
+    // Note: writer must contain at least one instruction, otherwise BuildDex fails.
+    std::shared_ptr<PI::DexWriter::Writer> writer = nullptr;
 };
 
 // Static field with a literal initial value (encoded_array_item static_values).
@@ -74,6 +73,14 @@ struct ClassSpec {
 // Converts "com.foo.Bar" / "com/foo/Bar" / "Lcom/foo/Bar;" / "I" / "[B"
 // into a canonical DEX type descriptor.
 std::string ToDescriptor(const std::string& type);
+
+// Parses a method signature "(params)ret" into ret descriptor and params descriptor vector.
+bool ParseSignature(const std::string& sig,
+                    std::string* ret,
+                    std::vector<std::string>* params);
+
+// Calculates Dalvik ins words (accounting for 'this' if non-static and 2-word long/double).
+uint16_t CalculateInsWords(const std::vector<std::string>& params, bool is_static);
 
 // Validates a DEX method signature: "(" params ")" ret. Returns false on junk.
 bool ValidateSignature(const std::string& signature, std::string* error);

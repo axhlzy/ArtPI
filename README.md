@@ -24,7 +24,7 @@
 | 能力 | 说明 |
 |---|---|
 | **Java 方法 Hook** | `PI::resolve(...).hook(cb)`，`frame[0]` 读写参数、`setResult` 篡改返回值、`invokeOriginal` 调用原方法；支持类级 `hookall` |
-| **高阶 Java 反编译** | 基于单 DEX 内存快速导出与内嵌 JADX CLI，实现秒级**免 OOM 单类与单方法高阶 Java 源码反编译**（`.disassembly()` / `.decompile()`） |
+| **高阶 Java 反编译** | 基于单 DEX 内存快速导出与内嵌 JADX CLI，实现秒级**免 OOM 单类与单方法高阶 Java 源码反编译**（`.decompile()`）；`.dumpCode()` / `.disassembly()` 提供统一 Smali / ARM64 反汇编 |
 | **Smali 反汇编** | 运行时直接从内存 `CodeItem`（StandardDex / CompactDex）极速 dump 规范 Smali 指令流与寄存器状态 |
 | **堆实例扫描 (`choose`)** | 类似 Frida `Java.choose`，支持纯 Native GC 物理扫描与 JVMTI 极速遍历双模式，实时捕获并操作存活对象 |
 | **字节码解释沙箱** | 内嵌 nmmvm 解释器重放方法体，支持指令级单步、`StepIn` 递归解释、`Mock` 返回值打桩、异常拦截 |
@@ -258,7 +258,7 @@ Act.findMethods("on*");   // 模糊查找类内方法
 Act.hookall(cb?);         // 一键 Hook 该类全部非 abstract/native 方法
 
 // 类级反编译：输出整类的完整 Java 源码（免 OOM 极速反编译）
-console.log(Act.disassembly());  // 或 Act.decompile()
+console.log(Act.decompile());     // JADX 类反编译成 Java 源码；Act.disassembly() 为类反汇编
 
 // 堆实例扫描：搜索当前进程堆中所有该类的活体对象
 Act.choose({
@@ -274,11 +274,11 @@ Act.choose({
 let oc = Act.onCreate;
 
 // 方法级反编译：精准抽取该方法的 Java 源码块（包含注解与实现体）
-console.log(oc.disassembly());    // 或 oc.decompile()
+console.log(oc.decompile());      // JADX 方法反编译成 Java 源码
 
 // 方法级 Smali / 原生反汇编
 console.log(oc.dumpSmali());      // dump 该方法的 Smali 字节码
-console.log(oc.dumpCode());       // 自动识别 Java/Native 并 dump 代码
+console.log(oc.dumpCode());       // 自动识别 Java/Native 并 dump 代码 (别名 oc.disassembly())
 
 // 安装 Hook（支持无参默认日志、单回调、onEnter + onLeave 双回调三种形式）
 oc.hook();                        // 1) 无参：自动树形打印入参与返回值
@@ -341,8 +341,9 @@ let m = jmethodBox(art);          // 别名: jmethodbox / methodBox / methodbox 
 m.className; m.methodName; m.artMethod; m.address; m.isNative; m.signature;
 
 m.hook(function(ctx) { ... });    // 安装 Hook
-m.dumpSmali(); m.dumpNative();    // 反汇编
-m.disassembly();                  // 反编译
+m.dumpSmali(); m.dumpNative();    // Smali / 原生反汇编
+m.dumpCode(); m.disassembly();    // 统一代码反汇编 (Java 输出 Smali, Native 输出 ARM64)
+m.decompile();                   // JADX 高阶 Java 源码反编译
 m.trace({ mode: "CALL_TREE" });   // 追踪
 m.break();                        // 断点
 ```
@@ -453,9 +454,9 @@ D();  // 同时卸载 Java / native / Unity 等全部 hook
 | `Java.findMethod` | `(clsOrName, name[, sig])` | `BigInt` / `null` | 查找 `ArtMethod*` 指针；自动沿着类继承链向上遍历父类 |
 | `Java.listMethods` | `(clsOrName)` | `string` | 格式化列出当前类声明的所有方法及指针 |
 | `Java.findMethods` | `(classOrPattern[, mPattern])`| `string` | 单类或跨类通配符查找方法 |
-| `Java.decompile` | `(clsOrMethod[, mName])` | `string` | **JADX 单类/单方法 Java 反编译**；自动 Fallback Smali。别名 `Java.disassembly` |
-| `Java.dumpSmali` | `(artMethod[, maxInsn])` | `string` | 纯 Native 内存直接解析输出规范 Smali 指令流 |
-| `Java.dumpCode` | `(artOrAddr[, maxInsn])` | `string` | 统一反汇编（自动分发 Smali 或 ARM64 汇编） |
+| `Java.decompile` | `(clsOrMethod[, mName])` | `string` | **JADX 单类/单方法 Java 源码反编译**；自动 Fallback Smali |
+| `Java.dumpSmali` | `(artMethodOrClass[, maxInsn])` | `string` | 纯 Native 内存直接解析输出规范 Smali 指令流 |
+| `Java.dumpCode` | `(artOrAddrOrClass[, maxInsn])` | `string` | **统一代码反汇编引擎**（Dalvik 输出 Smali，Native 输出 ARM64，DEX 内存输出头信息）。别名 `Java.disassembly` |
 | `Java.choose` | `(className[, callbacks])` | `array` / `number` | **堆实例枚举**；传回调为异步消费模式，省略回调同步返回实例数组 |
 | `Java.hook` | `(artMethod[, onEnter[, onLeave]])` | `string` | 安装 Hook；支持不传回调（默认入参/出参树形打印）、单回调 `cb(o)`、双回调 `(onEnter, onLeave)` |
 | `Java.unhook` | `(id)` | `string` | 按 ID 卸载指定的 Hook |
@@ -531,35 +532,186 @@ var D2 = Java.loadDex(bytesJRef /* byte[] */, { name: 'inline' });
   > 如果目标 ROM 是 userdebug，请先用 `Java.registeredClasses()` + `$injected` 确认行为。
 
 
-#### `Java.registerClass` — 用 JS 实现一个全新的 Java 类
+#### `Java.registerClass` — 运行时定义全新的 Java 类（支持 Native 回调与纯 Dalvik 字节码）
 
-生成流程：JS spec → Dexter(slicer) 构建独立 DEX → `InMemoryDexClassLoader(parent = App ClassLoader)`
-→ `RegisterNatives` → 每个方法一个运行时生成的 ARM64 桩（`x16 = slot`）→ `ArtpiNativeDispatch` → JS 函数。
-所有 JS 实现的方法在 DEX 中都是 `ACC_NATIVE`，**不涉及 smali 汇编**。
+生成流程：JS spec → Dexter(slicer) 构建独立 DEX → `InMemoryDexClassLoader(parent = App ClassLoader)`。
+支持两种方法实现模式（可在同一个类中**混合搭配**）：
+1. **纯 Dalvik 字节码方法（DexWriter / Smali）**：直接在 DEX 内组装并生成真实 Dalvik 指令流（去除 `ACC_NATIVE`），执行时完全在 ART 虚拟机内部运行，**零 JNI / QuickJS 调用开销**，支持分支跳转、标签定位、常量加载、对象创建与方法调用。
+2. **Native JS 回调方法（`ACC_NATIVE`）**：每个方法由运行时动态分配 ARM64 汇编桩（`x16 = slot`）→ `ArtpiNativeDispatch` 派发至 QuickJS 函数执行。
 
 ```js
-var Hook = Java.registerClass({
-  name: 'com.example.Hook',
+var MyPlugin = Java.registerClass({
+  name: 'com.example.MyPlugin',
   implements: ['com.example.Callback'],   // 父加载器 = App ClassLoader，接口类型可互通
   methods: {
-    // 短式：从接口/父类同名方法自动推断签名（含 static 修饰）
+    // -------------------------------------------------------------------------
+    // 模式 1: 纯 Dalvik 字节码 (直接书写 Smali 文本)
+    // -------------------------------------------------------------------------
+    "getGreeting()Ljava/lang/String;": `
+        const-string v0, "Hello from Pure Dalvik Bytecode!"
+        return-object v0
+    `,
+
+    // Smali 多分支跳转逻辑 (p0 = this, p1 = a, p2 = b)
+    "compare(II)I": `
+        if-ge p1, p2, :greater_or_equal
+        const/4 v0, -1
+        return v0
+        :greater_or_equal
+        if-eq p1, p2, :equal
+        const/4 v0, 1
+        return v0
+        :equal
+        const/4 v0, 0
+        return v0
+    `,
+
+    // 静态方法的 Smali 实现 (staticAdd: static 方法 p0 即为首个参数)
+    "staticAdd(II)I": {
+        static: true,
+        bytecode: `
+            add-int v0, p0, p1
+            return v0
+        `
+    },
+
+    // -------------------------------------------------------------------------
+    // 模式 2: 纯 Dalvik 字节码 (Fluent 链式汇编 DexWriter.build)
+    // -------------------------------------------------------------------------
+    "testBranch(I)I": DexWriter.build(function(w) {
+        w.setRegisters(3, 2, 0);       // 3 个寄存器, 2 个输入参数 (p0=this(v1), p1=flag(v2))
+        let lblZero = w.makeLabel();
+        let lblEnd = w.makeLabel();
+
+        w.putIfEqz(2, lblZero);         // if p1 == 0 goto lblZero
+        w.putConst(0, 777);             // v0 = 777
+        w.putGoto(lblEnd);
+
+        w.putLabel(lblZero);
+        w.putConst(0, 999);             // v0 = 999
+
+        w.putLabel(lblEnd);
+        w.putReturn(0);                 // return v0
+    }),
+
+    // -------------------------------------------------------------------------
+    // 模式 3: 传统 Native 回调 (JS 函数实现, ACC_NATIVE)
+    // -------------------------------------------------------------------------
+    // 短式：从接口/父类同名方法自动推断签名
     onEvent: function (v) { console.log('event', v); },
 
     // 完整式：显式 returnType / argumentTypes
-    twice: { returnType: 'int', argumentTypes: ['int'], static: true,
-             implementation: function (x) { return x * 2; } }
+    nativeTwice: {
+        returnType: 'int', argumentTypes: ['int'], static: true,
+        implementation: function (x) { return x * 2; }
+    },
+
+    // -------------------------------------------------------------------------
+    // 模式 4: 调用目标 App 现有函数 (直接调用 或 经由 Java 反射)
+    // -------------------------------------------------------------------------
+    // 直接调用：生成类已注入 App ClassLoader，可以直接 invoke 目标类的公开方法
+    "callTargetStatic(II)I": `
+        invoke-static {p1, p2}, Lcom/example/app/TargetClass;->mul(II)I
+        move-result v0
+        return v0
+    `,
+
+    // 反射调用：在纯 Dalvik 指令中完成 Class.forName -> getMethod -> invoke
+    "callViaReflection(Ljava/lang/Object;)Ljava/lang/String;": `
+        const-string v0, "com.example.app.TargetClass"
+        invoke-static {v0}, Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;
+        move-result-object v0
+        const-string v1, "getSecret"
+        const/4 v2, 0
+        invoke-virtual {v0, v1, v2}, Ljava/lang/Class;->getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
+        move-result-object v1
+        invoke-virtual {v1, p1, v2}, Ljava/lang/reflect/Method;->invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
+        move-result-object v0
+        check-cast v0, Ljava/lang/String;
+        return-object v0
+    `,
+
+    // 字段读写：在 Dalvik 字节码中操作静态与实例成员变量
+    "readAndBumpCounter(I)I": `
+        iget v0, p0, Lcom/example/MyPlugin;->counter:I
+        add-int v0, v0, p1
+        iput v0, p0, Lcom/example/MyPlugin;->counter:I
+        return v0
+    `
   },
-  fields: { VERSION: { type: 'int', value: 7 } }   // 静态字段初始值
+  // ---------------------------------------------------------------------------
+  // 成员变量定义 (静态字段 static: true，实例字段 static: false 或省略)
+  // ---------------------------------------------------------------------------
+  fields: {
+    VERSION: { type: 'int', value: 7, static: true },                     // 静态字段带初值
+    TAG: { type: 'java.lang.String', value: 'MyPluginTag', static: true }, // 静态对象字段
+    counter: { type: 'int', static: false }                              // 实例字段
+  }
 });
 
-Hook.twice(21);                              // 静态方法 -> 42
-var h = Hook.$new();                         // 实例化（JRef 代理，实例方法直接调用）
-Hook.$className;                             // 'com.example.Hook'
-Hook.$injected;                              // true = 已拼接进 App PathClassLoader
-Hook.$method('twice', '(I)I');               // ArtMethod* -> 可交给 brkj / Trace / invokeInterpreted
-Hook.$loader;                                // 该类的 ClassLoader
-Hook.$dispose();                             // 注销 native 并按名称移除注册
+var instance = MyPlugin.$new();
+instance.getGreeting();               // -> "Hello from Pure Dalvik Bytecode!"
+instance.compare(3, 10);              // -> -1
+MyPlugin.staticAdd(15, 27);           // -> 42
+instance.testBranch(0);               // -> 999
+instance.nativeTwice(21);             // -> 42
+instance.readAndBumpCounter(5);       // -> 5 (读写实例字段)
 ```
+
+---
+
+#### `DexWriter` / `Java.DexWriter` — 运行时 Dalvik 字节码汇编器
+
+类似 Frida-Gum 的 `Arm64Writer`，`DexWriter` 提供了指令级生成与 Smali 解析底座，可独立使用或在 `Java.registerClass` 中构造高效字节码。
+
+##### 常用方法速查：
+
+- **寄存器与标签控制**：
+  - `w.setRegisters(total, ins, outs)`：声明局部寄存器总数与参数/调用宽度。
+  - `let lbl = w.makeLabel()`：申请虚拟标签 ID。
+  - `w.putLabel(lbl)`：在当前位置插桩放置标签。
+  - `w.putGoto(lbl)`：无条件跳转至标签。
+- **分支条件跳转**：
+  - `w.putIfEqz(reg, lbl)` / `w.putIfNez(reg, lbl)`：与零比较分支。
+  - `w.putIfLtz` / `w.putIfGez` / `w.putIfGtz` / `w.putIfLez`：有符号单寄存器零比较。
+  - `w.putIfEq(r1, r2, lbl)` / `w.putIfNe` / `w.putIfLt` / `w.putIfGe` / `w.putIfGt` / `w.putIfLe`：双寄存器比较跳转。
+- **常量与移动**：
+  - `w.putConst4(reg, val)` / `w.putConst16(reg, val)` / `w.putConst(reg, val)`：加载 32 位整型常量。
+  - `w.putConstString(reg, "str")`：从 DEX 字符串常量池载入字符串对象。
+  - `w.putConstClass(reg, "java.lang.String")`：加载 `Class<?>` 对象。
+  - `w.putMove(dst, src)` / `w.putMoveObject(dst, src)`：寄存器值/对象拷贝。
+  - `w.putMoveResult(dst)` / `w.putMoveResultObject(dst)`：捕获上一次调用的返回值。
+- **算术与位运算（23x 格式）**：
+  - `w.putAddInt(dst, s1, s2)` / `w.putSubInt` / `w.putMulInt` / `w.putDivInt` / `w.putRemInt`：32位整型四则运算。
+  - `w.putAndInt(dst, s1, s2)` / `w.putOrInt` / `w.putXorInt` / `w.putShlInt` / `w.putShrInt` / `w.putUshrInt`：32位整型位运算。
+  - Smali 语法中直接支持 `add-int`, `sub-int`, `mul-int`, `div-int`, `rem-int`, `and-int`, `or-int`, `xor-int`, `shl-int`, `shr-int`, `ushr-int`。
+- **对象与字段**：
+  - `w.putNewInstance(reg, "com.example.Foo")`：分配新对象。
+  - `w.putCheckCast(reg, "com.example.Foo")`：类型强转检查。
+  - `w.putInstanceOf(dst, obj, "com.example.Foo")`：类型判断。
+  - `w.putIget` / `w.putIput` / `w.putIgetObject` / `w.putIputObject` / `w.putIgetBoolean`：实例字段读写。
+  - `w.putSget` / `w.putSput` / `w.putSgetObject` / `w.putSputObject`：静态字段读写。
+- **方法调用**：
+  - `w.putInvokeVirtual("com.foo.Bar.method(I)V", [0, 1])`
+  - `w.putInvokeDirect(...)` / `w.putInvokeStatic(...)` / `w.putInvokeSuper(...)` / `w.putInvokeInterface(...)`
+- **返回与控制流**：
+  - `w.putReturnVoid()` / `w.putReturn(reg)` / `w.putReturnObject(reg)` / `w.putThrow(reg)` / `w.putNop()`。
+- **静态构建器**：
+  - `DexWriter.build(function(w) { ... })`：执行回调并返回构造好的 `DexWriter` 实例。
+  - `DexWriter.smali([signature/options, ]smaliText)`：解析 Smali 文本并返回 `DexWriter` 实例。
+    - 单参数形式：`DexWriter.smali("const/4 v0, 1\nreturn v0")`（默认 `ins=1`）。
+    - 显式签名形式：`DexWriter.smali("static (II)I", "add-int v0, p0, p1\nreturn v0")`（自动计算入参寄存器 `ins=2`，准确映射 `p0`、`p1`）。
+    - 配置对象形式：`DexWriter.smali({ signature: "(II)I", static: true, registers: 6 }, "...")`。
+  - `w.emitSmali("...")` / `w.putSmali("...")`：在已有 writer 实例中追加解析 Smali 代码。
+
+##### 寄存器与参数映射规则：
+Dalvik 虚拟机将方法的参数传入方法寄存器帧的**最高端**：
+- 实例方法：参数占用最后 `ins` 个寄存器，`p0` 恒为 `this`，`p1..pN` 为各入参。
+- 静态方法：参数占用最后 `ins` 个寄存器，`p0..pN` 为各入参（无 `this`）。
+- 宽类型（`long` / `double`）在 Dalvik 中占 2 个连续寄存器字长，`DexWriter` 会自动按签名精准分配，无需手动计算对齐。
+- 在 Smali 语法中支持直接书写 `p0`, `p1`, `v0`, `v1`，解析器会自动映射至物理寄存器索引。
+
+---
 
 实现细节与限制：
 
@@ -578,7 +730,7 @@ Hook.$dispose();                             // 注销 native 并按名称移除
   可用 `__native_dexdisk(1)` 在真机上强制走回退路径做验证。
 
 
-> **全局别名**：`findclass`、`findmethod`、`listmethods`、`dumpsmali`、`dumpcode`、`decompile`组件 `disassembly`、`choose`、`jhook`、`unhook`、`unhookall`、`jmethodbox` 均可直接在全局作用域调用。
+> **全局别名**：`findclass`、`findmethod`、`listmethods`、`dumpsmali`、`dumpcode` / `disassembly`、`decompile`、`choose`、`jhook`、`unhook`、`unhookall`、`jmethodbox` 均可直接在全局作用域调用。
 
 ---
 

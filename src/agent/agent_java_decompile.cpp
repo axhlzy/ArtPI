@@ -3,6 +3,7 @@
 //
 #include "agent_java_decompile.h"
 #include "agent_java_ref.h"
+#include "agent_java.h"
 #include "agent_common.h"
 #include "../../include/ArtPI.h"
 #include "art/art_method.h"
@@ -25,128 +26,262 @@ namespace artpi { namespace agent {
 // ---------------------------------------------------------------------------
 // Dump Smali & Unified Code Disassembly
 // ---------------------------------------------------------------------------
+static std::string DumpMethodsOfClass(JNIEnv* env, jclass cls, const std::string& className, int maxInsn, bool smaliOnly) {
+    if (!env || !cls) return "";
+    jclass classCls = AgentCachedClass("java/lang/Class");
+    if (!classCls) return "";
+    jmethodID getDeclaredMethods = env->GetMethodID(classCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
+    if (!getDeclaredMethods) return "";
+
+    auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
+    if (!mArr) return "";
+
+    jsize len = env->GetArrayLength(mArr);
+    std::ostringstream ss;
+    std::string tag = smaliOnly ? "DumpSmali" : "DumpCode";
+    std::string title = className.empty() ? "Class" : className;
+    ss << "=== " << tag << " for " << title << " (" << len << " methods) ===\n\n";
+    for (jsize i = 0; i < len; ++i) {
+        jobject mObj = env->GetObjectArrayElement(mArr, i);
+        if (mObj) {
+            PI::Method pm = PI::resolve(env, mObj);
+            if (pm.isValid()) {
+                if (smaliOnly) {
+                    ss << pm.dumpSmali(maxInsn) << "\n";
+                } else {
+                    ss << pm.dumpCode(maxInsn) << "\n";
+                }
+            }
+            env->DeleteLocalRef(mObj);
+        }
+    }
+    env->DeleteLocalRef(mArr);
+    return ss.str();
+}
+
 static JSValue JsDumpSmali(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_NewString(ctx, "Usage: dumpSmali(artMethodPtrOrClass, [maxInstructions])");
     int maxInsn = -1;
     if (argc >= 2) JS_ToInt32(ctx, &maxInsn, argv[1]);
 
     JNIEnv* env = GetEnv();
+    int64_t ptr = 0;
 
-    // 1. If string argument: class name
+    // 1. If JS Object: check $className or pointer fields
+    if (JS_IsObject(argv[0])) {
+        JSValue cn = JS_GetPropertyStr(ctx, argv[0], "$className");
+        if (JS_IsString(cn)) {
+            const char* cstr = JS_ToCString(ctx, cn);
+            std::string className = cstr ? cstr : "";
+            JS_FreeCString(ctx, cstr);
+            JS_FreeValue(ctx, cn);
+            if (!className.empty()) {
+                if (env) {
+                    jclass cls = FindClassWithFallback(env, className);
+                    if (cls) {
+                        std::string out = DumpMethodsOfClass(env, cls, className, maxInsn, true);
+                        env->DeleteLocalRef(cls);
+                        return JS_NewString(ctx, out.c_str());
+                    }
+                }
+                return JS_NewString(ctx, ("[!] Class not found: " + className).c_str());
+            }
+        } else {
+            JS_FreeValue(ctx, cn);
+            JSValue artVal = JS_GetPropertyStr(ctx, argv[0], "artMethod");
+            if (JS_IsUndefined(artVal) || JS_IsNull(artVal)) {
+                artVal = JS_GetPropertyStr(ctx, argv[0], "address");
+            }
+            if (JS_IsUndefined(artVal) || JS_IsNull(artVal)) {
+                artVal = JS_GetPropertyStr(ctx, argv[0], "ptr");
+            }
+            if (!JS_IsUndefined(artVal) && !JS_IsNull(artVal)) {
+                ptr = ParsePtr(ctx, artVal);
+            }
+            JS_FreeValue(ctx, artVal);
+        }
+    }
+
+    // 2. If String: either hex address or class name
     if (JS_IsString(argv[0])) {
         const char* s = JS_ToCString(ctx, argv[0]);
         if (s) {
-            std::string name = s;
+            std::string strVal = s;
             JS_FreeCString(ctx, s);
-            if (env) {
-                jclass cls = FindClassWithFallback(env, name);
-                if (cls) {
-                    jclass classCls = env->FindClass("java/lang/Class");
-                    if (env->ExceptionCheck()) env->ExceptionClear();
-                    jmethodID getDeclaredMethods = classCls ? env->GetMethodID(classCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;") : nullptr;
-                    if (classCls && getDeclaredMethods) {
-                        auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
-                        if (env->ExceptionCheck()) env->ExceptionClear();
-                        if (mArr) {
-                            jsize len = env->GetArrayLength(mArr);
-                            std::ostringstream ss;
-                            ss << "=== DumpSmali for " << name << " (" << len << " methods) ===\n\n";
-                            for (jsize i = 0; i < len; ++i) {
-                                jobject mObj = env->GetObjectArrayElement(mArr, i);
-                                if (mObj) {
-                                    PI::Method pm = PI::resolve(env, mObj);
-                                    if (pm.isValid()) {
-                                        ss << pm.dumpSmali(maxInsn) << "\n";
-                                    }
-                                    env->DeleteLocalRef(mObj);
-                                }
-                            }
-                            env->DeleteLocalRef(mArr);
-                            env->DeleteLocalRef(classCls);
-                            env->DeleteLocalRef(cls);
-                            return JS_NewString(ctx, ss.str().c_str());
-                        }
+            if (strVal.size() > 2 && strVal[0] == '0' && (strVal[1] == 'x' || strVal[1] == 'X')) {
+                ptr = static_cast<int64_t>(strtoull(strVal.c_str(), nullptr, 16));
+            } else {
+                if (env) {
+                    jclass cls = FindClassWithFallback(env, strVal);
+                    if (cls) {
+                        std::string out = DumpMethodsOfClass(env, cls, strVal, maxInsn, true);
+                        env->DeleteLocalRef(cls);
+                        return JS_NewString(ctx, out.c_str());
                     }
-                    if (classCls) env->DeleteLocalRef(classCls);
-                    env->DeleteLocalRef(cls);
                 }
+                return JS_NewString(ctx, ("[!] Class not found: " + strVal).c_str());
             }
         }
     }
 
-    int64_t ptr = ParsePtr(ctx, argv[0]);
+    if (!ptr) {
+        ptr = ParsePtr(ctx, argv[0]);
+    }
     if (!ptr || ptr < 0x1000) {
         return JS_NewString(ctx, "[!] Invalid pointer (address is null or below 0x1000)");
     }
 
-    // 2. Check if ptr is a jclass reference
-    if (env && ptr > 0x1000) {
-        jobject testObj = reinterpret_cast<jobject>(ptr);
-        jclass cCls = AgentCachedClass("java/lang/Class");
-        if (cCls && env->IsInstanceOf(testObj, cCls)) {
-            jclass cls = reinterpret_cast<jclass>(testObj);
-            jmethodID getDeclaredMethods = env->GetMethodID(cCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            if (getDeclaredMethods) {
-                auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                if (mArr) {
-                    jsize len = env->GetArrayLength(mArr);
-                    std::ostringstream ss;
-                    ss << "=== DumpSmali for Class (" << len << " methods) ===\n\n";
-                    for (jsize i = 0; i < len; ++i) {
-                        jobject mObj = env->GetObjectArrayElement(mArr, i);
-                        if (mObj) {
-                            PI::Method pm = PI::resolve(env, mObj);
-                            if (pm.isValid()) {
-                                ss << pm.dumpSmali(maxInsn) << "\n";
-                            }
-                            env->DeleteLocalRef(mObj);
-                        }
-                    }
-                    env->DeleteLocalRef(mArr);
-                    return JS_NewString(ctx, ss.str().c_str());
-                }
-            }
+    // Memory inspection gate: validate memory readability before any JNI / dereference
+    std::string reason;
+    MemoryTargetKind kind = InspectAddress(static_cast<uintptr_t>(ptr), &reason);
+    if (kind == MemoryTargetKind::kInvalid) {
+        return JS_NewString(ctx, ("[!] Invalid pointer: " + reason).c_str());
+    }
+    if (kind == MemoryTargetKind::kNativeCode) {
+        return JS_NewString(ctx, "[!] Address points to native executable code, not an ArtMethod. Use dumpCode() or dumpNative().");
+    }
+    if (kind == MemoryTargetKind::kDexFile) {
+        return JS_NewString(ctx, "[!] Address points to a DEX file buffer, not an ArtMethod.");
+    }
+
+    // Check if ptr is a known global jclass reference
+    if (env && IsKnownGlobalClassRef(static_cast<uintptr_t>(ptr))) {
+        jclass cls = reinterpret_cast<jclass>(ptr);
+        std::string out = DumpMethodsOfClass(env, cls, "", maxInsn, true);
+        return JS_NewString(ctx, out.c_str());
+    }
+
+    // Validate and dump ArtMethod
+    if (kind == MemoryTargetKind::kArtMethod) {
+        PI::Method m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
+        if (m.isValid()) {
+            std::string smali = m.dumpSmali(maxInsn);
+            return JS_NewString(ctx, smali.c_str());
         }
     }
 
-    // 3. Otherwise treat as ArtMethod*
-    PI::Method m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
-    if (!m.isValid()) {
-        return JS_NewString(ctx, "[!] Cannot resolve ArtMethod at given address");
-    }
-
-    std::string smali = m.dumpSmali(maxInsn);
-    return JS_NewString(ctx, smali.c_str());
+    char hexBuf[32];
+    snprintf(hexBuf, sizeof(hexBuf), "0x%llx", (unsigned long long)ptr);
+    return JS_NewString(ctx, ("[!] Pointer " + std::string(hexBuf) + " is not an ArtMethod: " + reason).c_str());
 }
 
 static JSValue JsDumpCode(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    if (argc < 1) return JS_NewString(ctx, "Usage: dumpCode(artMethodPtrOrNativeAddr, [maxInstructions])");
-    int64_t ptr = ParsePtr(ctx, argv[0]);
-    if (!ptr || ptr < 0x1000) {
-        return JS_NewString(ctx, "[!] Invalid pointer (address is null or below 0x1000)");
-    }
+    if (argc < 1) return JS_NewString(ctx, "Usage: dumpCode(artMethodPtrOrNativeAddrOrClass, [maxInstructions])");
 
     int maxInsn = -1;
     if (argc >= 2) JS_ToInt32(ctx, &maxInsn, argv[1]);
 
-    xdl_info_t info;
-    void* cache = nullptr;
-    if (xdl_addr(reinterpret_cast<void*>(ptr), &info, &cache) != 0) {
-        xdl_addr_clean(&cache);
-        std::string code = PI::dumpNative(reinterpret_cast<const void*>(ptr), maxInsn);
-        return JS_NewString(ctx, code.c_str());
-    }
-    xdl_addr_clean(&cache);
+    JNIEnv* env = GetEnv();
+    int64_t ptr = 0;
 
-    ArtMethod* art = reinterpret_cast<ArtMethod*>(ptr);
-    PI::Method m = PI::resolve(art);
-    if (m.isValid()) {
-        std::string code = PI::dumpCode(art, maxInsn);
-        return JS_NewString(ctx, code.c_str());
+    // 1. If JS Object: check $className or pointer fields
+    if (JS_IsObject(argv[0])) {
+        JSValue cn = JS_GetPropertyStr(ctx, argv[0], "$className");
+        if (JS_IsString(cn)) {
+            const char* cstr = JS_ToCString(ctx, cn);
+            std::string className = cstr ? cstr : "";
+            JS_FreeCString(ctx, cstr);
+            JS_FreeValue(ctx, cn);
+            if (!className.empty()) {
+                if (env) {
+                    jclass cls = FindClassWithFallback(env, className);
+                    if (cls) {
+                        std::string out = DumpMethodsOfClass(env, cls, className, maxInsn, false);
+                        env->DeleteLocalRef(cls);
+                        return JS_NewString(ctx, out.c_str());
+                    }
+                }
+                return JS_NewString(ctx, ("[!] Class not found: " + className).c_str());
+            }
+        } else {
+            JS_FreeValue(ctx, cn);
+            JSValue artVal = JS_GetPropertyStr(ctx, argv[0], "artMethod");
+            if (JS_IsUndefined(artVal) || JS_IsNull(artVal)) {
+                artVal = JS_GetPropertyStr(ctx, argv[0], "address");
+            }
+            if (JS_IsUndefined(artVal) || JS_IsNull(artVal)) {
+                artVal = JS_GetPropertyStr(ctx, argv[0], "ptr");
+            }
+            if (!JS_IsUndefined(artVal) && !JS_IsNull(artVal)) {
+                ptr = ParsePtr(ctx, artVal);
+            }
+            JS_FreeValue(ctx, artVal);
+        }
     }
 
+    // 2. If String: either hex address or class name
+    if (JS_IsString(argv[0])) {
+        const char* s = JS_ToCString(ctx, argv[0]);
+        if (s) {
+            std::string strVal = s;
+            JS_FreeCString(ctx, s);
+            if (strVal.size() > 2 && strVal[0] == '0' && (strVal[1] == 'x' || strVal[1] == 'X')) {
+                ptr = static_cast<int64_t>(strtoull(strVal.c_str(), nullptr, 16));
+            } else {
+                if (env) {
+                    jclass cls = FindClassWithFallback(env, strVal);
+                    if (cls) {
+                        std::string out = DumpMethodsOfClass(env, cls, strVal, maxInsn, false);
+                        env->DeleteLocalRef(cls);
+                        return JS_NewString(ctx, out.c_str());
+                    }
+                }
+                return JS_NewString(ctx, ("[!] Class not found: " + strVal).c_str());
+            }
+        }
+    }
+
+    if (!ptr) {
+        ptr = ParsePtr(ctx, argv[0]);
+    }
+    if (!ptr || ptr < 0x1000) {
+        return JS_NewString(ctx, "[!] Invalid pointer (address is null or below 0x1000)");
+    }
+
+    std::string reason;
+    MemoryTargetKind kind = InspectAddress(static_cast<uintptr_t>(ptr), &reason);
+    if (kind == MemoryTargetKind::kInvalid) {
+        return JS_NewString(ctx, ("[!] Invalid pointer: " + reason).c_str());
+    }
+
+    // Dimension: DEX memory buffer
+    if (kind == MemoryTargetKind::kDexFile) {
+        uint8_t magic[8] = {0};
+        struct iovec liov = { magic, sizeof(magic) };
+        struct iovec riov = { reinterpret_cast<void*>(ptr), sizeof(magic) };
+        syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0);
+        uint32_t file_size = 0;
+        liov = { &file_size, sizeof(file_size) };
+        riov = { reinterpret_cast<void*>(ptr + 0x20), sizeof(file_size) };
+        syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0);
+
+        std::ostringstream ss;
+        ss << "=== DEX Memory Buffer at " << reinterpret_cast<void*>(ptr) << " ===\n";
+        ss << "  Format: " << std::string(reinterpret_cast<const char*>(magic), 4) << "\n";
+        ss << "  File Size: " << file_size << " bytes\n";
+        return JS_NewString(ctx, ss.str().c_str());
+    }
+
+    // Check if ptr is a known global jclass reference
+    if (env && IsKnownGlobalClassRef(static_cast<uintptr_t>(ptr))) {
+        jclass cls = reinterpret_cast<jclass>(ptr);
+        std::string out = DumpMethodsOfClass(env, cls, "", maxInsn, false);
+        return JS_NewString(ctx, out.c_str());
+    }
+
+    // Dimension: Valid ArtMethod
+    if (kind == MemoryTargetKind::kArtMethod) {
+        ArtMethod* art = reinterpret_cast<ArtMethod*>(ptr);
+        PI::Method m = PI::resolve(art);
+        if (m.isValid()) {
+            std::string code = PI::dumpCode(art, maxInsn);
+            return JS_NewString(ctx, code.c_str());
+        }
+    }
+
+    // Default fallback: Always Native ARM64 Disassembly!
     std::string code = PI::dumpNative(reinterpret_cast<const void*>(ptr), maxInsn);
     return JS_NewString(ctx, code.c_str());
 }
@@ -314,11 +449,18 @@ static JSValue JsDecompile(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
 
     int64_t ptr = ParsePtr(ctx, argv[0]);
     if (ptr > 0x1000) {
-        targetArt = reinterpret_cast<ArtMethod*>(ptr);
-        PI::Method m = PI::resolve(targetArt);
+        MemoryTargetKind kind = InspectAddress(static_cast<uintptr_t>(ptr));
+        if (kind != MemoryTargetKind::kArtMethod) {
+            // Pointer is not a validated ArtMethod; dispatch to disassembly rather than crashing JADX!
+            return JsDumpCode(ctx, JS_UNDEFINED, argc, argv);
+        }
+        PI::Method m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
         if (m.isValid()) {
+            targetArt = m.getArtMethod();
             className = m.getDeclaringClassName();
             methodName = m.getName();
+        } else {
+            return JsDumpCode(ctx, JS_UNDEFINED, argc, argv);
         }
     } else if (JS_IsString(argv[0])) {
         const char* s = JS_ToCString(ctx, argv[0]);
@@ -346,9 +488,9 @@ static JSValue JsDecompile(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
                 if (mPtr > 0x1000) targetArt = reinterpret_cast<ArtMethod*>(mPtr);
             }
             if (!targetArt) {
-                jclass classCls = env->FindClass("java/lang/Class");
-                if (env->ExceptionCheck()) env->ExceptionClear();
+                jclass classCls = AgentCachedClass("java/lang/Class");
                 jmethodID getDeclaredMethods = classCls ? env->GetMethodID(classCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;") : nullptr;
+                if (env->ExceptionCheck()) env->ExceptionClear();
                 if (classCls && getDeclaredMethods) {
                     auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
                     if (env->ExceptionCheck()) env->ExceptionClear();
@@ -361,7 +503,6 @@ static JSValue JsDecompile(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
                         }
                         env->DeleteLocalRef(mArr);
                     }
-                    env->DeleteLocalRef(classCls);
                 }
             }
             env->DeleteLocalRef(cls);
@@ -393,28 +534,7 @@ static JSValue JsDecompile(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
 
     jclass cls = FindClassWithFallback(env, className);
     if (cls) {
-        jclass classCls = env->FindClass("java/lang/Class");
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        jmethodID getDeclaredMethods = classCls ? env->GetMethodID(classCls, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;") : nullptr;
-        if (classCls && getDeclaredMethods) {
-            auto mArr = (jobjectArray)env->CallObjectMethod(cls, getDeclaredMethods);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            if (mArr) {
-                jsize len = env->GetArrayLength(mArr);
-                for (jsize i = 0; i < len; ++i) {
-                    jobject mObj = env->GetObjectArrayElement(mArr, i);
-                    if (mObj) {
-                        PI::Method pm = PI::resolve(env, mObj);
-                        if (pm.isValid()) {
-                            ss << pm.dumpSmali(-1) << "\n";
-                        }
-                        env->DeleteLocalRef(mObj);
-                    }
-                }
-                env->DeleteLocalRef(mArr);
-            }
-            env->DeleteLocalRef(classCls);
-        }
+        ss << DumpMethodsOfClass(env, cls, className, -1, true);
         env->DeleteLocalRef(cls);
     }
     return JS_NewString(ctx, ss.str().c_str());
@@ -602,8 +722,7 @@ static std::string PackageFromCmdline() {
 }
 
 static ArtMethod* FirstArtMethodOfClass(JNIEnv* env, jclass cls) {
-    jclass classCls = env->FindClass("java/lang/Class");
-    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    jclass classCls = AgentCachedClass("java/lang/Class");
     if (!classCls) return nullptr;
 
     struct Getter { const char* name; const char* sig; };
@@ -633,7 +752,6 @@ static ArtMethod* FirstArtMethodOfClass(JNIEnv* env, jclass cls) {
         env->DeleteLocalRef(arr);
     }
 
-    env->DeleteLocalRef(classCls);
     return found;
 }
 
@@ -868,7 +986,7 @@ void RegisterJavaDecompileApis(JSContext* ctx, JSValue global, JSValue java) {
     JS_SetPropertyStr(ctx, java, "dumpSmali", JS_NewCFunction(ctx, JsDumpSmali, "dumpSmali", 2));
     JS_SetPropertyStr(ctx, java, "dumpCode", JS_NewCFunction(ctx, JsDumpCode, "dumpCode", 2));
     JS_SetPropertyStr(ctx, java, "decompile", JS_NewCFunction(ctx, JsDecompile, "decompile", 2));
-    JS_SetPropertyStr(ctx, java, "disassembly", JS_NewCFunction(ctx, JsDecompile, "disassembly", 2));
+    JS_SetPropertyStr(ctx, java, "disassembly", JS_NewCFunction(ctx, JsDumpCode, "disassembly", 2));
     JS_SetPropertyStr(ctx, java, "dumpAllDex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpAllDex", 1));
     JS_SetPropertyStr(ctx, java, "dumpalldex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpalldex", 1));
     JS_SetPropertyStr(ctx, java, "dumpDex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpDex", 1));
@@ -879,7 +997,8 @@ void RegisterJavaDecompileApis(JSContext* ctx, JSValue global, JSValue java) {
     JS_SetPropertyStr(ctx, global, "dumpCode", JS_NewCFunction(ctx, JsDumpCode, "dumpCode", 2));
     JS_SetPropertyStr(ctx, global, "dumpcode", JS_NewCFunction(ctx, JsDumpCode, "dumpcode", 2));
     JS_SetPropertyStr(ctx, global, "decompile", JS_NewCFunction(ctx, JsDecompile, "decompile", 2));
-    JS_SetPropertyStr(ctx, global, "disassembly", JS_NewCFunction(ctx, JsDecompile, "disassembly", 2));
+    JS_SetPropertyStr(ctx, global, "disassembly", JS_NewCFunction(ctx, JsDumpCode, "disassembly", 2));
+    JS_SetPropertyStr(ctx, global, "disasm", JS_NewCFunction(ctx, JsDumpCode, "disasm", 2));
     JS_SetPropertyStr(ctx, global, "dumpAllDex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpAllDex", 1));
     JS_SetPropertyStr(ctx, global, "dumpalldex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpalldex", 1));
     JS_SetPropertyStr(ctx, global, "dumpdex", JS_NewCFunction(ctx, JsDumpAllDex, "dumpdex", 1));

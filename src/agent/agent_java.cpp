@@ -9,6 +9,7 @@
 #include "agent_java_choose.h"
 #include "agent_java_ui.h"
 #include "agent_java_registerclass.h"
+#include "agent_dex_writer.h"
 #include "agent_invoke.h"
 
 extern "C" {
@@ -30,6 +31,7 @@ void RegisterJavaApis(JSContext* ctx, JSValue global, JSValue java) {
     RegisterJavaChooseApis(ctx, global, java);
     RegisterJavaUiApis(ctx, global);
     RegisterJavaRegisterClassApis(ctx, global, java);
+    RegisterDexWriterApis(ctx, global, java);
     RegisterJavaInvokeApis(ctx, global, java);
 }
 

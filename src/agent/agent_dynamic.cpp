@@ -444,8 +444,8 @@ const char* kDynamicBootstrapJs = R"JS(
                 return dumpnative(isNative && nativeEntry ? nativeEntry : art,
                                   maxInsns !== undefined ? maxInsns : -1);
             };
-            mFn.disassembly = function() {
-                return Java.decompile(art);
+            mFn.disassembly = function(maxInsns) {
+                return mFn.dumpCode(maxInsns);
             };
             mFn.decompile = function() {
                 return Java.decompile(art);
@@ -519,8 +519,8 @@ const char* kDynamicBootstrapJs = R"JS(
                 }
                 return out;
             },
-            disassembly: function() {
-                return Java.decompile(className);
+            disassembly: function(maxInsns) {
+                return cBox.dumpCode(maxInsns);
             },
             decompile: function() {
                 return Java.decompile(className);

@@ -28,6 +28,7 @@ set(AGENT_SOURCES
     agent_java_choose.cpp
     agent_java_ui.cpp
     agent_java_registerclass.cpp
+    agent_dex_writer.cpp
     agent_invoke.cpp
     agent_native.cpp
     agent_memory.cpp

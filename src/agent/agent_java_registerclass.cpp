@@ -18,6 +18,8 @@
 //
 
 #include "agent_java_registerclass.h"
+#include "agent_dex_writer.h"
+#include "dex/pi_dex_writer.h"
 
 #include "agent_java_ref.h"
 #include "dex/pi_dex_gen.h"
@@ -650,38 +652,8 @@ std::string NormalizeTypeName(const std::string& t) {
 
 bool ParseSignatureLocal(const std::string& sig,
                          std::string* ret,
-                         std::vector<std::string>* args) {    args->clear();
-    if (sig.size() < 3 || sig[0] != '(') return false;
-    size_t i = 1;
-    while (i < sig.size() && sig[i] != ')') {
-        size_t start = i;
-        while (i < sig.size() && sig[i] == '[') ++i;
-        if (i >= sig.size()) return false;
-        if (sig[i] == 'L') {
-            size_t semi = sig.find(';', i);
-            if (semi == std::string::npos) return false;
-            i = semi + 1;
-        } else {
-            ++i;
-        }
-        args->push_back(sig.substr(start, i - start));
-    }
-    if (i >= sig.size() || sig[i] != ')') return false;
-    ++i;
-    if (i >= sig.size()) return false;
-    size_t rstart = i;
-    while (i < sig.size() && sig[i] == '[') ++i;
-    if (i >= sig.size()) return false;
-    if (sig[i] == 'L') {
-        size_t semi = sig.find(';', i);
-        if (semi == std::string::npos) return false;
-        i = semi + 1;
-    } else {
-        ++i;
-    }
-    if (i != sig.size()) return false;
-    *ret = sig.substr(rstart);
-    return true;
+                         std::vector<std::string>* args) {
+    return PI::DexGen::ParseSignature(sig, ret, args);
 }
 
 }  // namespace
@@ -726,6 +698,8 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
         JSValue impl = JS_UNDEFINED;
     };
     std::vector<PendingNative> pending;
+    bool hasNoArgConstructor = false;
+    bool hasAnyConstructor = false;
 
     JSValue methodsObj = JS_GetPropertyStr(ctx, spec, "methods");
     if (JS_IsObject(methodsObj)) {
@@ -735,37 +709,62 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
                                    JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
             for (uint32_t i = 0; i < count; ++i) {
                 const char* rawName = JS_AtomToCString(ctx, table[i].atom);
-                std::string methodName = rawName ? rawName : "";
+                std::string rawKey = rawName ? rawName : "";
                 if (rawName) JS_FreeCString(ctx, rawName);
                 JS_FreeAtom(ctx, table[i].atom);
                 table[i].atom = JS_ATOM_NULL;
 
-                if (methodName.empty()) continue;
+                if (rawKey.empty()) continue;
 
-                JSValue def = JS_GetPropertyStr(ctx, methodsObj, methodName.c_str());
-
+                std::string methodName = rawKey;
+                // Support inline signature in method name: e.g. "myMethod(I)V"
                 std::string signature, retType;
                 std::vector<std::string> argTypes;
+                size_t lparen = methodName.find('(');
+                if (lparen != std::string::npos) {
+                    signature = methodName.substr(lparen);
+                    methodName = methodName.substr(0, lparen);
+                }
+
+                JSValue def = JS_GetPropertyStr(ctx, methodsObj, rawKey.c_str());
+
                 bool isStatic = false;
                 JSValue impl = JS_UNDEFINED;
 
+                bool isExplicitBytecode = false;
                 if (JS_IsFunction(ctx, def)) {
                     impl = JS_DupValue(ctx, def);
-                    std::string err;
-                    if (!InferSignature(env, methodName, superclass, interfaces,
-                                        &signature, &retType, &argTypes,
-                                        &isStatic, &err)) {
-                        JS_FreeValue(ctx, def);
-                        JS_FreeValue(ctx, impl);
-                        JS_FreeValue(ctx, methodsObj);
-                        js_free(ctx, table);
-                        return JS_ThrowTypeError(ctx, "%s", err.c_str());
+                    if (signature.empty()) {
+                        std::string err;
+                        if (!InferSignature(env, methodName, superclass, interfaces,
+                                            &signature, &retType, &argTypes,
+                                            &isStatic, &err)) {
+                            JS_FreeValue(ctx, def);
+                            JS_FreeValue(ctx, impl);
+                            JS_FreeValue(ctx, methodsObj);
+                            js_free(ctx, table);
+                            return JS_ThrowTypeError(ctx, "%s", err.c_str());
+                        }
+                    }
+                } else if (GetDexWriterInstance(ctx, def) != nullptr || JS_IsString(def)) {
+                    impl = JS_DupValue(ctx, def);
+                    if (signature.empty()) {
+                        std::string err;
+                        if (!InferSignature(env, methodName, superclass, interfaces,
+                                            &signature, &retType, &argTypes,
+                                            &isStatic, &err)) {
+                            JS_FreeValue(ctx, def);
+                            JS_FreeValue(ctx, impl);
+                            JS_FreeValue(ctx, methodsObj);
+                            js_free(ctx, table);
+                            return JS_ThrowTypeError(ctx, "%s", err.c_str());
+                        }
                     }
                 } else if (JS_IsObject(def)) {
                     std::string explicitSig;
                     if (GetStringProp(ctx, def, "signature", &explicitSig)) {
                         signature = explicitSig;
-                    } else {
+                    } else if (signature.empty()) {
                         std::string retName;
                         if (!GetStringProp(ctx, def, "returnType", &retName)) {
                             retName = "void";
@@ -783,8 +782,15 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
                         }
                         signature += ")" + retType;
                     }
-                    isStatic = GetBoolProp(ctx, def, "static", false);
+                    isStatic = GetBoolProp(ctx, def, "static", isStatic);
                     GetValueProp(ctx, def, "implementation", &impl);
+                    if (JS_IsUndefined(impl)) {
+                        JS_FreeValue(ctx, impl);
+                        GetValueProp(ctx, def, "bytecode", &impl);
+                        if (!JS_IsUndefined(impl)) {
+                            isExplicitBytecode = true;
+                        }
+                    }
                 } else {
                     JS_FreeValue(ctx, def);
                     continue;
@@ -810,6 +816,12 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
                 }
 
                 bool isConstructor = (methodName == "<init>");
+                if (isConstructor) {
+                    hasAnyConstructor = true;
+                    if (signature == "()V") {
+                        hasNoArgConstructor = true;
+                    }
+                }
                 PI::DexGen::MethodSpec dexMethod;
                 dexMethod.name = methodName;
                 dexMethod.signature = signature;
@@ -818,14 +830,90 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
                 dexMethod.access_flags = PI::DexGen::ACC_PUBLIC | PI::DexGen::ACC_NATIVE;
                 if (isConstructor) dexMethod.access_flags |= PI::DexGen::ACC_CONSTRUCTOR;
                 if (isStatic) dexMethod.access_flags |= PI::DexGen::ACC_STATIC;
-                dexMethods.push_back(std::move(dexMethod));
 
-                __android_log_print(ANDROID_LOG_DEBUG, REGCLS_TAG,
-                                    "spec %s sig=%s isFunc=%d isUndef=%d",
-                                    methodName.c_str(), signature.c_str(),
-                                    (int) JS_IsFunction(ctx, impl),
-                                    (int) JS_IsUndefined(impl));
-                if (JS_IsFunction(ctx, impl)) {
+                std::shared_ptr<PI::DexWriter::Writer> bytecodeWriter = nullptr;
+                uint16_t expectedIns = PI::DexGen::CalculateInsWords(argTypes, isStatic);
+
+                // 1. Check if impl is already a DexWriter instance
+                if (PI::DexWriter::Writer* existing = GetDexWriterInstance(ctx, impl)) {
+                    bytecodeWriter = std::make_shared<PI::DexWriter::Writer>(*existing);
+                    uint16_t curIns = bytecodeWriter->GetIns();
+                    uint16_t curRegs = bytecodeWriter->GetRegisters();
+                    uint16_t curOuts = bytecodeWriter->GetOuts();
+                    if (curIns != expectedIns || curRegs < expectedIns) {
+                        uint16_t newRegs = std::max<uint16_t>(curRegs, expectedIns + 2);
+                        bytecodeWriter->SetRegisters(newRegs, expectedIns, curOuts);
+                    }
+                } else if (JS_IsString(impl)) {
+                    // 2. Smali string shorthand (Option B)
+                    const char* smaliStr = JS_ToCString(ctx, impl);
+                    if (smaliStr) {
+                        bytecodeWriter = std::make_shared<PI::DexWriter::Writer>();
+                        uint16_t totalRegs = std::max<uint16_t>(expectedIns + 2, 4);
+                        bytecodeWriter->SetRegisters(totalRegs, expectedIns, 4);
+
+                        std::string err;
+                        if (!bytecodeWriter->EmitSmali(smaliStr, &err)) {
+                            JS_FreeCString(ctx, smaliStr);
+                            JS_FreeValue(ctx, impl);
+                            JS_FreeValue(ctx, def);
+                            js_free(ctx, table);
+                            JS_FreeValue(ctx, methodsObj);
+                            for (auto& p : pending) JS_FreeValue(ctx, p.impl);
+                            return JS_ThrowTypeError(ctx, "Smali error in %s: %s", methodName.c_str(), err.c_str());
+                        }
+                        JS_FreeCString(ctx, smaliStr);
+                    }
+                } else if (JS_IsFunction(ctx, impl)) {
+                    // 3. Bytecode builder function (explicit bytecode: fn, or fn.$emit = true, or fn.bytecode = true)
+                    bool isBytecodeBuilder = isExplicitBytecode;
+                    if (!isBytecodeBuilder) {
+                        JSValue emitProp = JS_GetPropertyStr(ctx, impl, "$emit");
+                        if (JS_ToBool(ctx, emitProp)) isBytecodeBuilder = true;
+                        JS_FreeValue(ctx, emitProp);
+                        if (!isBytecodeBuilder) {
+                            JSValue bcProp = JS_GetPropertyStr(ctx, impl, "bytecode");
+                            if (JS_ToBool(ctx, bcProp)) isBytecodeBuilder = true;
+                            JS_FreeValue(ctx, bcProp);
+                        }
+                    }
+
+                    if (isBytecodeBuilder) {
+                        auto probeWriter = std::make_shared<PI::DexWriter::Writer>();
+                        uint16_t totalRegs = std::max<uint16_t>(expectedIns + 2, 4);
+                        probeWriter->SetRegisters(totalRegs, expectedIns, 4);
+
+                        JSValue writerObj = CreateDexWriterObject(ctx, probeWriter);
+                        JSValue res = JS_Call(ctx, impl, JS_UNDEFINED, 1, &writerObj);
+                        JS_FreeValue(ctx, writerObj);
+                        if (JS_IsException(res)) {
+                            JS_FreeValue(ctx, impl);
+                            JS_FreeValue(ctx, def);
+                            js_free(ctx, table);
+                            JS_FreeValue(ctx, methodsObj);
+                            for (auto& p : pending) JS_FreeValue(ctx, p.impl);
+                            return res;
+                        }
+                        JS_FreeValue(ctx, res);
+
+                        if (probeWriter->GetBytecodeInstructionCount() == 0) {
+                            JS_FreeValue(ctx, impl);
+                            JS_FreeValue(ctx, def);
+                            js_free(ctx, table);
+                            JS_FreeValue(ctx, methodsObj);
+                            for (auto& p : pending) JS_FreeValue(ctx, p.impl);
+                            return JS_ThrowTypeError(ctx, "bytecode builder for method %s emitted no instructions",
+                                                     methodName.c_str());
+                        }
+                        bytecodeWriter = probeWriter;
+                    }
+                }
+
+                if (bytecodeWriter != nullptr) {
+                    dexMethod.writer = bytecodeWriter;
+                    dexMethod.access_flags &= ~PI::DexGen::ACC_NATIVE;
+                    JS_FreeValue(ctx, impl);
+                } else if (JS_IsFunction(ctx, impl)) {
                     PendingNative pn;
                     pn.name = methodName;
                     pn.signature = signature;
@@ -837,6 +925,8 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
                     JS_FreeValue(ctx, impl);
                 }
 
+                dexMethods.push_back(std::move(dexMethod));
+
                 JS_FreeValue(ctx, def);
             }
             js_free(ctx, table);
@@ -844,7 +934,46 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
     }
     JS_FreeValue(ctx, methodsObj);
 
+    if (!hasNoArgConstructor) {
+        bool superHasDefaultCtor = false;
+        jclass sc = FindClassWithFallback(env, superclass);
+        if (sc != nullptr) {
+            jmethodID mid = env->GetMethodID(sc, "<init>", "()V");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+            if (mid != nullptr) {
+                superHasDefaultCtor = true;
+            }
+            env->DeleteLocalRef(sc);
+        }
+
+        if (superHasDefaultCtor) {
+            PI::DexGen::MethodSpec ctorMethod;
+            ctorMethod.name = "<init>";
+            ctorMethod.signature = "()V";
+            ctorMethod.is_static = false;
+            ctorMethod.is_constructor = true;
+            ctorMethod.access_flags = PI::DexGen::ACC_PUBLIC | PI::DexGen::ACC_CONSTRUCTOR;
+
+            auto ctorWriter = std::make_shared<PI::DexWriter::Writer>();
+            ctorWriter->SetRegisters(1, 1, 0); // p0 = this
+            std::string superInit = PI::DexWriter::NormalizeType(superclass) + "-><init>()V";
+            ctorWriter->PutInvokeDirect(superInit, {0});
+            ctorWriter->PutReturnVoid();
+
+            ctorMethod.writer = ctorWriter;
+            dexMethods.push_back(std::move(ctorMethod));
+        } else if (!hasAnyConstructor) {
+            for (auto& p : pending) JS_FreeValue(ctx, p.impl);
+            return JS_ThrowTypeError(ctx,
+                "Java.registerClass: superclass '%s' does not have a no-argument constructor; an explicit '<init>' method must be provided",
+                superclass.c_str());
+        }
+    }
+
     if (dexMethods.empty()) {
+        for (auto& p : pending) JS_FreeValue(ctx, p.impl);
         return JS_ThrowTypeError(ctx,
             "Java.registerClass: 'methods' must declare at least one method");
     }
@@ -865,14 +994,31 @@ static JSValue JsRegisterClass(JSContext* ctx, JSValueConst /*this_val*/,
                 table[i].atom = JS_ATOM_NULL;
 
                 JSValue def = JS_GetPropertyStr(ctx, fieldsObj, fieldName.c_str());
-                if (JS_IsObject(def)) {
+                if (JS_IsString(def)) {
+                    const char* s = JS_ToCString(ctx, def);
+                    if (s) {
+                        PI::DexGen::FieldSpec fs;
+                        fs.name = fieldName;
+                        fs.type = NormalizeTypeName(s);
+                        fs.access_flags = PI::DexGen::ACC_PUBLIC; // instance field
+                        dexFields.push_back(std::move(fs));
+                        JS_FreeCString(ctx, s);
+                    }
+                } else if (JS_IsObject(def)) {
                     std::string typeName;
                     GetStringProp(ctx, def, "type", &typeName);
                     if (!typeName.empty()) {
                         PI::DexGen::FieldSpec fs;
                         fs.name = fieldName;
                         fs.type = NormalizeTypeName(typeName);
-                        fs.access_flags = PI::DexGen::ACC_PUBLIC | PI::DexGen::ACC_STATIC;
+
+                        bool isStatic = true;
+                        JSValue statVal = JS_GetPropertyStr(ctx, def, "static");
+                        if (JS_IsBool(statVal)) isStatic = (JS_ToBool(ctx, statVal) != 0);
+                        JS_FreeValue(ctx, statVal);
+
+                        fs.access_flags = PI::DexGen::ACC_PUBLIC;
+                        if (isStatic) fs.access_flags |= PI::DexGen::ACC_STATIC;
 
                         const std::string& d = fs.type;
                         JSValue value = JS_GetPropertyStr(ctx, def, "value");
@@ -1660,6 +1806,7 @@ void RegisterJavaRegisterClassApis(JSContext* ctx, JSValue global, JSValue java)
         "        if (p === '$method') return function(n, s){ return __native_regmethod(handle, n, s); };"
         "        if (p === '$loader') return __native_regloader(handle);"
         "        if (p === '$methods') return Object.keys(isStatic);"
+        "        if (p === 'toString' || p === 'valueOf') return function(){ return '[JavaClass ' + className + ']'; };"
         "        if (typeof p === 'string' && p.charCodeAt(0) !== 95) {"
         "          if (p === 'then' || p === 'toJSON' || p === 'inspect') return t[p];"
         "          return function(){"

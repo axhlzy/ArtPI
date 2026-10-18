@@ -41,6 +41,17 @@ static jclass GetOrCreateGlobalClassRef(JNIEnv* env, const std::string& classNam
     return gCls;
 }
 
+bool IsKnownGlobalClassRef(uintptr_t ptr) {
+    if (!ptr || ptr < 0x1000) return false;
+    std::lock_guard<std::mutex> lk(g_classRefMutex);
+    for (const auto& pair : g_classRefCache) {
+        if (reinterpret_cast<uintptr_t>(pair.second) == ptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string FormatModifiers(uint32_t f) {
     std::string s;
     auto add = [&](const char* w) { if (!s.empty()) s += ' '; s += w; };
@@ -778,6 +789,7 @@ static JSValue JsMethodInfo(JSContext* ctx, JSValueConst /*this_val*/, int argc,
     if (argc < 1) return JS_NewString(ctx, "Usage: methodInfo(artMethodPtr)");
     int64_t ptr = ParsePtr(ctx, argv[0]);
     if (!ptr || ptr < 0x1000) return JS_NULL;
+    if (InspectAddress(static_cast<uintptr_t>(ptr)) != MemoryTargetKind::kArtMethod) return JS_NULL;
 
     PI::Method m = PI::resolve(reinterpret_cast<ArtMethod*>(ptr));
     if (!m.isValid()) return JS_NULL;

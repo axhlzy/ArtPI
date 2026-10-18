@@ -743,6 +743,13 @@ static JSValue JsDebugSymbolFindSymbolByName(JSContext* ctx, JSValueConst /*this
 JSValue JsDumpNative(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_NewString(ctx, "Usage: dumpNative(artMethodPtrOrNativeAddr, [maxInstructions])");
     int64_t ptr = ParsePtr(ctx, argv[0]);
+    if (!ptr && JS_IsObject(argv[0])) {
+        JSValue v = JS_GetPropertyStr(ctx, argv[0], "address");
+        if (JS_IsUndefined(v) || JS_IsNull(v)) v = JS_GetPropertyStr(ctx, argv[0], "artMethod");
+        if (JS_IsUndefined(v) || JS_IsNull(v)) v = JS_GetPropertyStr(ctx, argv[0], "ptr");
+        ptr = ParsePtr(ctx, v);
+        JS_FreeValue(ctx, v);
+    }
     if (!ptr || ptr < 0x1000) {
         return JS_NewString(ctx, "[!] Invalid pointer (address is null or below 0x1000)");
     }
@@ -750,24 +757,29 @@ JSValue JsDumpNative(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValu
     int maxInsn = -1;
     if (argc >= 2) JS_ToInt32(ctx, &maxInsn, argv[1]);
 
-    // 1. If ptr is inside an ELF module (.so), it's definitely a raw native code pointer
-    xdl_info_t info;
-    void* cache = nullptr;
-    if (xdl_addr(reinterpret_cast<void*>(ptr), &info, &cache) != 0) {
-        xdl_addr_clean(&cache);
-        std::string native_code = PI::dumpNative(reinterpret_cast<const void*>(ptr), maxInsn);
-        return JS_NewString(ctx, native_code.c_str());
-    }
-    xdl_addr_clean(&cache);
-
-    // 2. Try resolving as ArtMethod
-    ArtMethod* art = reinterpret_cast<ArtMethod*>(ptr);
-    PI::Method m = PI::resolve(art);
-    if (m.isValid() && m.isNative()) {
-        std::string native_code = m.dumpNative(maxInsn);
-        return JS_NewString(ctx, native_code.c_str());
+    std::string reason;
+    MemoryTargetKind kind = InspectAddress(static_cast<uintptr_t>(ptr), &reason);
+    if (kind == MemoryTargetKind::kInvalid) {
+        return JS_NewString(ctx, ("[!] Invalid pointer: " + reason).c_str());
     }
 
+    // Attempt ArtMethod resolution only if strictly validated as an ArtMethod
+    if (kind == MemoryTargetKind::kArtMethod) {
+        ArtMethod* art = reinterpret_cast<ArtMethod*>(ptr);
+        PI::Method m = PI::resolve(art);
+        if (m.isValid()) {
+            if (m.isNative()) {
+                std::string native_code = m.dumpNative(maxInsn);
+                return JS_NewString(ctx, native_code.c_str());
+            } else {
+                std::string msg = "[!] Method '" + m.getDeclaringClassName() + "." + m.getName() +
+                                  "' is a Dalvik/Java method (not native). Use dumpSmali() or dumpCode().\n";
+                return JS_NewString(ctx, msg.c_str());
+            }
+        }
+    }
+
+    // Direct native disassembly without touching ART structures
     std::string native_code = PI::dumpNative(reinterpret_cast<const void*>(ptr), maxInsn);
     return JS_NewString(ctx, native_code.c_str());
 }

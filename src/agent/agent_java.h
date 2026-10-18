@@ -19,6 +19,9 @@ void InitJRefClassCache(JNIEnv* env);
 // Register observed object for pointer tracking
 void RegisterObservedObject(JNIEnv* env, uint64_t raw, jobject obj);
 
+// Check if a raw pointer matches a known global jclass reference
+bool IsKnownGlobalClassRef(uintptr_t ptr);
+
 // Unhook every active Java hook; returns count removed
 size_t JavaUnhookAllCount();
 

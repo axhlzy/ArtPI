@@ -250,6 +250,10 @@ static JSValue JsInvoke(JSContext* ctx, JSValueConst /*this_val*/,
         }
     }
 
+    if (InspectAddress(static_cast<uintptr_t>(artPtr)) != MemoryTargetKind::kArtMethod) {
+        return JS_ThrowTypeError(ctx, "invoke: invalid ArtMethod pointer");
+    }
+
     auto* art = reinterpret_cast<ArtMethod*>(artPtr);
     PI::Method meta = PI::resolve(art);
     if (!meta.isValid()) return JS_ThrowTypeError(ctx, "invoke: cannot resolve ArtMethod");

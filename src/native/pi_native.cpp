@@ -11,6 +11,9 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <sys/uio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <sstream>
 #include <iomanip>
 #include <mutex>
@@ -319,10 +322,14 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
                 return true;
             }
         }
-        if (target_addr != fstart) {
-            const uint32_t* tw = reinterpret_cast<const uint32_t*>(target_addr);
-            if (isFunctionPrologue(*tw)) {
-                return true;
+        if (target_addr != fstart && (target_addr & 3) == 0) {
+            uint32_t tw = 0;
+            struct iovec liov = { &tw, sizeof(tw) };
+            struct iovec riov = { reinterpret_cast<void*>(target_addr), sizeof(tw) };
+            if (syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0) == sizeof(tw)) {
+                if (isFunctionPrologue(tw)) {
+                    return true;
+                }
             }
         }
         return false;
@@ -344,6 +351,54 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
         return errBuf;
     }
     cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+    // Buffered batch reader to eliminate per-instruction syscall overhead
+    struct BufferedInsnReader {
+        enum { kWords = 256 }; // 1024 bytes per chunk
+        uintptr_t base = 0;
+        size_t valid_bytes = 0;
+        uint32_t buf[kWords] = {0};
+
+        bool ReadWord(uintptr_t pc, uint32_t* out_word) {
+            if (!out_word || (pc & 3) != 0) return false;
+            if (pc >= base && pc + sizeof(uint32_t) <= base + valid_bytes) {
+                size_t idx = (pc - base) / sizeof(uint32_t);
+                *out_word = buf[idx];
+                return true;
+            }
+
+            // Align read request to chunk boundary
+            uintptr_t new_base = pc & ~static_cast<uintptr_t>(sizeof(buf) - 1);
+            struct iovec liov = { buf, sizeof(buf) };
+            struct iovec riov = { reinterpret_cast<void*>(new_base), sizeof(buf) };
+            ssize_t n = syscall(SYS_process_vm_readv, getpid(), &liov, 1, &riov, 1, 0);
+            if (n <= 0) {
+                // Fallback: try single 4-byte instruction read (boundary near EOF / page gap)
+                struct iovec sliov = { out_word, sizeof(uint32_t) };
+                struct iovec sriov = { reinterpret_cast<void*>(pc), sizeof(uint32_t) };
+                if (syscall(SYS_process_vm_readv, getpid(), &sliov, 1, &sriov, 1, 0) == sizeof(uint32_t)) {
+                    base = pc;
+                    buf[0] = *out_word;
+                    valid_bytes = sizeof(uint32_t);
+                    return true;
+                }
+                base = 0;
+                valid_bytes = 0;
+                return false;
+            }
+
+            base = new_base;
+            valid_bytes = static_cast<size_t>(n);
+            if (pc >= base && pc + sizeof(uint32_t) <= base + valid_bytes) {
+                size_t idx = (pc - base) / sizeof(uint32_t);
+                *out_word = buf[idx];
+                return true;
+            }
+            return false;
+        }
+    };
+
+    BufferedInsnReader reader;
 
     // 4. Perform CFG Reachability & Basic Block Analysis
     CFGResult cfg;
@@ -376,7 +431,13 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
             cfg.reachable_pcs.insert(cur_pc);
             explored_count++;
 
-            const uint8_t* code_bytes = reinterpret_cast<const uint8_t*>(cur_pc);
+            uint32_t insn_word = 0;
+            if (!reader.ReadWord(cur_pc, &insn_word)) {
+                block.end_pc = cur_pc;
+                break;
+            }
+
+            const uint8_t* code_bytes = reinterpret_cast<const uint8_t*>(&insn_word);
             cs_insn* insn = nullptr;
             size_t count = cs_disasm(cs_handle, code_bytes, 4, cur_pc, 1, &insn);
             if (count == 0 || !insn) {
@@ -562,7 +623,12 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
     uintptr_t cur_pc = dump_start;
 
     while (cur_pc < dump_end) {
-        const uint8_t* code_bytes = reinterpret_cast<const uint8_t*>(cur_pc);
+        uint32_t insn_word = 0;
+        if (!reader.ReadWord(cur_pc, &insn_word)) {
+            break;
+        }
+
+        const uint8_t* code_bytes = reinterpret_cast<const uint8_t*>(&insn_word);
         cs_insn* insn = nullptr;
         size_t count = cs_disasm(cs_handle, code_bytes, 4, cur_pc, 1, &insn);
         if (count == 0 || !insn) {
@@ -571,7 +637,7 @@ std::string dumpNative(const void* native_pc, int max_instructions, ArtMethod* m
             std::memcpy(item.bytes, code_bytes, 4);
             item.mnemonic = ".word";
             char wb[32];
-            snprintf(wb, sizeof(wb), "0x%08x", *reinterpret_cast<const uint32_t*>(cur_pc));
+            snprintf(wb, sizeof(wb), "0x%08x", insn_word);
             item.op_str = wb;
             insns_list.push_back(item);
             cur_pc += 4;

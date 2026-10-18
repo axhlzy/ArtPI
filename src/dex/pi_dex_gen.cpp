@@ -3,6 +3,7 @@
 //
 
 #include "pi_dex_gen.h"
+#include "pi_dex_writer.h"
 
 #include "pi_common.h"
 #include "utils/pi_hash.h"
@@ -18,7 +19,9 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <android/log.h>
 
 namespace PI {
 namespace DexGen {
@@ -128,6 +131,8 @@ bool ReadDescriptor(const std::string& s, size_t* i, std::string* out) {
     return true;
 }
 
+}  // namespace
+
 bool ParseSignature(const std::string& sig,
                     std::string* ret,
                     std::vector<std::string>* params) {
@@ -146,7 +151,17 @@ bool ParseSignature(const std::string& sig,
     return i == sig.size();
 }
 
-}  // namespace
+uint16_t CalculateInsWords(const std::vector<std::string>& params, bool is_static) {
+    uint16_t words = is_static ? 0 : 1;
+    for (const auto& a : params) {
+        if (a == "J" || a == "D" || a == "long" || a == "double") {
+            words += 2;
+        } else {
+            words += 1;
+        }
+    }
+    return words;
+}
 
 std::string ToDescriptor(const std::string& type) {
     if (type.empty()) return type;
@@ -235,6 +250,10 @@ public:
         ir_->AttachBuffer(std::move(buf));
         node->data = slicer::MemView(data, size);
 
+        auto new_index = ir_->strings_indexes.AllocateIndex();
+        ir_->strings_map[new_index] = node;
+        node->orig_index = new_index;
+
         strings_[value] = node;
         return node;
     }
@@ -247,6 +266,11 @@ public:
         auto* node = ir_->Alloc<ir::Type>();
         node->descriptor = Str(descriptor);
         node->class_def = nullptr;
+
+        auto new_index = ir_->types_indexes.AllocateIndex();
+        ir_->types_map[new_index] = node;
+        node->orig_index = new_index;
+
         types_[descriptor] = node;
         return node;
     }
@@ -276,6 +300,10 @@ public:
         }
         proto->shorty = Str(shorty);
 
+        auto new_index = ir_->protos_indexes.AllocateIndex();
+        ir_->protos_map[new_index] = proto;
+        proto->orig_index = new_index;
+
         protos_[signature] = proto;
         return proto;
     }
@@ -292,7 +320,33 @@ public:
         decl->name = Str(name);
         decl->prototype = proto;
         decl->parent = parent;
+
+        auto new_index = ir_->methods_indexes.AllocateIndex();
+        ir_->methods_map[new_index] = decl;
+        decl->orig_index = new_index;
+
         method_decls_[key] = decl;
+        return decl;
+    }
+
+    ir::FieldDecl* FieldDecl(ir::Type* parent,
+                             const std::string& name,
+                             ir::Type* type) {
+        const std::string key = std::string(parent->descriptor->c_str()) + "->" +
+                                name + ":" + type->descriptor->c_str();
+        auto it = field_decls_.find(key);
+        if (it != field_decls_.end()) return it->second;
+
+        auto* decl = ir_->Alloc<ir::FieldDecl>();
+        decl->name = Str(name);
+        decl->type = type;
+        decl->parent = parent;
+
+        auto new_index = ir_->fields_indexes.AllocateIndex();
+        ir_->fields_map[new_index] = decl;
+        decl->orig_index = new_index;
+
+        field_decls_[key] = decl;
         return decl;
     }
 
@@ -333,10 +387,7 @@ public:
 
         for (const auto& f : spec.fields) {
             if (!ValidateIdentifier(f.name, error)) return false;
-            auto* decl = ir_->Alloc<ir::FieldDecl>();
-            decl->name = Str(f.name);
-            decl->type = Type(f.type);
-            decl->parent = class_type;
+            auto* decl = FieldDecl(class_type, f.name, Type(f.type));
 
             // Pre-register every string the static_values may reference BEFORE
             // the first Normalize(): adding new strings afterwards would shift
@@ -368,8 +419,40 @@ public:
             auto* decl = MethodDecl(class_type, m.name, proto);
             auto* encoded = ir_->Alloc<ir::EncodedMethod>();
             encoded->decl = decl;
-            encoded->code = nullptr;  // native method: no code_item
-            encoded->access_flags = m.access_flags | ACC_NATIVE;
+
+            if (m.writer != nullptr) {
+                if (m.writer->GetBytecodeInstructionCount() == 0) {
+                    if (error) *error = "empty bytecode writer for method " + m.name + m.signature;
+                    return false;
+                }
+                // Pure Dalvik bytecode method
+                encoded->access_flags = (m.access_flags & ~ACC_NATIVE);
+                auto* ir_code = ir_->Alloc<ir::Code>();
+                ir_code->registers = m.writer->GetRegisters();
+                ir_code->ins_count = m.writer->GetIns();
+                ir_code->outs_count = m.writer->GetOuts();
+                encoded->code = ir_code;
+
+                PI::DexWriter::IrContext ctx;
+                ctx.ir = ir_;
+                ctx.get_str = [this](const std::string& s) { return Str(s); };
+                ctx.get_type = [this](const std::string& t) { return Type(t); };
+                ctx.get_proto = [this](const std::string& sig) { return Proto(sig); };
+                ctx.get_field = [this](const std::string& parent, const std::string& name, const std::string& type) {
+                    return FieldDecl(Type(parent), name, Type(type));
+                };
+                ctx.get_method = [this](const std::string& parent, const std::string& name, const std::string& sig) {
+                    return MethodDecl(Type(parent), name, Proto(sig));
+                };
+
+                if (!m.writer->AssembleInto(&ctx, encoded, ir_code, error)) {
+                    return false;
+                }
+            } else {
+                // Native stub dispatched by agent native thunk
+                encoded->code = nullptr;
+                encoded->access_flags = m.access_flags | ACC_NATIVE;
+            }
 
             const bool is_direct = m.is_static || m.is_constructor ||
                                    (m.access_flags & ACC_PRIVATE) != 0;
@@ -479,6 +562,7 @@ private:
     std::map<std::string, ir::Type*> types_;
     std::map<std::string, ir::Proto*> protos_;
     std::map<std::string, ir::MethodDecl*> method_decls_;
+    std::map<std::string, ir::FieldDecl*> field_decls_;
     std::map<std::string, ir::Class*> classes_;
     std::map<std::string, const FieldSpec*> field_specs_;
 };
@@ -488,6 +572,13 @@ private:
 bool BuildDex(const std::vector<ClassSpec>& classes,
               std::vector<uint8_t>* out_image,
               std::string* error) {
+    static std::once_flag s_logger_init;
+    std::call_once(s_logger_init, []() {
+        slicer::set_logger([](const std::string& msg) {
+            __android_log_print(ANDROID_LOG_ERROR, "ArtPI-Dexter", "%s", msg.c_str());
+        });
+    });
+
     if (out_image == nullptr) return false;
     out_image->clear();
     if (classes.empty()) {
@@ -510,19 +601,24 @@ bool BuildDex(const std::vector<ClassSpec>& classes,
         if (!builder.AddClass(spec, error)) return false;
     }
 
-    auto ir = builder.Finish(error);
-    if (ir == nullptr) {
-        if (error) *error = "IR build failed";
+    std::shared_ptr<ir::DexFile> ir;
+    bool finish_ok = slicer::RunGuarded([&]() {
+        ir = builder.Finish(error);
+    }, error);
+    if (!finish_ok || ir == nullptr) {
+        if (error && error->empty()) *error = "IR build failed";
         return false;
     }
 
     MallocAllocator allocator;
     dex::u1* image = nullptr;
     size_t image_size = 0;
-    {
+
+    bool ok = slicer::RunGuarded([&]() {
         dex::Writer writer(ir);
         image = writer.CreateImage(&allocator, &image_size);
-    }
+    }, error);
+    if (!ok) return false;
     if (image == nullptr || image_size < 0x70) {
         if (error) *error = "dex writer failed";
         return false;

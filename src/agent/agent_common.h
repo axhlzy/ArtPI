@@ -55,6 +55,17 @@ std::vector<std::string> FindMatchingClassNames(JNIEnv* env, const std::string& 
 int64_t ParsePtr(JSContext* ctx, JSValueConst val);
 JSValue NewBigIntOrInt(JSContext* ctx, uint64_t val);
 
+// Multi-dimensional memory target classifier
+enum class MemoryTargetKind {
+    kInvalid,
+    kNativeCode,       // Executable memory (ELF .text, anonymous trampoline, JIT code, etc.)
+    kArtMethod,        // Valid ArtMethod struct in non-executable readable memory
+    kDexFile,          // DEX/CDEX magic header
+    kFallbackNative    // Default fallback: treat as raw native instructions
+};
+
+MemoryTargetKind InspectAddress(uintptr_t addr, std::string* outReason = nullptr);
+
 // Cached class lookup (resolved once at init). Returns a GLOBAL ref that must
 // NOT be DeleteLocalRef'd. Never calls FindClass, so it is safe on the hook
 // path (frameless trampoline). Returns nullptr if not cached.

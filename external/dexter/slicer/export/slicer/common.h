@@ -19,7 +19,45 @@
 #include <stdint.h>
 #include <string>
 
+#include <csetjmp>
+
 namespace slicer {
+
+extern thread_local jmp_buf* g_slicer_trap_jmp;
+extern thread_local const char* g_slicer_trap_error;
+
+/**
+ * Executes a callable `f` inside a setjmp protection scope.
+ * If any SLICER_CHECK() fails inside Dexter while running `f`, execution
+ * immediately jumps back here, restores previous trap scope, and returns false.
+ *
+ * NOTE: This is intended STRICTLY as a fail-safe safety net on error paths.
+ * Because longjmp does not unwind C++ stack frames between setjmp and the abort point,
+ * any local heap objects allocated inside the failed call stack may leak.
+ * Robust pre-validation should always be used to avoid triggering SLICER_CHECK.
+ */
+template <typename F>
+bool RunGuarded(F&& f, std::string* error = nullptr) {
+    jmp_buf jmp;
+    jmp_buf* prev = g_slicer_trap_jmp;
+    g_slicer_trap_jmp = &jmp;
+    g_slicer_trap_error = nullptr;
+
+    bool ok = false;
+    if (setjmp(jmp) == 0) {
+        f();
+        ok = true;
+    } else {
+        if (error) {
+            *error = g_slicer_trap_error ? g_slicer_trap_error : "Dexter internal assertion failed";
+        }
+        ok = false;
+    }
+
+    g_slicer_trap_jmp = prev;
+    g_slicer_trap_error = nullptr;
+    return ok;
+}
 
 // Encapsulate the runtime check and error reporting policy.
 // (currently a simple fail-fast but the the intention is to allow customization)

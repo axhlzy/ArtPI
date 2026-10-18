@@ -494,6 +494,9 @@ static JSValue JsJavaHook(JSContext* ctx, JSValueConst /*this_val*/, int argc, J
     if (argc < 1) return JS_NewString(ctx, "Usage: jhook(artMethod, [onEnter], [onLeave], [className], [methodName], [sig])");
     int64_t ptr = ParsePtr(ctx, argv[0]);
     if (!ptr || ptr < 0x1000) return JS_NewString(ctx, "[!] Invalid method pointer");
+    if (InspectAddress(static_cast<uintptr_t>(ptr)) != MemoryTargetKind::kArtMethod) {
+        return JS_NewString(ctx, "[!] Address is not a valid ArtMethod");
+    }
 
     bool twoCb = (argc >= 3 && JS_IsFunction(ctx, argv[2]));
     int metaBase = twoCb ? 3 : 2;

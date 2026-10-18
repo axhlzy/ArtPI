@@ -988,6 +988,7 @@ static JSValue JsJCall(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVa
         if (it != mem->methods.end()) {
             int argCount = argc - 2;
             for (const auto& cand : it->second) {
+                if (obj == nullptr && !cand.isStatic) continue;
                 if (static_cast<int>(cand.params.size()) == argCount) {
                     chosen = &cand;
                     break;
@@ -1053,6 +1054,11 @@ static JSValue JsJCall(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVa
                     if (env->ExceptionCheck()) env->ExceptionClear();
                     bool isStatic = (mod & 0x0008) != 0;
 
+                    if (obj == nullptr && !isStatic) {
+                        env->DeleteLocalRef(m);
+                        continue;
+                    }
+
                     if (static_cast<int>(params.size()) == argCount) {
                         jmethodID mid = isStatic ? env->GetStaticMethodID(cls, mname.c_str(), sig.c_str())
                                                  : env->GetMethodID(cls, mname.c_str(), sig.c_str());
@@ -1077,6 +1083,11 @@ static JSValue JsJCall(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVa
     if (!chosen) {
         if (needDeleteCls) env->DeleteLocalRef(cls);
         return JS_ThrowTypeError(ctx, "Method '%s' not found or arg count mismatch on %s", mname.c_str(), cname.c_str());
+    }
+
+    if (!chosen->isStatic && obj == nullptr) {
+        if (needDeleteCls) env->DeleteLocalRef(cls);
+        return JS_ThrowTypeError(ctx, "Cannot call instance method '%s' without an object on %s", mname.c_str(), cname.c_str());
     }
 
     std::vector<jvalue> jargs(chosen->params.size());

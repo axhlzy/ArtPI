@@ -16,6 +16,7 @@
 #include "agent_qbdi.h"
 #include "agent_jni.h"
 #include "agent_unity.h"
+#include "agent_dex_writer.h"
 #include "sandbox/pi_interp_tracer.h"
 #include "../../engine/utils/unity_preprocess.h"
 
@@ -83,12 +84,25 @@ static const std::map<std::string, std::string> kApiDocs = {
     {"dumpnative", "Alias for dumpNative(artMethodPtrOrNativeAddr, [maxInstructions])"},
 
     {"dumpCode",
-     "Usage: dumpCode(artMethodPtrOrNativeAddr, [maxInstructions])\n"
+     "Usage: dumpCode(artMethodPtrOrNativeAddrOrClass, [maxInstructions])\n"
      "  - Unified code disassembler: auto-dispatches to dumpNative or dumpSmali.\n"
      "  - Examples:\n"
      "      dumpCode(0x74000312e0)\n"
+     "      dumpCode(\"com.example.MainActivity\")\n"
      "      dumpCode(m, 100)"},
-    {"dumpcode", "Alias for dumpCode(artMethodPtrOrNativeAddr, [maxInstructions])"},
+    {"dumpcode", "Alias for dumpCode(target, [maxInstructions])"},
+
+    {"disassembly",
+     "Usage: disassembly(target, [maxInstructions])\n"
+     "  - Alias for dumpCode: auto-dispatches to dumpNative (ARM64) or dumpSmali (DEX).\n"
+     "  - Target can be a native address (e.g. 0x7b76862a20), ArtMethod, or class name.\n"
+     "  - Default fallback is always native disassembly without crashing."},
+    {"disasm", "Alias for disassembly(target, [maxInstructions])"},
+
+    {"decompile",
+     "Usage: decompile(classNameOrMethod, [methodName])\n"
+     "  - High-level Java source decompiler powered by embedded JADX CLI.\n"
+     "  - Falls back cleanly to Smali/Native disassembly if JADX is unavailable."},
 
     {"methodToArt",
      "Usage: methodToArt(jmethodID)\n"
@@ -259,7 +273,20 @@ static const std::map<std::string, std::string> kApiDocs = {
      "    env->FindClass / Class.forName / app code can resolve the new classes.\n"
      "  - Returns a handle: .$injected / .$name / .$loader / .loadClass(name) / .$dispose()\n"
      "  - {inject:false} keeps the dex isolated in its own ClassLoader."},
-    {"loadedDexes", "Usage: Java.loadedDexes() -> [{name, injected}, ...]"}
+    {"loadedDexes", "Usage: Java.loadedDexes() -> [{name, injected}, ...]"},
+    {"DexWriter",
+     "Usage: new DexWriter() | DexWriter.smali([signature, ]text) | DexWriter.build((w) => { ... })\n"
+     "  - Low-level Dalvik bytecode assembler powered by Dexter / slicer.\n"
+     "  - Fluent API: w.setRegisters(total, ins, outs), w.putConst4/16/(), w.putMove/(),\n"
+     "                w.putReturn/Void/Object, w.putInvokeVirtual/Direct/Static/Super/Interface,\n"
+     "                w.putNewInstance, w.putCheckCast, w.putInstanceOf, w.putIget/Iput/Sget/Sput,\n"
+     "                w.putAddInt/SubInt/MulInt/DivInt/RemInt/AndInt/OrInt/XorInt/ShlInt/ShrInt/UshrInt,\n"
+     "                w.putIfEq/Ne/Lt/Ge/Gt/Le/Eqz/Nez, w.makeLabel(), w.putLabel(lbl), w.putGoto(lbl),\n"
+     "                w.putNop(), w.putThrow().\n"
+     "  - Smali text: w.putSmali(\"const/4 v0, 1\\nreturn v0\")\n"
+     "  - Can be passed directly as method implementation or bytecode: in Java.registerClass."},
+    {"dexwriter", "Alias for DexWriter (case-insensitive)"},
+    {"build", "Usage: DexWriter.build((w) => { ... }) -> DexWriter instance"}
 };
 
 static JSValue JsListAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
@@ -836,6 +863,7 @@ std::string EvalJs(const std::string& script, const char* filename) {
 
 void DestroyJs() {
     std::lock_guard<std::mutex> lk(g_jsMutex);
+    ResetDexWriterClassId();
     if (g_ctx) {
         JS_FreeContext(g_ctx);
         g_ctx = nullptr;

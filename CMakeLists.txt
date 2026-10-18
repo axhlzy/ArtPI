@@ -52,6 +52,7 @@ set(ARTPI_SOURCES
         src/dex/pi_dex_resolver.cpp
         src/dex/pi_dex_gen.cpp
         src/dex/pi_dex_loader.cpp
+        src/dex/pi_dex_writer.cpp
 
         # Native disassembly & symbol resolution (src/native)
         src/native/pi_native.cpp
