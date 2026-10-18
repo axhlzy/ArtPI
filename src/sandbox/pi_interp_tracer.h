@@ -294,6 +294,7 @@ void SetClassLookupFallback(ClassLookupFn fn);
 // Choose whether the per-instruction trace dumps register values AFTER the
 // instruction executes (true, default) or BEFORE (false, buffered pre-state).
 void SetDumpRegsAfter(bool after);
+bool GetDumpRegsAfter();
 
 // ---------------------------------------------------------------------------
 // logcat per-instruction trace ("PI_VMTrace" lines; see pi_interp_tracer.cpp)

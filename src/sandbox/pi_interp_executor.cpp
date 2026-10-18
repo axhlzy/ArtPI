@@ -123,14 +123,14 @@ struct ScopedManagedStackBoundary {
         if (!PineNative_GetSavedHookManagedStack(snapshot)) {
             snapshot[0] = saved[0]; snapshot[1] = saved[1]; snapshot[2] = saved[2];
         }
-        // Keep the live ManagedStack fragment fully empty (do NOT point
-        // top_quick_frame_ at callerFrameBase): nterp field-resolution and
-        // exception-delivery inside JNI calls made by nmmvm choke if the top
+        // Keep the live ManagedStack fragment top quick/shadow frames empty
+        // (do NOT point top_quick_frame_ at callerFrameBase): nterp field-resolution
+        // and exception-delivery inside JNI calls made by nmmvm choke if the top
         // quick frame is a synthetic untagged pointer. `callerFrameBase` is
         // kept in this struct for `bt` (getManagedStackSnapshot) instead.
         ms[0] = 0;            // top_quick_frame_  = nullptr
+        ms[1] = 0;            // link_ = nullptr (prevents WalkStack traversing unmanaged bridge)
         ms[2] = 0;            // top_shadow_frame_ = nullptr (stale chain, was crashing)
-        ms[1] = 0;            // link_ = nullptr
         active = true;
         depth = ++s_depth;
         PI_LOGI("MSBOUND enter depth=%d old={quick=%p link=%p shadow=%p}",

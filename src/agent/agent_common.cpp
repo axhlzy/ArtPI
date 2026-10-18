@@ -528,12 +528,34 @@ void InstallConsole(JSContext* ctx) {
     JS_FreeValue(ctx, global);
 }
 
+static std::atomic<int> g_agentInFlight{0};
+
+void AgentInFlightAcquire() {
+    g_agentInFlight.fetch_add(1, std::memory_order_acquire);
+}
+
+void AgentInFlightRelease() {
+    g_agentInFlight.fetch_sub(1, std::memory_order_release);
+}
+
+int AgentGetInFlightCount() {
+    return g_agentInFlight.load(std::memory_order_acquire);
+}
+
 int AgentReleaseMethodInstrumentation(void* artMethod) {
     if (!artMethod) return 0;
     int released = 0;
     if (JavaUnhookMethod(artMethod)) released |= 1;
     if (TraceStopByArtMethod(artMethod)) released |= 2;
     if (BreakpointClearByArtMethod(artMethod)) released |= 4;
+    if (released != 0) {
+        // In-flight drain: if replacing a hot method, wait briefly for any thread
+        // currently executing inside the old trampoline/callbacks to leave.
+        int drain = 50;
+        while (g_agentInFlight.load(std::memory_order_acquire) > 0 && drain-- > 0) {
+            usleep(1000);
+        }
+    }
     return released;
 }
 

@@ -403,7 +403,9 @@ static uint32_t ArtMethodFrameSize(void* methodPtr) {
         uint8_t ci[64];
         if (!SafeRead(reinterpret_cast<const void*>(e - code_info_offset), ci, sizeof(ci))) return 0;
         const size_t num_headers = (sdk >= pine::Android::kS) ? 7u : 6u;
-        const size_t frame_idx   = (sdk >= pine::Android::kS) ? 2u : 1u;
+        // AOSP stack_map.h: CodeInfo::ForEachHeaderField sequentially packs:
+        // index 0 = flags_, index 1 = packed_frame_size_
+        const size_t frame_idx   = 1u;
         uint32_t hdr[7] = {0};
         DecodeCodeInfoHeader(ci, hdr, num_headers);
         uint32_t frame = hdr[frame_idx] * kArm64StackAlignment;  // packed_frame_size_ * alignment
@@ -514,59 +516,59 @@ static std::string CaptureJavaStack(ArtMethod* curMethod, const PI::Interp::Insn
             CaptureCallersViaNativeFrames(snap.callerFrameBase, callerLines);
         }
         if (callerLines.empty()) {
-        // Walk top_shadow_frame_
-        void* sf = reinterpret_cast<void*>(snap.topShadowFrame);
-        int sfCount = 0;
-        while (sf != nullptr && sfCount < 64 && frames.size() < 128) {
-            ShadowFrameHeader hdr{};
-            if (!SafeRead(sf, &hdr, sizeof(hdr))) break;
-            if (hdr.method != nullptr && IsValidArtMethod(hdr.method)) {
-                if (frames.empty() || frames.back().artMethod != hdr.method) {
-                    frames.push_back({ hdr.method, hdr.dex_pc });
-                }
-            }
-            sf = hdr.link;
-            sfCount++;
-        }
-
-        // Walk link_ (previous ManagedStack fragments)
-        void* ms = reinterpret_cast<void*>(snap.link);
-        int msCount = 0;
-        while (ms != nullptr && msCount < 32 && frames.size() < 128) {
-            ManagedStackFragment frag{};
-            if (!SafeRead(ms, &frag, sizeof(frag))) break;
-
-            if (frag.top_shadow_frame != nullptr) {
-                void* cur_sf = frag.top_shadow_frame;
-                int sfd = 0;
-                while (cur_sf != nullptr && sfd < 64 && frames.size() < 128) {
-                    ShadowFrameHeader hdr{};
-                    if (!SafeRead(cur_sf, &hdr, sizeof(hdr))) break;
-                    if (hdr.method != nullptr && IsValidArtMethod(hdr.method)) {
-                        if (frames.empty() || frames.back().artMethod != hdr.method) {
-                            frames.push_back({ hdr.method, hdr.dex_pc });
-                        }
-                    }
-                    cur_sf = hdr.link;
-                    sfd++;
-                }
-            }
-
-            if (frag.top_quick_frame != nullptr) {
-                uintptr_t qf = reinterpret_cast<uintptr_t>(frag.top_quick_frame) & ~1ULL;
-                void* q_method = nullptr;
-                if (SafeRead(reinterpret_cast<void*>(qf), &q_method, sizeof(q_method))) {
-                    if (q_method != nullptr && IsValidArtMethod(q_method)) {
-                        if (frames.empty() || frames.back().artMethod != q_method) {
-                            frames.push_back({ q_method, 0 });
-                        }
+            // Walk top_shadow_frame_
+            void* sf = reinterpret_cast<void*>(snap.topShadowFrame);
+            int sfCount = 0;
+            while (sf != nullptr && sfCount < 64 && frames.size() < 128) {
+                ShadowFrameHeader hdr{};
+                if (!SafeRead(sf, &hdr, sizeof(hdr))) break;
+                if (hdr.method != nullptr && IsValidArtMethod(hdr.method)) {
+                    if (frames.empty() || frames.back().artMethod != hdr.method) {
+                        frames.push_back({ hdr.method, hdr.dex_pc });
                     }
                 }
+                sf = hdr.link;
+                sfCount++;
             }
 
-            ms = frag.link;
-            msCount++;
-        }
+            // Walk link_ (previous ManagedStack fragments)
+            void* ms = reinterpret_cast<void*>(snap.link);
+            int msCount = 0;
+            while (ms != nullptr && msCount < 32 && frames.size() < 128) {
+                ManagedStackFragment frag{};
+                if (!SafeRead(ms, &frag, sizeof(frag))) break;
+
+                if (frag.top_shadow_frame != nullptr) {
+                    void* cur_sf = frag.top_shadow_frame;
+                    int sfd = 0;
+                    while (cur_sf != nullptr && sfd < 64 && frames.size() < 128) {
+                        ShadowFrameHeader hdr{};
+                        if (!SafeRead(cur_sf, &hdr, sizeof(hdr))) break;
+                        if (hdr.method != nullptr && IsValidArtMethod(hdr.method)) {
+                            if (frames.empty() || frames.back().artMethod != hdr.method) {
+                                frames.push_back({ hdr.method, hdr.dex_pc });
+                            }
+                        }
+                        cur_sf = hdr.link;
+                        sfd++;
+                    }
+                }
+
+                if (frag.top_quick_frame != nullptr) {
+                    uintptr_t qf = reinterpret_cast<uintptr_t>(frag.top_quick_frame) & ~1ULL;
+                    void* q_method = nullptr;
+                    if (SafeRead(reinterpret_cast<void*>(qf), &q_method, sizeof(q_method))) {
+                        if (q_method != nullptr && IsValidArtMethod(q_method)) {
+                            if (frames.empty() || frames.back().artMethod != q_method) {
+                                frames.push_back({ q_method, 0 });
+                            }
+                        }
+                    }
+                }
+
+                ms = frag.link;
+                msCount++;
+            }
         }
     }
 
@@ -683,10 +685,13 @@ static std::vector<BreakpointSession> g_activeBreakpoints;
 static size_t g_nextBpId = 0;
 static std::mutex g_bpMutex;
 
-static void OnBreakpointHit(const std::string& location) {
+static void* g_pausedArtMethod = nullptr;
+
+static void OnBreakpointHit(const std::string& location, void* artMethod = nullptr) {
     std::unique_lock<std::mutex> lk(g_debugMutex);
     g_isThreadPaused = true;
     g_pausedLocation = location;
+    g_pausedArtMethod = artMethod;
     g_pendingCommand = DebugStepCommand::NONE;
 
     BroadcastLog("debug", location);
@@ -697,6 +702,7 @@ static void OnBreakpointHit(const std::string& location) {
     });
 
     g_isThreadPaused = false;
+    g_pausedArtMethod = nullptr;
     g_debugCv.notify_all();
 }
 
@@ -894,7 +900,7 @@ static jvalue RunNativeStepped(const PI::Interp::InvokeEvent& ie) {
                 return 0;
             }
             std::string view = FormatNativeStepView(am, fn, pc, mnem, disasm, gpr);
-            OnBreakpointHit(view);
+            OnBreakpointHit(view, am);
             t_runMode = g_pendingCommand;
             return 0;
         });
@@ -1042,7 +1048,7 @@ JSValue JsBreakJava(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValue
             if (!proceed) { frame.invokeOriginal(); return; }
         }
         if (!art || isNative) {
-            OnBreakpointHit(loc + " " + frame.toValueString());
+            OnBreakpointHit(loc + " " + frame.toValueString(), reinterpret_cast<void*>(art));
             frame.invokeOriginal();
             return;
         }
@@ -1057,7 +1063,7 @@ JSValue JsBreakJava(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValue
             }
             ArtMethod* cur = ev.artMethod ? reinterpret_cast<ArtMethod*>(ev.artMethod) : art;
             std::string view = FormatSmaliStepView(cur, ev);
-            OnBreakpointHit(view);
+            OnBreakpointHit(view, reinterpret_cast<void*>(cur));
             t_runMode = g_pendingCommand;
             if (t_runMode == DebugStepCommand::FINISH) {
                 t_targetDepth = (ev.depth > 0) ? (ev.depth - 1) : -1;
@@ -1735,7 +1741,7 @@ bool BreakpointClearByArtMethod(void* artMethod) {
             // wait for it to leave the pause window before tearing down the trampoline.
             {
                 std::unique_lock<std::mutex> dlk(g_debugMutex);
-                if (g_isThreadPaused && g_pausedLocation == it->location) {
+                if (g_isThreadPaused && (g_pausedArtMethod == artMethod || g_pausedLocation == it->location)) {
                     g_pendingCommand = DebugStepCommand::CONTINUE;
                     g_debugCv.notify_all();
                     g_debugCv.wait_for(dlk, std::chrono::milliseconds(200),

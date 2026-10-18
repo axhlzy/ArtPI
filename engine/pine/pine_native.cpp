@@ -1240,6 +1240,10 @@ struct ScopedHookManagedStack {
         auto* ms = reinterpret_cast<uintptr_t*>(thread + HookManagedStackOffset());
         saved[0] = ms[0]; saved[1] = ms[1]; saved[2] = ms[2];
         ms[0] = 0;   // top_quick_frame_
+        // ms[1] (link_) must also be 0: Pine's assembly bridge trampoline does
+        // not push an ART JNI transition frame. If link_ is traversed by
+        // StackVisitor::WalkStack (e.g. during env->FindClass or GC), WalkStack
+        // interprets unmanaged bridge registers as ArtMethod* and SIGSEGVs in PrettyMethod.
         ms[1] = 0;   // link_
         ms[2] = 0;   // top_shadow_frame_
         active = true;

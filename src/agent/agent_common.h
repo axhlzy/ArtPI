@@ -83,6 +83,17 @@ void InstallConsole(JSContext* ctx);
 int AgentReleaseMethodInstrumentation(void* artMethod);
 std::string FormatReleasedInstrumentation(int mask);
 
+void AgentInFlightAcquire();
+void AgentInFlightRelease();
+int  AgentGetInFlightCount();
+
+struct AgentInFlightGuard {
+    AgentInFlightGuard() { AgentInFlightAcquire(); }
+    ~AgentInFlightGuard() { AgentInFlightRelease(); }
+    AgentInFlightGuard(const AgentInFlightGuard&) = delete;
+    AgentInFlightGuard& operator=(const AgentInFlightGuard&) = delete;
+};
+
 // Install the interpreter's class-lookup fallback (app loader + generated
 // class registry). Call once from InitJs after the JS bindings are up.
 void InstallInterpClassFallback();

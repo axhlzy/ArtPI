@@ -80,6 +80,7 @@ static std::shared_ptr<JSValue> GuardJsHookCb(JSValue v) {
 
 struct JsHookRet {
     bool set = false;
+    bool alive = true;
     JSValue val = JS_UNDEFINED;
 };
 
@@ -90,11 +91,12 @@ static JSValue JsHookSetResultFn(JSContext* ctx, JSValueConst /*this_val*/, int 
     if (JS_IsBigInt(ctx, func_data[0])) JS_ToBigInt64(ctx, &p, func_data[0]);
     else JS_ToInt64(ctx, &p, func_data[0]);
     auto* slot = reinterpret_cast<JsHookRet*>(static_cast<uintptr_t>(p));
-    if (slot) {
-        if (slot->set) JS_FreeValue(ctx, slot->val);
-        slot->val = JS_DupValue(ctx, argv[0]);
-        slot->set = true;
+    if (!slot || !slot->alive) {
+        return JS_ThrowTypeError(ctx, "setResult() can only be called synchronously inside hook callback");
     }
+    if (slot->set) JS_FreeValue(ctx, slot->val);
+    slot->val = JS_DupValue(ctx, argv[0]);
+    slot->set = true;
     return JS_UNDEFINED;
 }
 
@@ -180,13 +182,22 @@ static bool JsValueToFrameResult(JSContext* ctx, PI::CallFrame& f, JSValueConst 
     }
 }
 
-static JSValue JsHookGetStackFn(JSContext* ctx, JSValueConst /*this_val*/,
+static std::atomic<int> g_nextHookId{0};
+
+static JSValue JsHookGetStackFn(JSContext* ctx, JSValueConst this_val,
                                 int /*argc*/, JSValueConst* /*argv*/,
                                 int /*magic*/, JSValue* func_data) {
     int64_t sp = ParsePtr(ctx, func_data[0]);
     if (!sp) return JS_NewString(ctx, "");
     std::string s = CaptureCallerStackFromSp(reinterpret_cast<void*>(static_cast<uintptr_t>(sp)));
-    return JS_NewString(ctx, s.c_str());
+    JSValue res = JS_NewString(ctx, s.c_str());
+    // Cache on this_val so that subsequent accesses (even after the callback has popped)
+    // read the safely captured string instead of traversing a stale stack pointer.
+    JSAtom atom = JS_NewAtom(ctx, "stack");
+    JS_DefinePropertyValue(ctx, this_val, atom, JS_DupValue(ctx, res),
+                           JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+    return res;
 }
 
 static void AttachLazyStackGetter(JSContext* jsctx, JSValue obj, const PI::CallFrame& frame) {
@@ -196,6 +207,22 @@ static void AttachLazyStackGetter(JSContext* jsctx, JSValue obj, const PI::CallF
     JS_FreeValue(jsctx, spData[0]);
     JSAtom atom = JS_NewAtom(jsctx, "stack");
     JS_DefinePropertyGetSet(jsctx, obj, atom, getter, JS_UNDEFINED, JS_PROP_C_W_E);
+    JS_FreeAtom(jsctx, atom);
+}
+
+static void DetachLazyStackGetter(JSContext* jsctx, JSValue obj) {
+    JSAtom atom = JS_NewAtom(jsctx, "stack");
+    JSPropertyDescriptor desc;
+    if (JS_GetOwnProperty(jsctx, &desc, obj, atom) > 0) {
+        if (JS_IsFunction(jsctx, desc.getter)) {
+            JS_DefinePropertyValue(jsctx, obj, atom,
+                                   JS_NewString(jsctx, "[!] stack is only available during hook callback execution"),
+                                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+        }
+        JS_FreeValue(jsctx, desc.getter);
+        JS_FreeValue(jsctx, desc.setter);
+        JS_FreeValue(jsctx, desc.value);
+    }
     JS_FreeAtom(jsctx, atom);
 }
 
@@ -216,6 +243,8 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
     PI::HookHandle handle;
     if (!twoCb && (!hasCb || !JS_IsFunction(ctx, cbArg1))) {
         handle = m.hook([](JNIEnv* cbEnv, PI::CallFrame& frame) {
+            AgentInFlightGuard ifg;
+
             if (cbEnv) cbEnv->PushLocalFrame(32);
 
             int curDepth = t_hookCallDepth;
@@ -262,6 +291,8 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
             : nullptr;
         auto onLeaveGuard = GuardJsHookCb(JS_DupValue(ctx, cbArg2));
         handle = m.hook([onEnterGuard, onLeaveGuard](JNIEnv* cbEnv, PI::CallFrame& frame) {
+            AgentInFlightGuard ifg;
+
             JSContext* jsctx = g_ctx;
             if (!jsctx) { frame.invokeOriginal(); return; }
 
@@ -314,6 +345,8 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
                 }
                 JS_FreeValue(jsctx, r1);
 
+                DetachLazyStackGetter(jsctx, obj);
+
                 for (int i = 0; i < n; i++) {
                     JSValue v = JS_GetPropertyUint32(jsctx, argsArr, static_cast<uint32_t>(i));
                     JsValueToFrameArg(jsctx, frame, i, v);
@@ -350,6 +383,9 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
                 }
                 JS_FreeValue(jsctx, r2);
 
+                leaveRet.alive = false;
+                DetachLazyStackGetter(jsctx, obj2);
+
                 if (leaveRet.set) {
                     JsValueToFrameResult(jsctx, frame, leaveRet.val);
                     const char* rv = JS_ToCString(jsctx, leaveRet.val);
@@ -367,6 +403,8 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
     } else {
         auto cbGuard = GuardJsHookCb(JS_DupValue(ctx, cbArg1));
         handle = m.hook([cbGuard](JNIEnv* cbEnv, PI::CallFrame& frame) {
+            AgentInFlightGuard ifg;
+
             JSContext* jsctx = g_ctx;
             if (!jsctx) { frame.invokeOriginal(); return; }
 
@@ -433,6 +471,9 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
                 }
                 JS_FreeValue(jsctx, callRet);
 
+                retSlot.alive = false;
+                DetachLazyStackGetter(jsctx, obj);
+
                 if (retSlot.set) {
                     JsValueToFrameResult(jsctx, frame, retSlot.val);
                     const char* rv = JS_ToCString(jsctx, retSlot.val);
@@ -480,7 +521,7 @@ static int InstallJavaMethodHook(JSContext* ctx, PI::Method& m,
     }
 
     std::lock_guard<std::mutex> lk(g_hooksMutex);
-    int newId = static_cast<int>(g_activeHooks.size());
+    int newId = g_nextHookId.fetch_add(1);
     g_activeHooks.push_back({ newId, handle, m.getDeclaringClassName(), m.getName(), m.getSignature(), reinterpret_cast<uintptr_t>(m.getArtMethod()) });
     return newId;
 }

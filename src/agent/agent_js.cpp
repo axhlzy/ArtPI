@@ -28,6 +28,7 @@
 #include <cctype>
 #include <cstdio>
 #include <string>
+#include <unistd.h>
 #include <iomanip>
 
 namespace artpi { namespace agent {
@@ -455,6 +456,16 @@ static JSValue JsDetachAll(JSContext* ctx, JSValueConst /*this_val*/, int /*argc
     return JS_NewString(ctx, msg.c_str());
 }
 
+static JSValue JsSleep(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int ms = 100;
+    if (argc >= 1) JS_ToInt32(ctx, &ms, argv[0]);
+    if (ms <= 0) return JS_UNDEFINED;
+    g_jsMutex.unlock();
+    usleep(ms * 1000);
+    g_jsMutex.lock();
+    return JS_UNDEFINED;
+}
+
 static void RegisterDualTrackApis(JSContext* ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
 
@@ -500,6 +511,7 @@ static void RegisterDualTrackApis(JSContext* ctx) {
     JS_SetPropertyStr(ctx, global, "list", JS_NewCFunction(ctx, JsListAll, "list", 0));
     JS_SetPropertyStr(ctx, global, "lists", JS_NewCFunction(ctx, JsListAll, "lists", 0));
     JS_SetPropertyStr(ctx, global, "hooks", JS_NewCFunction(ctx, JsListAll, "hooks", 0));
+    JS_SetPropertyStr(ctx, global, "sleep", JS_NewCFunction(ctx, JsSleep, "sleep", 1));
 
     // 6. Install console.log redirector
     InstallConsole(ctx);

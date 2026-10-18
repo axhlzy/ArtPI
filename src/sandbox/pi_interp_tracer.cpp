@@ -122,7 +122,7 @@ jclass FindClassRefCached(JNIEnv* env, const char* name) {
             jclass l = jn ? static_cast<jclass>(env->CallObjectMethod(loader, lc, jn)) : nullptr;
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
-                __android_log_print(ANDROID_LOG_WARN, "Interp",
+                __android_log_print(ANDROID_LOG_DEBUG, "Interp",
                                     "FindClassRefCached '%s': loadClass threw exception",
                                     dotted.c_str());
                 if (l) {
@@ -138,11 +138,11 @@ jclass FindClassRefCached(JNIEnv* env, const char* name) {
                 g_clsCache[name] = g;
                 return g;
             }
-            __android_log_print(ANDROID_LOG_WARN, "Interp",
+            __android_log_print(ANDROID_LOG_DEBUG, "Interp",
                                 "FindClassRefCached '%s': loadClass returned null (loader=%p)",
                                 dotted.c_str(), loader);
         } else {
-            __android_log_print(ANDROID_LOG_WARN, "Interp",
+            __android_log_print(ANDROID_LOG_DEBUG, "Interp",
                                 "FindClassRefCached '%s': NO loader (loader=%p lc=%p)",
                                 name, loader, lc);
         }
@@ -728,6 +728,9 @@ void destroyFrameCtx(void* frameCtx) {
 static thread_local bool tl_dumpRegsAfter = true;
 void SetDumpRegsAfter(bool after) {
     tl_dumpRegsAfter = after;
+}
+bool GetDumpRegsAfter() {
+    return tl_dumpRegsAfter;
 }
 
 namespace {

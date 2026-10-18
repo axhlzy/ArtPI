@@ -14,6 +14,7 @@
 #include "agent_common.h"
 #include "agent_java.h"
 #include "agent_net.h"
+#include "sandbox/pi_interp_tracer.h"
 #include "../../include/ArtPI.h"
 #include "dex/pi_smali.h"
 #include "native/hooker/pi_gum_hooker.h"
@@ -499,6 +500,7 @@ static JSValue JsTraceJava(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
 
     PI::HookHandle hh = m.hook([descCopy, sysClsCopy, insnStep, excludeSystem, maxDepth,
                                 cbEnter, cbLeave, cbInsn](JNIEnv*, PI::CallFrame& frame) {
+        AgentInFlightGuard ifg;
         JSContext* jsctx = g_ctx;
         bool deliver = !(excludeSystem && sysClsCopy);
 
@@ -707,13 +709,20 @@ static JSValue JsTraceUnified(JSContext* ctx, JSValueConst /*this_val*/, int arg
     StopExistingTrace(desc, art);
 
     PI::HookHandle hh = m.hook([desc, cbEnter, cbLeave, cbLine, preset, dumpAfter = opt.dumpAfter](JNIEnv*, PI::CallFrame& frame) {
+        AgentInFlightGuard ifg;
         JSContext* jsctx = g_ctx;
         if (jsctx && cbEnter) {
             JSValue ev = MakeJavaEvent(jsctx, frame, desc, false);
             CallJsCb1(jsctx, cbEnter, ev);
             JS_FreeValue(jsctx, ev);
         }
+        bool prevDump = PI::Interp::GetDumpRegsAfter();
         PI::Interp::SetDumpRegsAfter(dumpAfter);
+        struct DumpGuard {
+            bool prev;
+            ~DumpGuard() { PI::Interp::SetDumpRegsAfter(prev); }
+        } dumpGuard{prevDump};
+
         InstallUnifiedSink(jsctx, cbLine);
         frame.invokeTrace<void>(preset);
         PI::Logger::setLogSink(nullptr);
